@@ -1,20 +1,21 @@
-> **Fork 说明 — Agent Tool Chain Manager。** 这是独立安装的 Skills Manager Fork。
+> **Fork 说明 — Agent Toolchain Manager。** 这是独立安装的 Skills Manager Fork。
 > 本 Fork 的默认数据目录和 CLI 名称已隔离，在建立自己的签名发布渠道前禁用应用自动更新。
-> 以下上游文档保留供参考，其中原版下载安装链接并不适用于本 Fork。
+> 本文的安装及 CLI 命令面向本 Fork；部分上游视频与徽章保留用于署名与溯源。
 > 构建前请阅读 [Fork 发布隔离说明](FORK_RELEASE_ISOLATION.md)。
+> 下方演示视频及上游热度徽章均属于原版项目，不代表本 Fork 的指标。
 
 <p align="center">
   <img src="assets/icon.png" width="80" />
 </p>
 
-<h1 align="center">Skills Manager</h1>
+<h1 align="center">Agent Toolchain Manager</h1>
 
 <p align="center">
   一个应用，统一管理所有 AI 编码工具的 Skills。
 </p>
 
 <p align="center">
-  <strong><a href="https://skillsmanager.dev/zh">skillsmanager.dev</a></strong>
+  <strong><a href="https://github.com/wzwu0309/agent-toolchain-manager">GitHub · Agent Toolchain Manager</a></strong>
 </p>
 
 <p align="center">
@@ -38,7 +39,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo/library.png" width="800" alt="Skills Manager 技能库" />
+  <img src="assets/demo/library.png" width="800" alt="上游 Skills Manager 界面参考" />
 </p>
 
 <p align="center"><strong>安装 Skills</strong></p>
@@ -65,11 +66,11 @@
   <img src="assets/diagram-concept-map.png" width="640" alt="概念图：技能库、Preset、全局工作区、项目工作区、Agent" />
 </p>
 
-- **统一技能库** — 从 Git 仓库、本地目录、`.zip` / `.skill` 文件或 [skills.sh](https://skills.sh) 市场安装技能，统一存放在 `~/.agent-tool-chain-manager`。
+- **统一技能库** — 从 Git 仓库、本地目录、`.zip` / `.skill` 文件或 [skills.sh](https://skills.sh) 市场安装技能，统一存放在 `~/.agent-toolchain-manager`。
 - **技能市场** — 浏览市场上的热门 Skills，用关键词搜索找到需要的那个。
-- **让你的 Agent 管理 Skills** —— Claude Code、Codex、Cursor 等可以替你装一个 skill、部署到另一个 agent、或报告哪个 agent 有什么，走的是驱动 Skills Manager 而不是绕过它直接写 agent 目录——来源、preset、更新追踪和各 agent 的状态都不会丢。Dashboard 上一键完成设置，详见[让你的 Agent 来管理 Skills](#让你的-agent-来管理-skills)。
+- **让你的 Agent 管理 Skills** —— Claude Code、Codex、Cursor 等可以替你装一个 skill、部署到另一个 agent、或报告哪个 agent 有什么，走的是驱动 Agent Toolchain Manager 而不是绕过它直接写 agent 目录——来源、preset、更新追踪和各 agent 的状态都不会丢。Dashboard 上一键完成设置，详见[让你的 Agent 来管理 Skills](#让你的-agent-来管理-skills)。
 - **Preset（预设）** — 将技能分组为命名 Preset。在任意工作区点击 Preset 标签，即可一键为当前 Agent 范围激活或停用其全部技能，激活的 Preset 显示 ✓，部分安装显示数量。应用 Preset 是一次性复制，不是实时同步。
-- **全局工作区** — 每个 Agent 都有自己的页面，列出其全局目录里的所有 Skills（包括不是通过 Skills Manager 安装的），始终反映 Agent 实际看到的内容。可按 Agent 添加或移除 Skills，也可通过「全部 Agents」总览跨所有已安装 Agent 统一管理。
+- **全局工作区** — 每个 Agent 都有自己的页面，列出其全局目录里的所有 Skills（包括不是通过 Agent Toolchain Manager 安装的），始终反映 Agent 实际看到的内容。可按 Agent 添加或移除 Skills，也可通过「全部 Agents」总览跨所有已安装 Agent 统一管理。
 - **项目工作区** — 查看并管理任意项目的本地 Skills 目录，支持与中央库双向同步。支持嵌套 Skill 目录和导出时按 Agent 分配。
 - **关联工作区** — 将任意目录指定为 Skills 根目录，适合管理不在默认 Agent 路径下的 Skills。作为独立工作区管理，不参与全局 Preset 同步。
 - **多工具同步** — 一键将技能同步到任意支持的工具，支持软链接和复制两种模式。每张 Skill 卡片会为每个已启用 Agent 显示一个图标角标，点击角标即可直接在卡片上为该 Agent 安装或移除这个 Skill，角标会实时反映同步状态。
@@ -87,7 +88,7 @@
 ## 从源码构建本 Fork
 
 本 Fork 尚无经过独立签名的正式安装包。上游 Homebrew/Scoop/Release
-下载命令安装的是 Skills Manager 原版，而不是 Agent Tool Chain Manager。
+下载命令安装的是 Skills Manager 原版，而不是 Agent Toolchain Manager。
 
 在配置 Rust、Cargo、Node 及 Tauri 构建依赖后：
 
@@ -107,14 +108,14 @@
 
 ## 让你的 Agent 来管理 Skills
 
-Claude Code、Codex、Cursor 等可以替你装一个 Skill、把它部署到另一个 Agent、或者报告哪个 Agent 有什么——做法是驱动 Skills Manager，而不是绕过它直接往 Agent 目录里写。这正是来源元数据、Preset 归属、更新追踪和跨 Agent 部署状态得以保全的原因。
+Claude Code、Codex、Cursor 等可以替你装一个 Skill、把它部署到另一个 Agent、或者报告哪个 Agent 有什么——做法是驱动 Agent Toolchain Manager，而不是绕过它直接往 Agent 目录里写。这正是来源元数据、Preset 归属、更新追踪和跨 Agent 部署状态得以保全的原因。
 
 Dashboard 上有一个一次性入口：勾选哪些 Agent 可以这么做，应用就把 [`manage-skills`](skills/manage-skills/SKILL.md) 装进技能库并只部署给这些 Agent。之后它就是一个普通的库内 Skill——增减 Agent 走它自己卡片上的 Agent 图标行。全程不需要配置 PATH：应用会把自己那份 CLI 发布到 Agent 会去找的位置。
 
 它同时也是一个正常发布的 Skill，不装应用也能直接装：
 
 ```bash
-npx skills add xingkongliang/skills-manager
+npx skills add wzwu0309/agent-toolchain-manager
 ```
 
 ## 备份与多设备同步
@@ -209,7 +210,7 @@ npm run cli -- skills adopt ~/.claude/skills --dry-run
 - `git`：操作 git 管理的 `skills/` 仓库（`clone`、`pull`、`push`、`commit`、`versions`、`restore`）
 
 额外参数：
-- `--skills-root <path>`：直接针对某个已 clone / 已导出的 skills repo 操作，而不是本机 app 默认目录。manager 的状态（DB、scenarios、cache、logs）会落在 `~/.agent-tool-chain-manager/external/<name>-<hash>/`，按 skills root 的规范化路径分目录隔离，外部仓库本身保持干净。
+- `--skills-root <path>`：直接针对某个已 clone / 已导出的 skills repo 操作，而不是本机 app 默认目录。manager 的状态（DB、scenarios、cache、logs）会落在 `~/.agent-toolchain-manager/external/<name>-<hash>/`，按 skills root 的规范化路径分目录隔离，外部仓库本身保持干净。
 - `--json`：给脚本 / agent 使用的机器可读输出。失败时在 stderr 打印 `{"ok": false, "code": …, "message": …}` 并以非零码退出。因目标不属于我们而被拒绝的部署会把路径作为数据带出来（`code: "TARGET_CONFLICT"`、`details.conflicts[].path`），调用方可以直接指出是哪个目录挡路，而不是转述一句话。
 
 ```bash
@@ -223,27 +224,27 @@ Windows 版应用无法在 WSL 里建链接，只能复制。如果你的 agent 
 ```bash
 # Build the CLI from this fork on Linux, with Rust/Cargo and Node:
 npm run cli:build
-# Place src-tauri/target/debug/agent-tool-chain-manager-cli on PATH.
-agent-tool-chain-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
-agent-tool-chain-manager-cli skills install ./my-skill
-agent-tool-chain-manager-cli skills deploy my-skill --agent hermes-work
+# Place src-tauri/target/debug/agent-toolchain-manager-cli on PATH.
+agent-toolchain-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
+agent-toolchain-manager-cli skills install ./my-skill
+agent-toolchain-manager-cli skills deploy my-skill --agent hermes-work
 ```
 
 #### 二进制放在哪
 
-应用启动时会把自己那份 CLI 复制到 `~/.agent-tool-chain-manager/bin/agent-tool-chain-manager-cli`，版本永远与正在运行的应用一致，Agent 不需要你改 PATH 就能找到它。旁边的 `.version` 标记只在副本校验通过后才写、每次重新发布前先删——所以一次失败的复制（比如 Windows 上二进制正被占用）绝不会被当成可用的。
+应用启动时会把自己那份 CLI 复制到 `~/.agent-toolchain-manager/bin/agent-toolchain-manager-cli`，版本永远与正在运行的应用一致，Agent 不需要你改 PATH 就能找到它。旁边的 `.version` 标记只在副本校验通过后才写、每次重新发布前先删——所以一次失败的复制（比如 Windows 上二进制正被占用）绝不会被当成可用的。
 
 把 CLI 放到**你自己**的 PATH 上手敲命令，是另一件事：
 
 ```bash
 npm run cli:install
 # 等价于：
-# cargo install --path src-tauri --bin agent-tool-chain-manager-cli --locked --force
+# cargo install --path src-tauri --bin agent-toolchain-manager-cli --locked --force
 ```
 
-二进制会装到 `~/.cargo/bin/agent-tool-chain-manager-cli`。代码更新后再跑一次即可刷新。
+二进制会装到 `~/.cargo/bin/agent-toolchain-manager-cli`。代码更新后再跑一次即可刷新。
 
-此 Fork 暂不发布独立签名 CLI，请勿从上游获取同名二进制。未来只应下载本仓库发布的 `agent-tool-chain-manager-cli-*`，在 macOS/Linux 添加可执行权限后放入 PATH 即可。
+此 Fork 暂不发布独立签名 CLI，请勿从上游获取同名二进制。未来只应下载本仓库发布的 `agent-toolchain-manager-cli-*`，在 macOS/Linux 添加可执行权限后放入 PATH 即可。
 
 #### 与桌面应用并发使用
 
@@ -260,7 +261,7 @@ npm run cli:build
 
 **macOS 打不开应用。** 从 **v1.29.0** 起，发布版本都经过 Apple Developer ID 签名与公证，可以正常打开。如果看到「Apple 无法验证…」或「应用已损坏」，说明你用的是 v1.28.5 或更早的版本，升级即可解决。（升级会改变代码签名，macOS 可能会再问一次 `skills-manager-git-backup` 钥匙串权限，点「始终允许」。）
 
-其它问题——[提个 issue](https://github.com/xingkongliang/skills-manager/issues)，并附上 **设置 → 导出日志** 打出来的压缩包。
+其它问题——[提个 issue](https://github.com/wzwu0309/agent-toolchain-manager/issues)，并附上 **设置 → 导出日志** 打出来的压缩包。
 
 ## Star 增长
 

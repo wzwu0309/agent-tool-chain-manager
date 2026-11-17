@@ -10,10 +10,10 @@ import { AgentIcon } from "./AgentIcon";
 /** Dismissal flag, same shape as the backup first-run prompt. */
 const PROMPT_SETTING_KEY = "agent_control_setup_prompt";
 
-/** The library skill that teaches an agent to drive Skills Manager. */
+/** The library skill that teaches an agent to drive Agent Toolchain Manager. */
 const SKILL_NAME = "manage-skills";
 const SKILL_SOURCE =
-  "https://github.com/wzwu0309/agent-tool-chain-manager/tree/main/skills/manage-skills";
+  "https://github.com/wzwu0309/agent-toolchain-manager/tree/main/skills/manage-skills";
 
 /**
  * One-time pointer to a capability nothing else advertises: an agent can drive

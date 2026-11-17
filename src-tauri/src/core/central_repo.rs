@@ -94,7 +94,7 @@ fn default_base_dir() -> PathBuf {
     home_base_dir()
 }
 
-/// `~/.agent-tool-chain-manager`, ignoring any configured relocation.
+/// `~/.agent-toolchain-manager`, ignoring any configured relocation.
 ///
 /// The library can be moved anywhere the user likes, but a few things must
 /// stay where another program can find them without being told — the CLI
@@ -106,11 +106,11 @@ pub fn home_base_dir() -> PathBuf {
         .unwrap()
         .clone()
     {
-        return path.join(".agent-tool-chain-manager");
+        return path.join(".agent-toolchain-manager");
     }
     dirs::home_dir()
         .expect("Cannot determine home directory")
-        .join(".agent-tool-chain-manager")
+        .join(".agent-toolchain-manager")
 }
 
 #[cfg(test)]
@@ -141,7 +141,7 @@ fn config_file_path() -> PathBuf {
     }
     dirs::config_dir()
         .unwrap_or_else(default_base_dir)
-        .join("agent-tool-chain-manager")
+        .join("agent-toolchain-manager")
         .join(CONFIG_FILE_NAME)
 }
 
@@ -875,15 +875,50 @@ pub fn clear_repoint_from() -> Result<()> {
     Ok(())
 }
 
+/// Avoid silently replacing a pre-rename fork library with an empty one.
+/// The old store is from this fork, not the upstream Skills Manager.
+fn prior_fork_needs_manual_migration(
+    new_store: &Path,
+    previous_store: &Path,
+    new_config: &Path,
+    previous_config: &Path,
+) -> bool {
+    !new_store.exists()
+        && !new_config.exists()
+        && (previous_store.exists() || previous_config.is_file())
+}
+
 /// `allow_migration`: whether this process may carry out a pending move. Only
 /// the app at startup and an explicit CLI `repo set-path` do; everything else
 /// keeps running against the library where it is.
 pub fn ensure_central_repo(allow_migration: bool) -> Result<()> {
+    let config_state = load_config_state();
+    if matches!(&config_state, ConfigState::Missing) && !base_dir_override_active() {
+        let new_store = home_base_dir();
+        let previous_store = new_store.with_file_name(".agent-tool-chain-manager");
+        let new_config = config_file_path();
+        let previous_config = new_config
+            .parent()
+            .and_then(Path::parent)
+            .map(|root| root.join("agent-tool-chain-manager").join(CONFIG_FILE_NAME));
+        if previous_config.as_deref().is_some_and(|old| {
+            prior_fork_needs_manual_migration(&new_store, &previous_store, &new_config, old)
+        }) {
+            return Err(anyhow!(
+                concat!(
+                    "Previous Agent Tool Chain Manager data detected. ",
+                    "Quit the old app and manually move ",
+                    "~/.agent-tool-chain-manager to ~/.agent-toolchain-manager ",
+                    "before launching the renamed app. No user data was changed."
+                )
+            ));
+        }
+    }
     // A config file that exists but cannot be used means the app is about to
     // run against the default location even though the user configured (and
     // populated) another one. Never let that pass silently — it presents as
     // "the library was rebuilt empty, all skills lost" (#228 review).
-    let mut config = match load_config_state() {
+    let mut config = match config_state {
         ConfigState::Valid(config) => {
             if let Some(raw) = config.repo_path.as_deref() {
                 if let Err(err) = normalize_path(raw) {
@@ -973,9 +1008,41 @@ mod tests {
         let _guard = test_base_dir_lock();
         let tmp = tempfile::tempdir().unwrap();
         set_test_home_dir_override(Some(tmp.path().to_path_buf()));
-        assert_eq!(home_base_dir(), tmp.path().join(".agent-tool-chain-manager"));
+        assert_eq!(home_base_dir(), tmp.path().join(".agent-toolchain-manager"));
         assert_ne!(home_base_dir(), tmp.path().join(".skills-manager"));
         set_test_home_dir_override(None);
+    }
+
+    #[test]
+    fn renamed_fork_blocks_implicit_empty_store_when_old_data_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_store = temp.path().join(".agent-tool-chain-manager");
+        let new_store = temp.path().join(".agent-toolchain-manager");
+        let old_config = temp.path().join("old/repo-config.json");
+        let new_config = temp.path().join("new/repo-config.json");
+        assert!(!prior_fork_needs_manual_migration(
+            &new_store, &old_store, &new_config, &old_config
+        ));
+        fs::create_dir_all(&old_store).unwrap();
+        assert!(prior_fork_needs_manual_migration(
+            &new_store, &old_store, &new_config, &old_config
+        ));
+        fs::create_dir_all(&new_store).unwrap();
+        assert!(!prior_fork_needs_manual_migration(
+            &new_store, &old_store, &new_config, &old_config
+        ));
+        fs::remove_dir_all(&old_store).unwrap();
+        fs::remove_dir_all(&new_store).unwrap();
+        fs::create_dir_all(old_config.parent().unwrap()).unwrap();
+        fs::write(&old_config, "{}").unwrap();
+        assert!(prior_fork_needs_manual_migration(
+            &new_store, &old_store, &new_config, &old_config
+        ));
+        fs::create_dir_all(new_config.parent().unwrap()).unwrap();
+        fs::write(&new_config, "{}").unwrap();
+        assert!(!prior_fork_needs_manual_migration(
+            &new_store, &old_store, &new_config, &old_config
+        ));
     }
 
     // ── migrate_repo_if_needed (#252) ──
@@ -1243,13 +1310,13 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("a.txt"), b"src").unwrap();
         fs::create_dir_all(dst.path().join("bin")).unwrap();
-        fs::write(dst.path().join("bin/agent-tool-chain-manager-cli"), b"mine").unwrap();
+        fs::write(dst.path().join("bin/agent-toolchain-manager-cli"), b"mine").unwrap();
 
         let mut config = config_migrating(src.path(), dst.path());
         let outcome = migrate_repo_if_needed(&mut config, dst.path());
 
         assert!(matches!(outcome, MigrationOutcome::UseSource));
-        assert!(dst.path().join("bin/agent-tool-chain-manager-cli").exists());
+        assert!(dst.path().join("bin/agent-toolchain-manager-cli").exists());
     }
 
     #[test]

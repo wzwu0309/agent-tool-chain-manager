@@ -16,8 +16,8 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 #[derive(Parser, Debug)]
-#[command(name = "agent-tool-chain-manager-cli")]
-#[command(about = "Shared-core CLI for Agent Tool Chain Manager", version)]
+#[command(name = "agent-toolchain-manager-cli")]
+#[command(about = "Shared-core CLI for Agent Toolchain Manager", version)]
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
@@ -3794,7 +3794,7 @@ mod tests {
         let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
         let skills = tmp.path().join("hermes-work/skills");
         let args = |key: &str| match Cli::try_parse_from([
-            "agent-tool-chain-manager-cli",
+            "agent-toolchain-manager-cli",
             "agents",
             "add-custom",
             key,
@@ -3944,7 +3944,7 @@ mod tests {
     #[test]
     fn parses_agent_friendly_commands_and_aliases() {
         let cli = Cli::try_parse_from([
-            "agent-tool-chain-manager-cli",
+            "agent-toolchain-manager-cli",
             "--json",
             "skills",
             "deploy",
@@ -3969,7 +3969,7 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from([
-            "agent-tool-chain-manager-cli",
+            "agent-toolchain-manager-cli",
             "skills",
             "list",
             "--query",
@@ -3999,7 +3999,7 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from([
-            "agent-tool-chain-manager-cli",
+            "agent-toolchain-manager-cli",
             "agents",
             "enable",
             "codex",
@@ -4014,7 +4014,7 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from([
-            "agent-tool-chain-manager-cli",
+            "agent-toolchain-manager-cli",
             "presets",
             "open",
             "Web Dev",
@@ -4381,7 +4381,7 @@ mod project_tests {
     }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("agent-tool-chain-manager-cli").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("agent-toolchain-manager-cli").chain(args.iter().copied()))
     }
 
     #[test]

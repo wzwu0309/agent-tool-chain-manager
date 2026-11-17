@@ -23,7 +23,7 @@ static TRAY_PRESET_APPLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// tray menu can render a disabled "Checking for updates..." label.
 static TRAY_CHECK_UPDATES_RUNNING: AtomicBool = AtomicBool::new(false);
 
-const MAIN_TRAY_ID: &str = "agent-tool-chain-manager-tray";
+const MAIN_TRAY_ID: &str = "agent-toolchain-manager-tray";
 const TRAY_PRESET_ADD_PREFIX: &str = "tray-preset-add:";
 const TRAY_PRESET_REMOVE_PREFIX: &str = "tray-preset-remove:";
 const TRAY_OPEN_UPDATES_ID: &str = "tray-open-updates";
@@ -283,7 +283,7 @@ fn build_tray_menu_from_data<R: tauri::Runtime>(
 
     let menu = Menu::new(app)?;
 
-    let app_name = MenuItem::with_id(app, "tray-app-name", "Agent Tool Chain Manager", false, None::<&str>)?;
+    let app_name = MenuItem::with_id(app, "tray-app-name", "Agent Toolchain Manager", false, None::<&str>)?;
     menu.append(&app_name)?;
 
     let status_line = MenuItem::with_id(

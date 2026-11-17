@@ -150,7 +150,7 @@ pub async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateInfo, Ap
         has_update: false,
         latest_version: current_version.clone(),
         current_version,
-        release_url: "https://github.com/wzwu0309/agent-tool-chain-manager/releases".into(),
+        release_url: "https://github.com/wzwu0309/agent-toolchain-manager/releases".into(),
     })
 }
 

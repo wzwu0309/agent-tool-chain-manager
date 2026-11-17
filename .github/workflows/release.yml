@@ -88,7 +88,7 @@ jobs:
         run: >-
           cargo build --release
           --manifest-path src-tauri/Cargo.toml
-          --bin agent-tool-chain-manager-cli
+          --bin agent-toolchain-manager-cli
           --target ${{ matrix.target }}
 
       - name: Extract changelog for current version
@@ -115,7 +115,7 @@ jobs:
           fi
           {
             echo "body<<EOF"
-            echo "## Skills Manager ${{ github.ref_name }}"
+            echo "## Agent Toolchain Manager ${{ github.ref_name }}"
             echo ""
             echo "发布日期：\`${RELEASE_DATE}\`"
             echo "${RANGE_LINE}"
@@ -209,7 +209,7 @@ jobs:
           APPLE_API_KEY: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_API_KEY || '' }}
         with:
           tagName: v__VERSION__
-          releaseName: 'Skills Manager v__VERSION__'
+          releaseName: 'Agent Toolchain Manager v__VERSION__'
           releaseBody: ${{ steps.changelog.outputs.body }}
           # Publish only after every platform is verified. v1.29.0 shipped with
           # Windows and Linux assets while both macOS legs were still notarizing,
@@ -338,7 +338,7 @@ jobs:
             -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
 
-          CLI_PATH="src-tauri/target/${{ matrix.target }}/release/agent-tool-chain-manager-cli"
+          CLI_PATH="src-tauri/target/${{ matrix.target }}/release/agent-toolchain-manager-cli"
           codesign --force --options runtime --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" "$CLI_PATH"
           codesign --verify --strict --verbose=2 "$CLI_PATH"
@@ -352,7 +352,7 @@ jobs:
             echo "Hardened runtime is not enabled on the CLI" >&2
             exit 1
           }
-          CLI_ARCHIVE="$RUNNER_TEMP/agent-tool-chain-manager-cli-${{ matrix.label }}.zip"
+          CLI_ARCHIVE="$RUNNER_TEMP/agent-toolchain-manager-cli-${{ matrix.label }}.zip"
           ditto -c -k --keepParent "$CLI_PATH" "$CLI_ARCHIVE"
           NOTARY_RESULT="$(xcrun notarytool submit "$CLI_ARCHIVE" \
             --key "$APPLE_API_KEY_PATH" \
@@ -377,11 +377,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
-            CLI_PATH="src-tauri/target/${{ matrix.target }}/release/agent-tool-chain-manager-cli.exe"
-            CLI_ASSET="agent-tool-chain-manager-cli-${{ matrix.label }}.exe"
+            CLI_PATH="src-tauri/target/${{ matrix.target }}/release/agent-toolchain-manager-cli.exe"
+            CLI_ASSET="agent-toolchain-manager-cli-${{ matrix.label }}.exe"
           else
-            CLI_PATH="src-tauri/target/${{ matrix.target }}/release/agent-tool-chain-manager-cli"
-            CLI_ASSET="agent-tool-chain-manager-cli-${{ matrix.label }}"
+            CLI_PATH="src-tauri/target/${{ matrix.target }}/release/agent-toolchain-manager-cli"
+            CLI_ASSET="agent-toolchain-manager-cli-${{ matrix.label }}"
           fi
           CLI_UPLOAD="$RUNNER_TEMP/$CLI_ASSET"
           cp "$CLI_PATH" "$CLI_UPLOAD"
@@ -432,10 +432,10 @@ jobs:
 
           fail=0
           for cli_asset in \
-            agent-tool-chain-manager-cli-macOS-arm64 \
-            agent-tool-chain-manager-cli-macOS-x64 \
-            agent-tool-chain-manager-cli-Windows-x64.exe \
-            agent-tool-chain-manager-cli-Linux-x64; do
+            agent-toolchain-manager-cli-macOS-arm64 \
+            agent-toolchain-manager-cli-macOS-x64 \
+            agent-toolchain-manager-cli-Windows-x64.exe \
+            agent-toolchain-manager-cli-Linux-x64; do
             if ! echo "$asset_names" | grep -qx "$cli_asset"; then
               echo "Missing CLI release asset: ${cli_asset}" >&2
               fail=1

@@ -67,7 +67,7 @@ import type { Theme } from "../hooks/useTheme";
 
 // The fork does not install application updates until it has an independent
 // signed release channel; source skill updates remain unaffected.
-const FORK_RELEASES_URL = "https://github.com/wzwu0309/agent-tool-chain-manager/releases";
+const FORK_RELEASES_URL = "https://github.com/wzwu0309/agent-toolchain-manager/releases";
 
 interface SortableAgentCardProps {
   agentKey: string;
@@ -194,8 +194,8 @@ export function Settings() {
   const [addingCustom, setAddingCustom] = useState(false);
   const [showMoreAgents, setShowMoreAgents] = useState(false);
 
-  const GITHUB_URL = "https://github.com/wzwu0309/agent-tool-chain-manager";
-  const WEBSITE_URL = "https://github.com/wzwu0309/agent-tool-chain-manager#readme";
+  const GITHUB_URL = "https://github.com/wzwu0309/agent-toolchain-manager";
+  const WEBSITE_URL = "https://github.com/wzwu0309/agent-toolchain-manager#readme";
 
   const startEditPath = useCallback((key: string, currentPath: string) => {
     setEditingPathKey(key);
@@ -598,7 +598,7 @@ export function Settings() {
             enabledCustomCount > 0 ? `${enabledCustomCount} custom` : "",
           ].filter(Boolean).join(", ");
       const parts = [
-        "**Diagnostics** (auto-collected by Skills Manager)",
+        "**Diagnostics** (auto-collected by Agent Toolchain Manager)",
         "",
         `- App version: \`${info.app_version}\``,
         `- OS: \`${info.os} ${info.os_version} (${info.arch})\``,

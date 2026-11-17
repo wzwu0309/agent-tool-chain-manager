@@ -1,21 +1,22 @@
-> **Fork notice — Agent Tool Chain Manager.** This is a separately installed fork of Skills Manager.
+> **Fork notice — Agent Toolchain Manager.** This is a separately installed fork of Skills Manager.
 > The default data root and CLI name differ, and app auto-updates are disabled
-> until this fork has its own signed releases. Upstream instructions below are
-> retained for reference; upstream install/download links do not install this fork.
+> until this fork has its own signed releases. This fork has distinct install
+> and CLI instructions; any upstream media and badges remain for attribution.
 > Read [Fork release isolation](FORK_RELEASE_ISOLATION.md) before building.
+> Demo videos and upstream popularity badges below belong to the original project.
 
 <p align="center">
   <img src="assets/icon.png" width="80" />
 </p>
 
-<h1 align="center">Skills Manager</h1>
+<h1 align="center">Agent Toolchain Manager</h1>
 
 <p align="center">
   One app to manage AI agent skills across all your coding tools.
 </p>
 
 <p align="center">
-  <strong><a href="https://skillsmanager.dev">skillsmanager.dev</a></strong>
+  <strong><a href="https://github.com/wzwu0309/agent-toolchain-manager">GitHub · Agent Toolchain Manager</a></strong>
 </p>
 
 <p align="center">
@@ -43,7 +44,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo/library.png" width="800" alt="Skills Manager Library" />
+  <img src="assets/demo/library.png" width="800" alt="Upstream Skills Manager UI reference" />
 </p>
 
 <p align="center"><strong>Install Skills — Marketplace</strong></p>
@@ -70,11 +71,11 @@
   <img src="assets/diagram-concept-map.png" width="640" alt="Concept map: Library, Preset, Global Workspace, Project Workspace, Agent" />
 </p>
 
-- **Unified skill library** — Install skills from Git repos, local folders, `.zip` / `.skill` archives, or the [skills.sh](https://skills.sh) marketplace. Everything goes into one central repo, which defaults to `~/.agent-tool-chain-manager` and can be customized in **Settings**.
+- **Unified skill library** — Install skills from Git repos, local folders, `.zip` / `.skill` archives, or the [skills.sh](https://skills.sh) marketplace. Everything goes into one central repo, which defaults to `~/.agent-toolchain-manager` and can be customized in **Settings**.
 - **Marketplace** — Browse popular skills from the marketplace and find them with keyword search.
-- **Your agents can manage skills** — Claude Code, Codex, Cursor and the rest can install a skill, deploy it to another agent, or report what is where, by driving Skills Manager instead of writing into an agent's folder behind its back — so sources, presets, update tracking and per-agent state stay intact. The Dashboard sets this up in one click; see [Let your agents manage skills](#let-your-agents-manage-skills).
+- **Your agents can manage skills** — Claude Code, Codex, Cursor and the rest can install a skill, deploy it to another agent, or report what is where, by driving Agent Toolchain Manager instead of writing into an agent's folder behind its back — so sources, presets, update tracking and per-agent state stay intact. The Dashboard sets this up in one click; see [Let your agents manage skills](#let-your-agents-manage-skills).
 - **Presets** — Group skills into named presets. In any workspace, click a preset pill to instantly activate or deactivate all its skills for the current agent scope. Applying a preset is a one-time copy, not a live sync. The sidebar lists all presets for quick access.
-- **Global Workspace** — Each agent gets its own page listing every skill in its global folder — including ones installed outside Skills Manager — so the view always reflects what the agent actually sees. Add or remove skills per agent, or use the All Agents overview to manage every installed agent at once.
+- **Global Workspace** — Each agent gets its own page listing every skill in its global folder — including ones installed outside Agent Toolchain Manager — so the view always reflects what the agent actually sees. Add or remove skills per agent, or use the All Agents overview to manage every installed agent at once.
 - **Project Workspaces** — View and manage project-local skill folders for supported agents, compare them with your central library, and sync changes in either direction. Supports nested skill directories and per-agent assignment when exporting.
 - **Linked Workspaces** — Point to any directory as a skills root — useful for skills that live outside the default agent paths. Managed as a standalone workspace without participating in global preset sync.
 - **Multi-tool sync** — Sync skills to any supported tool via symlink or copy with a single click. Every skill card shows an agent icon badge per enabled agent — click a badge to install or remove that skill for that agent right from the card, with the badge reflecting live sync state.
@@ -93,7 +94,7 @@
 
 No independently signed installer is available for this fork yet. Upstream
 Homebrew, Scoop and GitHub Releases commands install the original Skills
-Manager, **not** Agent Tool Chain Manager.
+Manager, **not** Agent Toolchain Manager.
 
 On a machine with Rust, Cargo, Node and Tauri build prerequisites:
 
@@ -113,14 +114,14 @@ See [Fork release isolation](FORK_RELEASE_ISOLATION.md) before installation.
 
 ## Let your agents manage skills
 
-Claude Code, Codex, Cursor and the rest can install a skill, deploy it to another agent, or report what is where — by driving Skills Manager rather than writing into an agent's folder behind its back. That is what keeps source metadata, preset membership, update tracking and cross-agent deployment state intact.
+Claude Code, Codex, Cursor and the rest can install a skill, deploy it to another agent, or report what is where — by driving Agent Toolchain Manager rather than writing into an agent's folder behind its back. That is what keeps source metadata, preset membership, update tracking and cross-agent deployment state intact.
 
 The Dashboard offers a one-time setup: pick the agents that should be able to do it, and the app installs the [`manage-skills`](skills/manage-skills/SKILL.md) skill and deploys it to exactly those. Afterwards it is an ordinary library skill — adding or removing an agent is the agent badge row on its own card. No PATH setup is involved: the app publishes a copy of its CLI where agents look for it.
 
 It is also an ordinary published skill, so it can be installed without the app:
 
 ```bash
-npx skills add xingkongliang/skills-manager
+npx skills add wzwu0309/agent-toolchain-manager
 ```
 
 ## Backup & Multi-Device Sync
@@ -220,7 +221,7 @@ Available command groups:
 - `git` — operate on the git-backed `skills/` repository (`clone`, `pull`, `push`, `commit`, `versions`, `restore`)
 
 Extra flags:
-- `--skills-root <path>` — operate on a cloned/exported skills repo directly instead of the local app default. The manager's state (DB, presets, cache, logs) lives in `~/.agent-tool-chain-manager/external/<name>-<hash>/`, namespaced by the canonical path of the skills root, so the external checkout itself stays clean.
+- `--skills-root <path>` — operate on a cloned/exported skills repo directly instead of the local app default. The manager's state (DB, presets, cache, logs) lives in `~/.agent-toolchain-manager/external/<name>-<hash>/`, namespaced by the canonical path of the skills root, so the external checkout itself stays clean.
 - `--json` — machine-readable output for scripts/agents. Failures print `{"ok": false, "code": …, "message": …}` on stderr with a non-zero exit. A deployment refused because the target is not ours carries the paths as data (`code: "TARGET_CONFLICT"`, `details.conflicts[].path`) so a caller can name the directory in the way instead of quoting a sentence.
 
 ```bash
@@ -234,27 +235,27 @@ The Windows app cannot create links inside WSL, so it can only copy skills there
 ```bash
 # Build the CLI from this fork on Linux, with Rust/Cargo and Node:
 npm run cli:build
-# Place src-tauri/target/debug/agent-tool-chain-manager-cli on PATH.
-agent-tool-chain-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
-agent-tool-chain-manager-cli skills install ./my-skill
-agent-tool-chain-manager-cli skills deploy my-skill --agent hermes-work
+# Place src-tauri/target/debug/agent-toolchain-manager-cli on PATH.
+agent-toolchain-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
+agent-toolchain-manager-cli skills install ./my-skill
+agent-toolchain-manager-cli skills deploy my-skill --agent hermes-work
 ```
 
 #### Where the binary lives
 
-At startup the app publishes a copy of its own CLI to `~/.agent-tool-chain-manager/bin/agent-tool-chain-manager-cli`, always matching the running app, so agents can find it without anything on your PATH. A `.version` stamp beside it is written only after the copy is verified and removed before each republish, so a copy that failed — a binary held open on Windows, say — is never presented as usable.
+At startup the app publishes a copy of its own CLI to `~/.agent-toolchain-manager/bin/agent-toolchain-manager-cli`, always matching the running app, so agents can find it without anything on your PATH. A `.version` stamp beside it is written only after the copy is verified and removed before each republish, so a copy that failed — a binary held open on Windows, say — is never presented as usable.
 
 Putting the CLI on your *own* PATH, for typing commands yourself, is separate:
 
 ```bash
 npm run cli:install
 # equivalent to:
-# cargo install --path src-tauri --bin agent-tool-chain-manager-cli --locked --force
+# cargo install --path src-tauri --bin agent-toolchain-manager-cli --locked --force
 ```
 
-This drops the binary at `~/.cargo/bin/agent-tool-chain-manager-cli`. Re-run after pulling updates to refresh it.
+This drops the binary at `~/.cargo/bin/agent-toolchain-manager-cli`. Re-run after pulling updates to refresh it.
 
-This fork currently has no signed standalone CLI releases. When available, use only this fork's `agent-tool-chain-manager-cli-*` asset, make it executable on macOS/Linux, and place it on PATH.
+This fork currently has no signed standalone CLI releases. When available, use only this fork's `agent-toolchain-manager-cli-*` asset, make it executable on macOS/Linux, and place it on PATH.
 
 #### Concurrent use with the desktop app
 
@@ -271,7 +272,7 @@ npm run cli:build
 
 **macOS refuses to open the app.** Releases from **v1.29.0** onward are signed with an Apple Developer ID certificate and notarized, so they open normally. If you see "Apple could not verify…" or "App is damaged", you are on v1.28.5 or older — upgrading is the fix. (Upgrading changes the code signature, so macOS may ask once more for the `skills-manager-git-backup` keychain entry; click **Always Allow**.)
 
-Anything else — [open an issue](https://github.com/xingkongliang/skills-manager/issues), and attach the bundle from **Settings → Export Logs**.
+Anything else — [open an issue](https://github.com/wzwu0309/agent-toolchain-manager/issues), and attach the bundle from **Settings → Export Logs**.
 
 ## Star History
 

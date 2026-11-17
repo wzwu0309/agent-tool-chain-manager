@@ -1,6 +1,6 @@
 {
   "app": {
-    "name": "Agent Tool Chain Manager"
+    "name": "Agent Toolchain Manager"
   },
   "sidebar": {
     "dashboard": "Panel",
@@ -17,7 +17,7 @@
   },
   "help": {
     "eyebrow": "Guía",
-    "title": "Inicio rápido de Skills Manager",
+    "title": "Inicio rápido de Agent Toolchain Manager",
     "description": "Ruta más rápida: instala skills → abre el Espacio de trabajo global → haz clic en una píldora de preset para activar. Pulsa ⌘K en cualquier momento para la paleta de comandos. Usa los Espacios de trabajo de proyecto, la Copia de seguridad con Git y los Ajustes según lo necesites.",
     "items": {
       "workflows": {
@@ -38,7 +38,7 @@
       },
       "global": {
         "title": "Espacio de trabajo global",
-        "description": "Cada agente tiene su propia página con todos los skills de su carpeta global, incluidos los instalados fuera de Skills Manager, para que la vista coincida con lo que el agente realmente ve. Usa + Agregar skills para traer desde tu biblioteca central con chips de agentes de destino en línea, o usa la vista general Todos los agentes para gestionar cada agente instalado a la vez. Los skills que solo existen en una carpeta de agente se pueden eliminar directamente desde la tarjeta."
+        "description": "Cada agente tiene su propia página con todos los skills de su carpeta global, incluidos los instalados fuera de Agent Toolchain Manager, para que la vista coincida con lo que el agente realmente ve. Usa + Agregar skills para traer desde tu biblioteca central con chips de agentes de destino en línea, o usa la vista general Todos los agentes para gestionar cada agente instalado a la vez. Los skills que solo existen en una carpeta de agente se pueden eliminar directamente desde la tarjeta."
       },
       "projects": {
         "title": "Espacios de trabajo de proyecto",
@@ -721,7 +721,7 @@
     "openInFinder": "Abrir carpeta",
     "otherAgentsSection": "Otros agentes compatibles ({{count}})",
     "overridePathHint": "Usando una ruta de skills personalizada manualmente",
-    "panicBanner": "Skills Manager se bloqueó durante la última sesión ({{time}}).",
+    "panicBanner": "Agent Toolchain Manager se bloqueó durante la última sesión ({{time}}).",
     "panicDismiss": "Descartar",
     "pathOverridden": "Ruta personalizada",
     "pathReset": "Ruta del agente restablecida al valor predeterminado",
@@ -788,8 +788,8 @@
     "trayIconOffHint": "El icono de la bandeja está oculto, por lo que cerrar la ventana cerrará la aplicación.",
     "updateAvailable": "¡Nueva versión {{version}} disponible!",
     "updateError": "Error en la actualización automática. Abriendo página de descarga…",
-    "updateRelocate": "Mueve Skills Manager a tu carpeta de Aplicaciones y ábrelo desde allí para actualizarlo directamente.",
-    "version": "Skills Manager {{version}}",
+    "updateRelocate": "Las actualizaciones desde la aplicación están desactivadas hasta contar con publicaciones firmadas propias.",
+    "version": "Agent Toolchain Manager {{version}}",
     "viewUpdate": "Ver",
     "website": "Sitio web"
   },

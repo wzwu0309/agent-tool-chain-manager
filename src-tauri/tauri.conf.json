@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Agent Tool Chain Manager",
+  "productName": "Agent Toolchain Manager",
   "version": "1.45.0",
   "identifier": "com.wzwu0309.agenttoolchainmanager",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Agent Tool Chain Manager",
+        "title": "Agent Toolchain Manager",
         "width": 1440,
         "height": 860,
         "minWidth": 1100,

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 9;
+const LATEST_VERSION: u32 = 10;
 
 /// Run all pending migrations on the database.
 ///
@@ -56,6 +56,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         6 => migrate_v6_to_v7(conn),
         7 => migrate_v7_to_v8(conn),
         8 => migrate_v8_to_v9(conn),
+        9 => migrate_v9_to_v10(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -338,6 +339,23 @@ fn migrate_v8_to_v9(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v9 → v10: independent baselines for managed project Copy deployments.
+/// Existing copies deliberately have no baseline; unknown provenance must
+/// never authorize deleting their content based on a newer mtime.
+fn migrate_v9_to_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_copy_baselines (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            target_path TEXT NOT NULL,
+            skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+            tree_hash TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            PRIMARY KEY(project_id, target_path)
+        );",
+    )?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn add_column_if_missing(
@@ -401,11 +419,41 @@ mod tests {
 
         assert!(tables.contains(&"skills".to_string()));
         assert!(tables.contains(&"skill_targets".to_string()));
+        assert!(tables.contains(&"project_copy_baselines".to_string()));
         assert!(tables.contains(&"scenarios".to_string()));
         assert!(tables.contains(&"projects".to_string()));
         assert!(tables.contains(&"skill_tags".to_string()));
         assert!(tables.contains(&"scenario_skill_tools".to_string()));
         assert!(tables.contains(&"audit_log".to_string()));
+    }
+
+    #[test]
+    fn test_v9_project_copy_baseline_migration_preserves_existing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE projects (id TEXT PRIMARY KEY);
+             CREATE TABLE skills (id TEXT PRIMARY KEY);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO projects (id) VALUES ('p1');
+             INSERT INTO skills (id) VALUES ('s1');
+             INSERT INTO settings (key, value) VALUES ('theme', 'dark');
+             PRAGMA user_version=9;"
+        ).unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO project_copy_baselines (project_id, target_path, skill_id, tree_hash, source_hash)
+             VALUES ('p1', '/tmp/project/demo', 's1', 'copy', 'center')", []
+        ).unwrap();
+        let theme: String = conn.query_row(
+            "SELECT value FROM settings WHERE key='theme'", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(theme, "dark");
+        conn.execute("DELETE FROM projects WHERE id='p1'", []).unwrap();
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM project_copy_baselines", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(remaining, 0, "project deletion must clean its Copy provenance");
     }
 
     #[test]

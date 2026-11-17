@@ -4,6 +4,7 @@ pub mod auto_backup;
 pub mod central_repo;
 pub mod cli_bridge;
 pub mod content_hash;
+pub mod copy_snapshot;
 pub mod crypto;
 pub mod error;
 pub mod file_manager;

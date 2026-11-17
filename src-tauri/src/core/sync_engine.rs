@@ -122,6 +122,10 @@ pub enum ReplacePolicy<'a> {
     /// Explicit user intent: adopt an existing directory into the library,
     /// `--force`, or "update this copy from center".
     UserConfirmed,
+    /// A project Copy may be replaced only while its entire on-disk tree
+    /// equals the fingerprint recorded at our last successful deployment.
+    /// Rechecked at the destructive boundary, not only during UI planning.
+    ProjectCopyBaseline { tree_hash: &'a str },
 }
 
 impl ReplacePolicy<'_> {
@@ -138,11 +142,13 @@ impl ReplacePolicy<'_> {
                 // does not: something turned our directory into a link.
                 ReplacePolicy::Recorded { mode } => *mode == "symlink",
                 ReplacePolicy::UserConfirmed => true,
+                ReplacePolicy::ProjectCopyBaseline { .. } => false,
             },
             TargetState::RealDir => match self {
                 ReplacePolicy::NoClobber => false,
                 ReplacePolicy::Recorded { mode } => *mode == "copy",
                 ReplacePolicy::UserConfirmed => true,
+                ReplacePolicy::ProjectCopyBaseline { .. } => true,
             },
             // We never deploy a bare file, so no record can vouch for one.
             TargetState::RealFile => matches!(self, ReplacePolicy::UserConfirmed),
@@ -154,6 +160,7 @@ impl ReplacePolicy<'_> {
             ReplacePolicy::NoClobber => "is not managed by Skills Manager",
             ReplacePolicy::Recorded { .. } => "does not match its recorded deployment",
             ReplacePolicy::UserConfirmed => "cannot be replaced",
+            ReplacePolicy::ProjectCopyBaseline { .. } => "has changed since its last managed Copy deployment",
         }
     }
 }
@@ -202,6 +209,15 @@ fn authorize_replacement(
             reason: policy.describe(),
         }
         .into());
+    }
+    if let ReplacePolicy::ProjectCopyBaseline { tree_hash } = policy {
+        let actual = crate::core::copy_snapshot::fingerprint(target)?;
+        if actual != tree_hash {
+            return Err(ReplaceRefused {
+                target: target.to_path_buf(),
+                reason: policy.describe(),
+            }.into());
+        }
     }
     Ok(state)
 }
@@ -289,12 +305,55 @@ pub fn target_dir_name(central_path: &Path, skill_name: &str) -> String {
         .unwrap_or_else(|| skill_name.to_string())
 }
 
+/// Replace a verified project Copy without ever deleting it before the new
+/// source has been copied successfully. Both siblings are on the same volume,
+/// so the two renames can be rolled back if publishing the staged copy fails.
+/// A crash between renames leaves the old tree in a visible staging directory
+/// rather than deleting the only good copy.
+fn replace_verified_project_copy(source: &Path, target: &Path, tree_hash: &str) -> Result<SyncMode> {
+    ensure_dst_not_inside_src(source, target)?;
+    let parent = target.parent().context("Copy target has no parent directory")?;
+    let staging = tempfile::Builder::new()
+        .prefix(".skills-manager-copy-update-")
+        .tempdir_in(parent)
+        .with_context(|| format!("Cannot stage replacement for {}", target.display()))?;
+    let next = staging.path().join("incoming");
+    copy_dir_recursive(source, &next)
+        .with_context(|| format!("Failed to stage project Copy from {}", source.display()))?;
+
+    // Repeat the fingerprint immediately before the destructive rename, not
+    // when the GUI rendered the update button or while we staged the source.
+    authorize_replacement(source, target, ReplacePolicy::ProjectCopyBaseline { tree_hash })?;
+    let previous = staging.path().join("previous");
+    std::fs::rename(target, &previous)
+        .with_context(|| format!("Cannot move old project Copy {} to recovery slot", target.display()))?;
+    if let Err(err) = std::fs::rename(&next, target) {
+        // Preserve the backup if restoration fails, for manual recovery.
+        if let Err(restore_err) = std::fs::rename(&previous, target) {
+            let recovery = staging.keep();
+            anyhow::bail!(
+                "Failed to install project Copy ({err}) and restore previous copy ({restore_err}); recover it from {}",
+                recovery.join("previous").display(),
+            );
+        }
+        return Err(err).with_context(|| format!("Failed to publish project Copy {}", target.display()));
+    }
+    crate::core::file_watcher::mute_self_writes(target);
+    Ok(SyncMode::Copy)
+}
+
 pub fn sync_skill(
     source: &Path,
     target: &Path,
     mode: SyncMode,
     policy: ReplacePolicy<'_>,
 ) -> Result<SyncMode> {
+    // Managed project Copies must never be removed before we have staged a
+    // complete replacement. A failed source read leaves the old copy intact.
+    if let (SyncMode::Copy, ReplacePolicy::ProjectCopyBaseline { tree_hash }) = (mode, policy) {
+        return replace_verified_project_copy(source, target, tree_hash);
+    }
+
     // Internal self-check uses no hash context, so Copy mode always
     // proceeds — the caller (e.g. `sync_desired_targets`) is the place
     // that knows about freshness and can short-circuit.

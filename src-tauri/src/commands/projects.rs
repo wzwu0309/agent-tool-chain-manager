@@ -206,9 +206,51 @@ fn project_agent_targets_for_record(
         .collect()
 }
 
+/// A tracked Copy has a real three-way baseline, unlike the legacy mtime
+/// heuristic. This status is informational; the destructive path independently
+/// verifies the full target fingerprint immediately before replacement.
+fn classify_project_sync_status(
+    store: &SkillStore,
+    project_id: &str,
+    skill: &project_scanner::ProjectSkillInfo,
+    managed: Option<&SkillRecord>,
+) -> String {
+    let Some(managed) = managed else {
+        return "project_only".to_string();
+    };
+    if !std::fs::symlink_metadata(&skill.path).is_ok_and(|meta| meta.is_dir()) {
+        return classify_sync_status(skill, Some(managed));
+    }
+    let baseline = store
+        .get_project_copy_baseline(project_id, &skill.path)
+        .ok()
+        .flatten();
+    let Some((saved_skill, project_hash, source_hash)) = baseline else {
+        return if classify_sync_status(skill, Some(managed)) == "in_sync" {
+            "in_sync".to_string()
+        } else {
+            "diverged".to_string()
+        };
+    };
+    if saved_skill != managed.id {
+        return "diverged".to_string();
+    }
+    let project_changed = crate::core::copy_snapshot::fingerprint(Path::new(&skill.path))
+        .map_or(true, |hash| hash != project_hash);
+    let center_changed = crate::core::copy_snapshot::fingerprint(Path::new(&managed.central_path))
+        .map_or(true, |hash| hash != source_hash);
+    match (project_changed, center_changed) {
+        (false, false) => "in_sync",
+        (true, false) => "project_newer",
+        (false, true) => "center_newer",
+        (true, true) => "diverged",
+    }.to_string()
+}
+
 /// Convert a project record into its DTO, folding the copies of one logical
 /// skill across agents together by relative path.
 fn project_to_dto(
+    store: Option<&SkillStore>,
     rec: &ProjectRecord,
     all_managed: &[SkillRecord],
     configs: &[project_scanner::AgentSkillConfig],
@@ -218,7 +260,10 @@ fn project_to_dto(
 
     for skill in &skills {
         let matched = find_best_center_match(skill, all_managed);
-        let status = classify_sync_status(skill, matched);
+        let status = store.map_or_else(
+            || classify_sync_status(skill, matched),
+            |store| classify_project_sync_status(store, &rec.id, skill, matched),
+        );
         let key = skill.relative_path.to_lowercase();
         let existing = grouped_statuses
             .entry(key)
@@ -636,7 +681,7 @@ pub fn get_projects_internal(store: &SkillStore) -> Result<Vec<ProjectDto>, AppE
     let count = records.len();
     let dtos: Vec<ProjectDto> = records
         .iter()
-        .map(|r| project_to_dto(r, &all_managed, &configs))
+        .map(|r| project_to_dto(Some(store), r, &all_managed, &configs))
         .collect();
     let elapsed_ms = start.elapsed().as_millis();
     if should_log_first_or_slow(&GET_PROJECTS_FIRST_CALL, elapsed_ms, 100) {
@@ -725,7 +770,7 @@ pub fn add_project_internal(store: &SkillStore, path: String) -> Result<ProjectD
     store.insert_project(&record).map_err(AppError::db)?;
     let all_managed = store.get_all_skills().map_err(AppError::db)?;
     let configs = agent_skill_configs(&store);
-    Ok(project_to_dto(&record, &all_managed, &configs))
+    Ok(project_to_dto(Some(store), &record, &all_managed, &configs))
 }
 
 #[tauri::command]
@@ -799,7 +844,7 @@ pub async fn add_linked_workspace(
         store.insert_project(&record).map_err(AppError::db)?;
         let all_managed = store.get_all_skills().map_err(AppError::db)?;
         let configs = agent_skill_configs(&store);
-        Ok(project_to_dto(&record, &all_managed, &configs))
+        Ok(project_to_dto(Some(&store), &record, &all_managed, &configs))
     })
     .await?
 }
@@ -941,7 +986,7 @@ pub fn get_project_skills_internal(
             .as_ref()
             .and_then(|skill_id| tags_map.get(skill_id).cloned())
             .unwrap_or_default();
-        skill.sync_status = classify_sync_status(skill, matched);
+        skill.sync_status = classify_project_sync_status(store, &project_id, skill, matched);
     }
 
     Ok(skills)
@@ -1279,65 +1324,90 @@ pub async fn update_project_skill_from_center(
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        ensure_safe_skill_relative_path(&skill_relative_path)?;
-
-        let record = store
-            .get_project_by_id(&project_id)
-            .map_err(AppError::db)?
-            .ok_or_else(|| AppError::not_found("Workspace not found"))?;
-
-        let configs = agent_skill_configs(&store);
-        let skills = read_workspace_skills(&record, &configs);
-        let skill = skills
-            .iter()
-            .find(|s| s.relative_path == skill_relative_path && s.agent == agent)
-            .ok_or_else(|| AppError::not_found("Skill not found in workspace"))?;
-
-        let all_managed = store.get_all_skills().unwrap_or_default();
-        let managed = find_best_center_match(skill, &all_managed)
-            .ok_or_else(|| AppError::not_found("No matching skill in center"))?;
-
-        // Mirror the global-workspace protection (agent_workspace.rs): never
-        // overwrite a project copy that has unsynced local edits (#225 review).
-        if classify_sync_status(skill, Some(managed)) == "project_newer" {
-            return Err(AppError::invalid_input(
-                "Project skill is newer than the Skills Center version",
-            ));
-        }
-
-        let (skills_root, disabled_root) = resolve_agent_skills_roots(&store, &record, &agent)
-            .ok_or_else(|| AppError::not_found(format!("Unknown agent: {}", agent)))?;
-        let target_path = PathBuf::from(&skill.path);
-        if target_path.starts_with(&skills_root) {
-            ensure_dir_within_root(&target_path, &skills_root)?;
-        } else if disabled_root
-            .as_ref()
-            .map(|root| target_path.starts_with(root))
-            .unwrap_or(false)
-        {
-            let disabled_root = disabled_root.expect("checked above");
-            ensure_dir_within_root(&target_path, &disabled_root)?;
-        } else {
-            return Err(AppError::invalid_input("Invalid skill directory path"));
-        }
-
-        let source = PathBuf::from(&managed.central_path);
-        let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
-        let mode = sync_engine::sync_mode_for_tool(&agent, configured_mode.as_deref());
-        // UserConfirmed: this intentionally replaces an existing project copy
-        // the user chose to update, and project deployments never create
-        // `skill_targets` rows, so no record could vouch for it. The
-        // project_newer check above is the guard that makes this safe.
-        sync_engine::sync_skill(
-            &source,
-            &target_path,
-            mode,
-            sync_engine::ReplacePolicy::UserConfirmed,
-        )
-        .map_err(AppError::io)?;
-        Ok(())
+        update_project_skill_from_center_internal(&store, &project_id, &skill_relative_path, &agent)
     })
     .await?
+}
+
+/// A pull must prove that the exact Copy target still equals its last managed
+/// deployment, regardless of which side has the newer mtime. Legacy project
+/// copies have no provenance and are not implicitly adopted for deletion.
+pub fn update_project_skill_from_center_internal(
+    store: &SkillStore,
+    project_id: &str,
+    skill_relative_path: &str,
+    agent: &str,
+) -> Result<(), AppError> {
+    ensure_safe_skill_relative_path(skill_relative_path)?;
+    let record = get_project_record(store, project_id)?;
+    let configs = agent_skill_configs(store);
+    let skills = read_workspace_skills(&record, &configs);
+    let skill = skills
+        .iter()
+        .find(|s| s.relative_path == skill_relative_path && s.agent == agent)
+        .ok_or_else(|| AppError::not_found("Skill not found in workspace"))?;
+    let all_managed = store.get_all_skills().map_err(AppError::db)?;
+    let managed = find_best_center_match(skill, &all_managed)
+        .ok_or_else(|| AppError::not_found("No matching skill in center"))?;
+
+    let (skills_root, disabled_root) = resolve_agent_skills_roots(store, &record, agent)
+        .ok_or_else(|| AppError::not_found(format!("Unknown agent: {}", agent)))?;
+    let target_path = PathBuf::from(&skill.path);
+    if target_path.starts_with(&skills_root) {
+        ensure_dir_within_root(&target_path, &skills_root)?;
+    } else if disabled_root.as_ref().is_some_and(|root| target_path.starts_with(root)) {
+        ensure_dir_within_root(&target_path, disabled_root.as_ref().expect("checked above"))?;
+    } else {
+        return Err(AppError::invalid_input("Invalid skill directory path"));
+    }
+
+    let source = PathBuf::from(&managed.central_path);
+    let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
+    let mode = sync_engine::sync_mode_for_tool(agent, configured_mode.as_deref());
+    let state = sync_engine::classify_target(&target_path, Some(&source)).map_err(AppError::io)?;
+    let target_key = target_path.to_string_lossy();
+    let baseline = store
+        .get_project_copy_baseline(project_id, &target_key)
+        .map_err(AppError::db)?;
+    let saved_hash = match state {
+        sync_engine::TargetState::RealDir => {
+            let (saved_skill, hash, _) = baseline.as_ref().ok_or_else(|| {
+                AppError::invalid_input(
+                    "Project Copy has no recorded deployment baseline; move it aside and redeploy to avoid losing local changes",
+                )
+            })?;
+            if saved_skill != &managed.id {
+                return Err(AppError::invalid_input(
+                    "Project Copy belongs to a different recorded skill; refusing to overwrite",
+                ));
+            }
+            Some(hash.as_str())
+        }
+        sync_engine::TargetState::LinkToSource => None,
+        _ => return Err(AppError::invalid_input(
+            "Project target is not a managed Copy or a link to this Skills Center source",
+        )),
+    };
+    if saved_hash.is_some() && matches!(mode, sync_engine::SyncMode::Symlink) {
+        return Err(AppError::invalid_input(
+            "Switching a managed project Copy to a symlink requires undeploying and redeploying",
+        ));
+    }
+    let policy = match saved_hash {
+        Some(tree_hash) => sync_engine::ReplacePolicy::ProjectCopyBaseline { tree_hash },
+        None => sync_engine::ReplacePolicy::NoClobber,
+    };
+    sync_engine::sync_skill(&source, &target_path, mode, policy).map_err(AppError::io)?;
+    if matches!(mode, sync_engine::SyncMode::Copy) {
+        let hash = crate::core::copy_snapshot::fingerprint(&target_path).map_err(AppError::io)?;
+        let source_hash = crate::core::copy_snapshot::fingerprint(&source).map_err(AppError::io)?;
+        store.set_project_copy_baseline(project_id, &target_key, &managed.id, &hash, &source_hash)
+            .map_err(AppError::db)?;
+    } else {
+        store.delete_project_copy_baseline(project_id, &target_key)
+            .map_err(AppError::db)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1350,22 +1420,35 @@ pub async fn toggle_project_skill(
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        ensure_safe_skill_relative_path(&skill_relative_path)?;
-
-        let record = store
-            .get_project_by_id(&project_id)
-            .map_err(AppError::db)?
-            .ok_or_else(|| AppError::not_found("Workspace not found"))?;
-
-        let (skills_dir, disabled_dir) = resolve_agent_skills_roots(&store, &record, &agent)
-            .ok_or_else(|| AppError::not_found(format!("Unknown agent: {}", agent)))?;
-        let disabled_dir = disabled_dir.ok_or_else(|| {
-            AppError::invalid_input("This workspace does not support disabling skills")
-        })?;
-
-        set_project_skill_enabled_state(&skills_dir, &disabled_dir, &skill_relative_path, enabled)
+        toggle_project_skill_internal(&store, &project_id, &skill_relative_path, &agent, enabled)
     })
     .await?
+}
+
+pub fn toggle_project_skill_internal(
+    store: &SkillStore,
+    project_id: &str,
+    skill_relative_path: &str,
+    agent: &str,
+    enabled: bool,
+) -> Result<(), AppError> {
+    ensure_safe_skill_relative_path(skill_relative_path)?;
+    let record = get_project_record(store, project_id)?;
+    let (skills_dir, disabled_dir) = resolve_agent_skills_roots(store, &record, agent)
+        .ok_or_else(|| AppError::not_found(format!("Unknown agent: {}", agent)))?;
+    let disabled_dir = disabled_dir.ok_or_else(|| {
+        AppError::invalid_input("This workspace does not support disabling skills")
+    })?;
+    let before = if enabled { disabled_dir.join(skill_relative_path) } else { skills_dir.join(skill_relative_path) };
+    let after = if enabled { skills_dir.join(skill_relative_path) } else { disabled_dir.join(skill_relative_path) };
+    let had_source = before.is_dir() && !after.is_dir();
+    set_project_skill_enabled_state(&skills_dir, &disabled_dir, skill_relative_path, enabled)?;
+    if had_source && after.is_dir() && !before.exists() {
+        store.move_project_copy_baseline(
+            project_id, &before.to_string_lossy(), &after.to_string_lossy(),
+        ).map_err(AppError::db)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1425,6 +1508,8 @@ pub fn delete_project_skill_internal(
         ensure_removable(store, &record, &target)?;
     }
     remove_workspace_skill_target(&target)?;
+    store.delete_project_copy_baseline(&project_id, &target.to_string_lossy())
+        .map_err(AppError::db)?;
     Ok(())
 }
 
@@ -1449,7 +1534,10 @@ pub fn remove_planned_project_copy(
     if !force {
         ensure_removable(store, &record, &path)?;
     }
-    remove_workspace_skill_target(&path)
+    remove_workspace_skill_target(&path)?;
+    store.delete_project_copy_baseline(project_id, &path.to_string_lossy())
+        .map_err(AppError::db)?;
+    Ok(())
 }
 
 /// Refuse unless what sits at `target` is a scanned project skill whose
@@ -1613,6 +1701,8 @@ pub enum ProjectDeployState {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ProjectDeployTarget {
+    #[serde(skip)]
+    project_id: String,
     pub skill_id: String,
     pub skill: String,
     pub agent: String,
@@ -1716,6 +1806,7 @@ pub fn plan_project_deploy(
                 }
             };
             plan.push(ProjectDeployTarget {
+                project_id: project_id.to_string(),
                 skill_id: skill.id.clone(),
                 skill: skill.name.clone(),
                 agent: group.key.clone(),
@@ -1820,6 +1911,14 @@ pub fn apply_project_deploy(
             sync_engine::ReplacePolicy::NoClobber,
         )
         .map_err(AppError::io)?;
+        if matches!(mode, sync_engine::SyncMode::Copy) {
+            let hash = crate::core::copy_snapshot::fingerprint(&target_dir).map_err(AppError::io)?;
+            let source_hash = crate::core::copy_snapshot::fingerprint(&target.source).map_err(AppError::io)?;
+            store.set_project_copy_baseline(
+                &target.project_id,
+                &target.path, &target.skill_id, &hash, &source_hash,
+            ).map_err(AppError::db)?;
+        }
     }
     Ok(())
 }
@@ -2404,7 +2503,7 @@ mod tests {
             },
         ];
 
-        let dto = project_to_dto(&record, &[], &configs);
+        let dto = project_to_dto(None, &record, &[], &configs);
 
         assert_eq!(dto.skill_count, 1);
         assert_eq!(dto.sync_health.project_only, 1);
@@ -2936,6 +3035,180 @@ mod project_plan_tests {
             .iter()
             .map(|c| PathBuf::from(&c.path))
             .collect()
+    }
+
+    /// SM-06: a real project Copy is automatically refreshed only while it
+    /// still equals our recorded deployment, never according to mtime alone.
+    #[test]
+    fn tracked_project_copy_status_distinguishes_each_side_without_mtime() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+        let source = Path::new(&demo.central_path);
+        let target = fx.repo.join(".claude/skills/demo");
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let status = || get_project_skills_internal(&fx.store, fx.project_id.clone())
+            .unwrap().into_iter().find(|s| s.dir_name == "demo").unwrap().sync_status;
+        assert_eq!(status(), "in_sync");
+        write_skill(source, "demo", "# Center-only change");
+        assert_eq!(status(), "center_newer");
+        write_skill(&target, "demo", "# Local edit");
+        assert_eq!(status(), "diverged");
+        write_skill(source, "demo", "# Original");
+        assert_eq!(status(), "project_newer");
+    }
+
+    #[test]
+    fn project_copy_baseline_survives_enable_disable_and_is_removed_with_copy() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+        let enabled = fx.repo.join(".claude/skills/demo");
+        let disabled = fx.repo.join(".claude/skills-disabled/demo");
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        toggle_project_skill_internal(&fx.store, &fx.project_id, "demo", "claude_code", false).unwrap();
+        assert!(!enabled.exists());
+        assert!(disabled.join("SKILL.md").exists());
+        assert!(fx.store.get_project_copy_baseline(&fx.project_id, &enabled.to_string_lossy()).unwrap().is_none());
+        assert!(fx.store.get_project_copy_baseline(&fx.project_id, &disabled.to_string_lossy()).unwrap().is_some());
+        write_skill(Path::new(&demo.central_path), "demo", "# Center update");
+        update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").unwrap();
+        toggle_project_skill_internal(&fx.store, &fx.project_id, "demo", "claude_code", true).unwrap();
+        assert!(enabled.join("SKILL.md").exists());
+        assert!(fx.store.get_project_copy_baseline(&fx.project_id, &enabled.to_string_lossy()).unwrap().is_some());
+        delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), true).unwrap();
+        assert!(fx.store.get_project_copy_baseline(&fx.project_id, &enabled.to_string_lossy()).unwrap().is_none());
+    }
+
+    #[test]
+    fn project_copy_equal_mtimes_cannot_hide_two_sided_changes() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Initial");
+        let source = Path::new(&demo.central_path);
+        let target = fx.repo.join(".claude/skills/demo");
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        write_skill(&target, "demo", "# Local--");
+        write_skill(source, "demo", "# Center-");
+        let same = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for path in [source.join("SKILL.md"), target.join("SKILL.md")] {
+            File::options().write(true).open(path).unwrap()
+                .set_times(FileTimes::new().set_modified(same)).unwrap();
+        }
+        assert_eq!(get_project_skills_internal(&fx.store, fx.project_id.clone()).unwrap()
+            .into_iter().find(|s| s.dir_name == "demo").unwrap().sync_status, "diverged");
+        assert!(update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").is_err());
+        assert!(fs::read_to_string(target.join("SKILL.md")).unwrap().contains("# Local--"));
+    }
+
+    #[test]
+    fn project_copy_center_only_update_rebases_its_saved_snapshot() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+        let source = Path::new(&demo.central_path);
+        let target = fx.repo.join(".claude/skills/demo");
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let saved = fx.store.get_project_copy_baseline(&fx.project_id, &target.to_string_lossy()).unwrap();
+        assert_eq!(saved.as_ref().map(|b| b.0.as_str()), Some("s-demo"));
+        write_skill(source, "demo", "# Central update 1");
+        update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").unwrap();
+        assert_eq!(fs::read(source.join("SKILL.md")).unwrap(), fs::read(target.join("SKILL.md")).unwrap());
+        write_skill(source, "demo", "# Central update 2");
+        update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").unwrap();
+        assert_eq!(fs::read(source.join("SKILL.md")).unwrap(), fs::read(target.join("SKILL.md")).unwrap());
+    }
+
+    #[test]
+    fn project_copy_local_edit_is_preserved_when_center_changes_later() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+        let source = Path::new(&demo.central_path);
+        let target = fx.repo.join(".claude/skills/demo");
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        write_skill(&target, "demo", "# Project customization");
+        let before = fs::read(target.join("SKILL.md")).unwrap();
+        // The previous implementation treated "center_newer" as permission to
+        // destroy the project copy even when the local bytes had changed.
+        write_skill(source, "demo", "# Later center customization");
+        let err = update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").unwrap_err();
+        assert!(err.to_string().contains("changed since its last managed Copy deployment"), "{err}");
+        assert_eq!(before, fs::read(target.join("SKILL.md")).unwrap());
+    }
+
+    #[test]
+    fn project_copy_hidden_file_empty_dir_and_removed_content_block_update() {
+        for edit in ["hidden", "removed", "renamed", "empty-dir", "symlink"] {
+            let fx = fixture(&["claude_code"]);
+            fx.store.set_setting("sync_mode", "copy").unwrap();
+            let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+            let target = fx.repo.join(".claude/skills/demo");
+            let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+            apply_project_deploy(&fx.store, &plan).unwrap();
+            match edit {
+                "hidden" => fs::write(target.join(".gitignore"), "local ignore rules").unwrap(),
+                "removed" => fs::remove_file(target.join("SKILL.md")).unwrap(),
+                "renamed" => fs::rename(target.join("SKILL.md"), target.join("CUSTOM.md")).unwrap(),
+                "empty-dir" => fs::create_dir(target.join("empty")).unwrap(),
+                "symlink" => {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink("SKILL.md", target.join("alias")).unwrap();
+                    #[cfg(not(unix))]
+                    fs::write(target.join("alias"), "local").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            // An unrelated hidden/new/renamed/deleted file must not be lost.
+            let original_fingerprint = crate::core::copy_snapshot::fingerprint(&target).unwrap();
+            write_skill(Path::new(&demo.central_path), "demo", "# Central newer");
+            let result = update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code");
+            assert!(result.is_err(), "{edit} was overwritten");
+            assert_eq!(original_fingerprint, crate::core::copy_snapshot::fingerprint(&target).unwrap(), "{edit} changed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_copy_failed_source_stage_preserves_original_and_baseline() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+        let target = fx.repo.join(".claude/skills/demo");
+        let source = Path::new(&demo.central_path);
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let baseline = fx.store.get_project_copy_baseline(&fx.project_id, &target.to_string_lossy()).unwrap();
+        let original = fs::read(target.join("SKILL.md")).unwrap();
+        write_skill(source, "demo", "# Changed center");
+        std::os::unix::fs::symlink("missing-source-file", source.join("broken-link")).unwrap();
+        let err = update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").unwrap_err();
+        assert!(err.to_string().contains("stage"), "{err}");
+        assert_eq!(original, fs::read(target.join("SKILL.md")).unwrap());
+        assert_eq!(baseline, fx.store.get_project_copy_baseline(&fx.project_id, &target.to_string_lossy()).unwrap());
+    }
+
+    #[test]
+    fn project_copy_without_trusted_baseline_fails_closed() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Original");
+        let target = fx.repo.join(".claude/skills/demo");
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        fx.store.delete_project_copy_baseline(&fx.project_id, &target.to_string_lossy()).unwrap();
+        write_skill(Path::new(&demo.central_path), "demo", "# Central newer");
+        let before = fs::read(target.join("SKILL.md")).unwrap();
+        let err = update_project_skill_from_center_internal(&fx.store, &fx.project_id, "demo", "claude_code").unwrap_err();
+        assert!(err.to_string().contains("no recorded deployment baseline"), "{err}");
+        assert_eq!(before, fs::read(target.join("SKILL.md")).unwrap());
     }
 
     #[test]

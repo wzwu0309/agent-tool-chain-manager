@@ -1255,6 +1255,59 @@ impl SkillStore {
         Ok(())
     }
 
+    // ── Project Copy baselines ──
+
+    /// Only writes performed by our Copy deploy/update path create baselines.
+    /// The target path identifies the actual enabled/disabled filesystem slot.
+    pub fn set_project_copy_baseline(
+        &self, project_id: &str, target_path: &str, skill_id: &str, tree_hash: &str, source_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO project_copy_baselines (project_id, target_path, skill_id, tree_hash, source_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, target_path) DO UPDATE SET
+                 skill_id=excluded.skill_id, tree_hash=excluded.tree_hash, source_hash=excluded.source_hash",
+            params![project_id, target_path, skill_id, tree_hash, source_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_project_copy_baseline(
+        &self, project_id: &str, target_path: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT skill_id, tree_hash, source_hash FROM project_copy_baselines
+             WHERE project_id=?1 AND target_path=?2",
+            params![project_id, target_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?)
+    }
+
+    pub fn delete_project_copy_baseline(&self, project_id: &str, target_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM project_copy_baselines WHERE project_id=?1 AND target_path=?2",
+            params![project_id, target_path],
+        )?;
+        Ok(())
+    }
+
+    /// Called only after a successful enabled/disabled filesystem move.
+    pub fn move_project_copy_baseline(
+        &self, project_id: &str, from: &str, to: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE project_copy_baselines SET target_path=?3
+             WHERE project_id=?1 AND target_path=?2",
+            params![project_id, from, to],
+        )?;
+        Ok(())
+    }
+
     // ── Skill Tags ──
 
     pub fn get_all_tags(&self) -> Result<Vec<String>> {

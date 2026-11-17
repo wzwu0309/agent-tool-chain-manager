@@ -716,12 +716,8 @@ fn stored_project_path(canonical: &Path, absolute_input: &Path) -> PathBuf {
 
 pub fn add_project_internal(store: &SkillStore, path: String) -> Result<ProjectDto, AppError> {
     let record = prepare_project_record(store, Path::new(&path))?;
-    let claude_dir = Path::new(&record.path).join(".claude");
-
-    // Support initializing an empty project directory as a managed project.
-    std::fs::create_dir_all(claude_dir.join("skills"))?;
-    std::fs::create_dir_all(claude_dir.join("skills-disabled"))?;
-
+    // Registration only records the project. Agent-specific directories are
+    // created on first deployment, not merely because a project is tracked.
     store.insert_project(&record).map_err(AppError::db)?;
     let all_managed = store.get_all_skills().map_err(AppError::db)?;
     let configs = agent_skill_configs(&store);
@@ -2753,7 +2749,7 @@ mod add_project_tests {
     use tempfile::tempdir;
 
     #[test]
-    fn add_project_creates_skill_roots_and_stores_the_canonical_path() {
+    fn add_project_registers_without_creating_agent_directories() {
         let tmp = tempdir().unwrap();
         let project_dir = tmp.path().join("repo");
         fs::create_dir(&project_dir).unwrap();
@@ -2764,9 +2760,36 @@ mod add_project_tests {
         let canonical = dunce::canonicalize(&project_dir).unwrap();
         assert_eq!(dto.path, canonical.to_string_lossy());
         assert_eq!(dto.name, "repo");
-        assert!(project_dir.join(".claude/skills").is_dir());
-        assert!(project_dir.join(".claude/skills-disabled").is_dir());
+        assert_eq!(fs::read_dir(&project_dir).unwrap().count(), 0);
+        for agent_dir in [".claude", ".codex", ".agents"] {
+            assert!(!project_dir.join(agent_dir).exists(), "{agent_dir} must be opt-in");
+        }
         assert_eq!(store.get_all_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_and_remove_project_preserve_existing_agent_directories() {
+        let tmp = tempdir().unwrap();
+        let project_dir = tmp.path().join("repo");
+        let existing = project_dir.join(".claude/skills/custom/SKILL.md");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, "user-owned skill").unwrap();
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+
+        let dto = add_project_internal(&store, project_dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "user-owned skill");
+        assert!(!project_dir.join(".claude/skills-disabled").exists());
+        assert!(!project_dir.join(".codex").exists());
+
+        let duplicate = add_project_internal(&store, format!("{}/", project_dir.display()));
+        assert!(duplicate.unwrap_err().to_string().contains("already registered"));
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "user-owned skill");
+        assert!(!project_dir.join(".claude/skills-disabled").exists());
+
+        super::remove_project_internal(&store, dto.id).unwrap();
+        assert!(store.get_all_projects().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "user-owned skill");
+        assert!(!project_dir.join(".claude/skills-disabled").exists());
     }
 
     #[test]
@@ -2936,6 +2959,29 @@ mod project_plan_tests {
             .iter()
             .map(|c| PathBuf::from(&c.path))
             .collect()
+    }
+
+    #[test]
+    fn first_deploy_creates_only_selected_agent_directories() {
+        let fx = fixture(&["claude_code", "codex"]);
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        assert_eq!(fs::read_dir(&fx.repo).unwrap().count(), 0, "registration is metadata-only");
+
+        let claude = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        assert_eq!(claude[0].state, ProjectDeployState::Create);
+        assert!(!fx.repo.join(".claude").exists(), "planning must not create directories");
+        apply_project_deploy(&fx.store, &claude).unwrap();
+        assert!(fx.repo.join(".claude/skills/demo/SKILL.md").is_file());
+        assert!(!fx.repo.join(".claude/skills-disabled").exists());
+        assert!(!fx.repo.join(".codex").exists(), "unselected agent must remain untouched");
+
+        let codex = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["codex".into()]).unwrap();
+        assert_eq!(codex[0].state, ProjectDeployState::Create);
+        assert!(!fx.repo.join(".codex").exists(), "planning must not create directories");
+        apply_project_deploy(&fx.store, &codex).unwrap();
+        assert!(fx.repo.join(".codex/skills/demo/SKILL.md").is_file());
+        assert!(!fx.repo.join(".codex/skills-disabled").exists());
+        assert!(!fx.repo.join(".agents").exists());
     }
 
     #[test]
@@ -3186,6 +3232,7 @@ mod project_plan_tests {
         let fx = fixture(&["claude_code"]);
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         let skills = fx.repo.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
         let link = skills.join("demo");
 
         for (label, body) in [("different", "# Someone else's demo"), ("identical", "# Demo")] {

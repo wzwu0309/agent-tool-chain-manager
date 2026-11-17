@@ -60,6 +60,7 @@ test("inherited upstream release workflow is disabled in the fork", () => {
   assert.doesNotMatch(workflow, /\n  push:\s*\n    tags:/);
   const guards = workflow.match(/if: github.repository == 'xingkongliang\/skills-manager'/g) || [];
   assert.equal(guards.length, 3);
+  assert.match(read(".github/workflows/prepare-release.yml"), /if: github.repository == 'xingkongliang\/skills-manager'/);
 });
 
 test("fork update copy and app branding exist in each locale", () => {

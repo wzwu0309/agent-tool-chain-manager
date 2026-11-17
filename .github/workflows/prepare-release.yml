@@ -19,7 +19,8 @@ permissions:
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    # Fork releases need independent signing and a verified publishing pipeline.
+    if: github.repository == 'xingkongliang/skills-manager' && github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

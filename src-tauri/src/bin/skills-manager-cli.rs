@@ -381,8 +381,7 @@ enum ProjectsCommand {
         #[arg(long = "agent", value_name = "AGENT")]
         agent: Option<String>,
     },
-    /// Register a project directory. Creates .claude/skills and
-    /// .claude/skills-disabled inside it, as the app does.
+    /// Register a project directory without creating agent-specific directories.
     Add {
         path: PathBuf,
         #[arg(long)]
@@ -3390,12 +3389,9 @@ fn show_project(
 
 fn add_project(store: &SkillStore, path: &Path, dry_run: bool) -> anyhow::Result<ProjectAddReport> {
     let record = project_cmd::prepare_project_record(store, path).map_err(map_app_err)?;
-    let claude = Path::new(&record.path).join(".claude");
-    let created_dirs: Vec<String> = [claude.join("skills"), claude.join("skills-disabled")]
-        .into_iter()
-        .filter(|dir| !dir.is_dir())
-        .map(|dir| dir.to_string_lossy().to_string())
-        .collect();
+    // Keep the existing JSON field for CLI consumers; project registration
+    // no longer creates any agent directories (dry-run or real).
+    let created_dirs = Vec::new();
     let project_id = if dry_run {
         None
     } else {
@@ -4428,6 +4424,26 @@ mod project_tests {
     }
 
     #[test]
+    fn project_add_dry_run_and_real_run_report_no_agent_directories() {
+        let fx = fixture();
+        let fresh = fx.tmp.path().join("fresh-project");
+        fs::create_dir_all(&fresh).unwrap();
+
+        let dry = add_project(&fx.store, &fresh, true).unwrap();
+        assert!(dry.dry_run);
+        assert!(dry.project_id.is_none());
+        assert!(dry.created_dirs.is_empty());
+        assert_eq!(fs::read_dir(&fresh).unwrap().count(), 0);
+
+        let real = add_project(&fx.store, &fresh, false).unwrap();
+        assert!(!real.dry_run);
+        assert!(real.project_id.is_some());
+        assert!(real.created_dirs.is_empty());
+        assert_eq!(fs::read_dir(&fresh).unwrap().count(), 0);
+        assert_eq!(fx.store.get_all_projects().unwrap().len(), 2);
+    }
+
+    #[test]
     fn project_dry_runs_write_nothing() {
         let fx = fixture();
         let repo = repo_ref(&fx);
@@ -4438,8 +4454,8 @@ mod project_tests {
         fs::create_dir_all(&fresh).unwrap();
         let report = add_project(&fx.store, &fresh, true).unwrap();
         assert!(report.project_id.is_none());
-        assert_eq!(report.created_dirs.len(), 2);
-        assert!(!fresh.join(".claude").exists());
+        assert!(report.created_dirs.is_empty());
+        assert_eq!(fs::read_dir(&fresh).unwrap().count(), 0);
         assert_eq!(fx.store.get_all_projects().unwrap().len(), 1);
 
         // deploy --dry-run: reported, not written.

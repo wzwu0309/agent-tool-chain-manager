@@ -1,3 +1,8 @@
+> **Fork 说明 — Agent Tool Chain Manager。** 这是独立安装的 Skills Manager Fork。
+> 本 Fork 的默认数据目录和 CLI 名称已隔离，在建立自己的签名发布渠道前禁用应用自动更新。
+> 以下上游文档保留供参考，其中原版下载安装链接并不适用于本 Fork。
+> 构建前请阅读 [Fork 发布隔离说明](FORK_RELEASE_ISOLATION.md)。
+
 <p align="center">
   <img src="assets/icon.png" width="80" />
 </p>
@@ -60,7 +65,7 @@
   <img src="assets/diagram-concept-map.png" width="640" alt="概念图：技能库、Preset、全局工作区、项目工作区、Agent" />
 </p>
 
-- **统一技能库** — 从 Git 仓库、本地目录、`.zip` / `.skill` 文件或 [skills.sh](https://skills.sh) 市场安装技能，统一存放在 `~/.skills-manager`。
+- **统一技能库** — 从 Git 仓库、本地目录、`.zip` / `.skill` 文件或 [skills.sh](https://skills.sh) 市场安装技能，统一存放在 `~/.agent-tool-chain-manager`。
 - **技能市场** — 浏览市场上的热门 Skills，用关键词搜索找到需要的那个。
 - **让你的 Agent 管理 Skills** —— Claude Code、Codex、Cursor 等可以替你装一个 skill、部署到另一个 agent、或报告哪个 agent 有什么，走的是驱动 Skills Manager 而不是绕过它直接写 agent 目录——来源、preset、更新追踪和各 agent 的状态都不会丢。Dashboard 上一键完成设置，详见[让你的 Agent 来管理 Skills](#让你的-agent-来管理-skills)。
 - **Preset（预设）** — 将技能分组为命名 Preset。在任意工作区点击 Preset 标签，即可一键为当前 Agent 范围激活或停用其全部技能，激活的 Preset 显示 ✓，部分安装显示数量。应用 Preset 是一次性复制，不是实时同步。
@@ -77,32 +82,19 @@
 - **备份与多设备同步** — 一次 GitHub 登录（或任意 Git 远端）接入私有备份仓库，之后自动备份、多台设备自动保持一致。合并以技能为单位——一台改名、另一台改内容会自动组合；真冲突不阻塞不覆盖，本机版本保留待你三选一处理。快照版本随时可恢复。
 - **活动日志 & 导出日志** — 应用会记录本地的安装/移除/更新/同步操作。在 **设置 → 导出日志** 可把最近日志和活动记录打包成压缩文件，方便提交 Issue 时附上。
 - **灵活的应用设置** — 在一个页面里配置仓库路径、同步模式、主题、字号、语言、托盘行为、代理、Git 远程、更新检查，以及 Agent 在全应用中的显示顺序。
-- **应用内更新** — 有新版本时应用会主动提醒，并在 macOS 和 Windows 上直接完成安装。不会自行下载或安装：检查只负责告知，安装和重启各需一次点击。
+- **Fork 应用更新已禁用** — 建立独立签名发布渠道之前不执行应用更新；Skill 来源更新不受影响。
 
-## 安装
+## 从源码构建本 Fork
 
-### macOS
+本 Fork 尚无经过独立签名的正式安装包。上游 Homebrew/Scoop/Release
+下载命令安装的是 Skills Manager 原版，而不是 Agent Tool Chain Manager。
 
-使用 [Homebrew](https://brew.sh) 安装：
+在配置 Rust、Cargo、Node 及 Tauri 构建依赖后：
 
-```bash
-brew install --cask skills-manager
-```
+    npm ci
+    npm run tauri:build
 
-也可以从 [最新 Release](https://github.com/xingkongliang/skills-manager/releases/latest) 直接下载 `.dmg`。
-
-### Windows 和 Linux
-
-从 [最新 Release](https://github.com/xingkongliang/skills-manager/releases/latest) 下载对应平台的安装包：Windows 为 `.exe` 或 `.msi`，Linux 为 `.AppImage`、`.deb` 或 `.rpm`（提供 x64 和 arm64）。
-
-Windows 也可以用 [Scoop](https://scoop.sh) 安装：
-
-```powershell
-scoop bucket add extras
-scoop install extras/skills-manager
-```
-
-所有安装包都自带 CLI，位置见 [二进制放在哪](#二进制放在哪)。
+安装前参见 [Fork 发布隔离说明](FORK_RELEASE_ISOLATION.md)。
 
 ## 快速上手
 
@@ -217,7 +209,7 @@ npm run cli -- skills adopt ~/.claude/skills --dry-run
 - `git`：操作 git 管理的 `skills/` 仓库（`clone`、`pull`、`push`、`commit`、`versions`、`restore`）
 
 额外参数：
-- `--skills-root <path>`：直接针对某个已 clone / 已导出的 skills repo 操作，而不是本机 app 默认目录。manager 的状态（DB、scenarios、cache、logs）会落在 `~/.skills-manager/external/<name>-<hash>/`，按 skills root 的规范化路径分目录隔离，外部仓库本身保持干净。
+- `--skills-root <path>`：直接针对某个已 clone / 已导出的 skills repo 操作，而不是本机 app 默认目录。manager 的状态（DB、scenarios、cache、logs）会落在 `~/.agent-tool-chain-manager/external/<name>-<hash>/`，按 skills root 的规范化路径分目录隔离，外部仓库本身保持干净。
 - `--json`：给脚本 / agent 使用的机器可读输出。失败时在 stderr 打印 `{"ok": false, "code": …, "message": …}` 并以非零码退出。因目标不属于我们而被拒绝的部署会把路径作为数据带出来（`code: "TARGET_CONFLICT"`、`details.conflicts[].path`），调用方可以直接指出是哪个目录挡路，而不是转述一句话。
 
 ```bash
@@ -229,30 +221,29 @@ npm run -s cli -- --skills-root /path/to/my-skills --json skills list
 Windows 版应用无法在 WSL 里建链接，只能复制。如果你的 agent 都装在 WSL 里，请在 WSL 内直接使用 Linux 版 CLI：它在 WSL 里维护自己的技能库，并用真正的软链接部署：
 
 ```bash
-mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/skills-manager-cli \
-  https://github.com/xingkongliang/skills-manager/releases/latest/download/skills-manager-cli-Linux-x64
-chmod +x ~/.local/bin/skills-manager-cli
-export PATH="$HOME/.local/bin:$PATH"
-skills-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
-skills-manager-cli skills install ./my-skill
-skills-manager-cli skills deploy my-skill --agent hermes-work
+# Build the CLI from this fork on Linux, with Rust/Cargo and Node:
+npm run cli:build
+# Place src-tauri/target/debug/agent-tool-chain-manager-cli on PATH.
+agent-tool-chain-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
+agent-tool-chain-manager-cli skills install ./my-skill
+agent-tool-chain-manager-cli skills deploy my-skill --agent hermes-work
 ```
 
 #### 二进制放在哪
 
-应用启动时会把自己那份 CLI 复制到 `~/.skills-manager/bin/skills-manager-cli`，版本永远与正在运行的应用一致，Agent 不需要你改 PATH 就能找到它。旁边的 `.version` 标记只在副本校验通过后才写、每次重新发布前先删——所以一次失败的复制（比如 Windows 上二进制正被占用）绝不会被当成可用的。
+应用启动时会把自己那份 CLI 复制到 `~/.agent-tool-chain-manager/bin/agent-tool-chain-manager-cli`，版本永远与正在运行的应用一致，Agent 不需要你改 PATH 就能找到它。旁边的 `.version` 标记只在副本校验通过后才写、每次重新发布前先删——所以一次失败的复制（比如 Windows 上二进制正被占用）绝不会被当成可用的。
 
 把 CLI 放到**你自己**的 PATH 上手敲命令，是另一件事：
 
 ```bash
 npm run cli:install
 # 等价于：
-# cargo install --path src-tauri --bin skills-manager-cli --locked --force
+# cargo install --path src-tauri --bin agent-tool-chain-manager-cli --locked --force
 ```
 
-二进制会装到 `~/.cargo/bin/skills-manager-cli`。代码更新后再跑一次即可刷新。
+二进制会装到 `~/.cargo/bin/agent-tool-chain-manager-cli`。代码更新后再跑一次即可刷新。
 
-正式 Release 也会提供 macOS arm64/x64、Windows x64、Linux x64 的独立 CLI 文件。下载对应的 `skills-manager-cli-*`，在 macOS/Linux 添加可执行权限后放入 PATH 即可。
+此 Fork 暂不发布独立签名 CLI，请勿从上游获取同名二进制。未来只应下载本仓库发布的 `agent-tool-chain-manager-cli-*`，在 macOS/Linux 添加可执行权限后放入 PATH 即可。
 
 #### 与桌面应用并发使用
 

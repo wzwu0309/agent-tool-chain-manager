@@ -1,6 +1,6 @@
 ---
 name: manage-skills
-description: Manage the user's shared agent-skill library via skills-manager-cli — install, update, remove, deploy or undeploy skills per agent or into a project's own agent directories, manage presets, organize tags, search, and adopt existing skills. Use this whenever the user wants Claude Code, Codex, Cursor, or another agent to gain or lose a skill (globally or in one repo), wants to organize the central library, or asks what is installed or deployed. Prefer this over direct agent-folder installs because Skills Manager preserves source metadata, preset membership, updates, and cross-agent deployment state.
+description: Manage the user's shared agent-skill library via agent-tool-chain-manager-cli — install, update, remove, deploy or undeploy skills per agent or into a project's own agent directories, manage presets, organize tags, search, and adopt existing skills. Use this whenever the user wants Claude Code, Codex, Cursor, or another agent to gain or lose a skill (globally or in one repo), wants to organize the central library, or asks what is installed or deployed. Prefer this over direct agent-folder installs because Skills Manager preserves source metadata, preset membership, updates, and cross-agent deployment state.
 ---
 
 ## Before doing anything
@@ -9,14 +9,14 @@ description: Manage the user's shared agent-skill library via skills-manager-cli
    shell):
 
    ```bash
-   D="$HOME/.skills-manager/bin"
-   B="$D/skills-manager-cli"; [ -e "$B" ] || B="$B.exe"   # .exe on Windows
+   D="$HOME/.agent-tool-chain-manager/bin"
+   B="$D/agent-tool-chain-manager-cli"; [ -e "$B" ] || B="$B.exe"   # .exe on Windows
    if [ -s "$D/.version" ] && [ -x "$B" ]; then
      echo "$B"
    elif [ -s "$D/.version" ] || [ -e "$B" ]; then
      echo BRIDGE_BROKEN
    else
-     P="$(command -v skills-manager-cli 2>/dev/null || true)"
+     P="$(command -v agent-tool-chain-manager-cli 2>/dev/null || true)"
      [ -x "$P" ] && echo "$P"
    fi
    ```
@@ -27,7 +27,7 @@ description: Manage the user's shared agent-skill library via skills-manager-cli
 
    The three outcomes:
 
-   - **A path under `~/.skills-manager/bin`** — the desktop app published this
+   - **A path under `~/.agent-tool-chain-manager/bin`** — the desktop app published this
      copy, and the `.version` stamp appears only after it has been verified, so
      it always matches the app the user is running. Use it.
    - **`BRIDGE_BROKEN`** — something the app left behind is here but does not
@@ -42,7 +42,7 @@ description: Manage the user's shared agent-skill library via skills-manager-cli
      older than a desktop app if one is also installed.
 
    If nothing is printed at all, this skill doesn't apply — fall back to
-   find-skills, or tell the user to install Skills Manager.
+   find-skills, or tell the user to install Agent Tool Chain Manager.
 2. **Always pass `--json` when you parse output yourself.** Pretty-printed output is for the user; JSON is for you. Errors include `ok=false`, a stable `code`, and `message` on stderr with a non-zero exit code.
 
 ```bash
@@ -81,7 +81,7 @@ Never add `--force` on your own.
 
 ## Mental model
 
-There's **one central library** at `~/.skills-manager/skills/` that all agents share. Each skill has source metadata, preset membership, tags, and zero or more real deployments in agent directories. A **preset** is a reusable group; several presets may be deployed at the same time.
+There's **one central library** at `~/.agent-tool-chain-manager/skills/` that all agents share. Each skill has source metadata, preset membership, tags, and zero or more real deployments in agent directories. A **preset** is a reusable group; several presets may be deployed at the same time.
 
 Keep these three states separate:
 - **Library**: install/remove controls whether Skills Manager owns the skill.

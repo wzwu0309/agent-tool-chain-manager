@@ -94,7 +94,7 @@ fn default_base_dir() -> PathBuf {
     home_base_dir()
 }
 
-/// `~/.skills-manager`, ignoring any configured relocation.
+/// `~/.agent-tool-chain-manager`, ignoring any configured relocation.
 ///
 /// The library can be moved anywhere the user likes, but a few things must
 /// stay where another program can find them without being told — the CLI
@@ -106,11 +106,11 @@ pub fn home_base_dir() -> PathBuf {
         .unwrap()
         .clone()
     {
-        return path.join(".skills-manager");
+        return path.join(".agent-tool-chain-manager");
     }
     dirs::home_dir()
         .expect("Cannot determine home directory")
-        .join(".skills-manager")
+        .join(".agent-tool-chain-manager")
 }
 
 #[cfg(test)]
@@ -141,7 +141,7 @@ fn config_file_path() -> PathBuf {
     }
     dirs::config_dir()
         .unwrap_or_else(default_base_dir)
-        .join("skills-manager")
+        .join("agent-tool-chain-manager")
         .join(CONFIG_FILE_NAME)
 }
 
@@ -968,6 +968,16 @@ pub fn ensure_central_repo(allow_migration: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fork_home_store_and_cli_bridge_root_do_not_overlap_upstream() {
+        let _guard = test_base_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(tmp.path().to_path_buf()));
+        assert_eq!(home_base_dir(), tmp.path().join(".agent-tool-chain-manager"));
+        assert_ne!(home_base_dir(), tmp.path().join(".skills-manager"));
+        set_test_home_dir_override(None);
+    }
+
     // ── migrate_repo_if_needed (#252) ──
 
     fn config_migrating(source: &Path, target: &Path) -> RepoPathConfig {
@@ -1233,13 +1243,13 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("a.txt"), b"src").unwrap();
         fs::create_dir_all(dst.path().join("bin")).unwrap();
-        fs::write(dst.path().join("bin/skills-manager-cli"), b"mine").unwrap();
+        fs::write(dst.path().join("bin/agent-tool-chain-manager-cli"), b"mine").unwrap();
 
         let mut config = config_migrating(src.path(), dst.path());
         let outcome = migrate_repo_if_needed(&mut config, dst.path());
 
         assert!(matches!(outcome, MigrationOutcome::UseSource));
-        assert!(dst.path().join("bin/skills-manager-cli").exists());
+        assert!(dst.path().join("bin/agent-tool-chain-manager-cli").exists());
     }
 
     #[test]

@@ -476,6 +476,7 @@ export const openCentralRepoFolder = () =>
   invoke<void>("open_central_repo_folder");
 
 export interface AppUpdateInfo {
+  updates_enabled: boolean;
   has_update: boolean;
   current_version: string;
   latest_version: string;

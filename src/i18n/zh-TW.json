@@ -1,6 +1,6 @@
 {
   "app": {
-    "name": "Skills Manager"
+    "name": "Agent Tool Chain Manager"
   },
   "sidebar": {
     "dashboard": "Dashboard",
@@ -656,6 +656,8 @@
     "checkUpdate": "檢查更新",
     "checking": "檢查中…",
     "updateAvailable": "發現新版本 {{version}}！",
+    "forkUpdatesDisabled": "Fork 應用程式更新已停用，待建立獨立簽署發布流程後再啟用。",
+    "forkReleases": "查看 Fork 發布頁面",
     "noUpdate": "當前已是最新版本。",
     "download": "下載",
     "installUpdate": "安裝更新",

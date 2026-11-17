@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use super::central_repo;
 
-const KEYRING_SERVICE: &str = "skills-manager-git-backup";
+const KEYRING_SERVICE: &str = "agent-tool-chain-manager-git-backup";
 
 /// Environment variable names consumed by the askpass script. The script
 /// itself contains no secrets — it just echoes these back to git.

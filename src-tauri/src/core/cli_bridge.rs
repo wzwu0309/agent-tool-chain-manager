@@ -1,4 +1,4 @@
-//! The copy of `skills-manager-cli` that agents are told to run.
+//! The copy of `agent-tool-chain-manager-cli` that agents are told to run.
 //!
 //! The CLI already ships inside the desktop bundle — Tauri packages every
 //! `[[bin]]` of the crate — but nothing puts it anywhere an agent can find it.
@@ -35,9 +35,9 @@ use std::process::Command;
 use super::central_repo;
 
 const BRIDGE_BIN_NAME: &str = if cfg!(windows) {
-    "skills-manager-cli.exe"
+    "agent-tool-chain-manager-cli.exe"
 } else {
-    "skills-manager-cli"
+    "agent-tool-chain-manager-cli"
 };
 
 /// Where the bridge lives. Deliberately the home directory rather than
@@ -266,8 +266,8 @@ mod tests {
     #[cfg(unix)]
     fn fake_cli(dir: &Path, reports: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("skills-manager-cli");
-        std::fs::write(&path, format!("#!/bin/sh\necho 'skills-manager-cli {reports}'\n")).unwrap();
+        let path = dir.join("agent-tool-chain-manager-cli");
+        std::fs::write(&path, format!("#!/bin/sh\necho 'agent-tool-chain-manager-cli {reports}'\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }

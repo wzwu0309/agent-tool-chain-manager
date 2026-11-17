@@ -1,6 +1,6 @@
 {
   "app": {
-    "name": "Skills Manager"
+    "name": "Agent Tool Chain Manager"
   },
   "sidebar": {
     "dashboard": "대시보드",
@@ -650,6 +650,8 @@
     "checkUpdate": "업데이트 확인",
     "checking": "확인 중…",
     "updateAvailable": "새 버전이 나왔습니다: {{version}}",
+    "forkUpdatesDisabled": "독립적인 서명 릴리스 채널이 준비될 때까지 Fork 앱 업데이트는 비활성화됩니다.",
+    "forkReleases": "Fork 릴리스 보기",
     "noUpdate": "최신 버전을 쓰고 있습니다.",
     "download": "다운로드",
     "installUpdate": "업데이트 설치",

@@ -315,7 +315,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       appUpdateCheckedRef.current = true;
       refreshAppUpdate()
         .then((info) => {
-          if (!info.has_update) return;
+          if (!info.updates_enabled || !info.has_update) return;
           toast.info(
             i18n.t("settings.updateAvailable", { version: info.latest_version }),
             {

@@ -1,3 +1,9 @@
+> **Fork notice — Agent Tool Chain Manager.** This is a separately installed fork of Skills Manager.
+> The default data root and CLI name differ, and app auto-updates are disabled
+> until this fork has its own signed releases. Upstream instructions below are
+> retained for reference; upstream install/download links do not install this fork.
+> Read [Fork release isolation](FORK_RELEASE_ISOLATION.md) before building.
+
 <p align="center">
   <img src="assets/icon.png" width="80" />
 </p>
@@ -64,7 +70,7 @@
   <img src="assets/diagram-concept-map.png" width="640" alt="Concept map: Library, Preset, Global Workspace, Project Workspace, Agent" />
 </p>
 
-- **Unified skill library** — Install skills from Git repos, local folders, `.zip` / `.skill` archives, or the [skills.sh](https://skills.sh) marketplace. Everything goes into one central repo, which defaults to `~/.skills-manager` and can be customized in **Settings**.
+- **Unified skill library** — Install skills from Git repos, local folders, `.zip` / `.skill` archives, or the [skills.sh](https://skills.sh) marketplace. Everything goes into one central repo, which defaults to `~/.agent-tool-chain-manager` and can be customized in **Settings**.
 - **Marketplace** — Browse popular skills from the marketplace and find them with keyword search.
 - **Your agents can manage skills** — Claude Code, Codex, Cursor and the rest can install a skill, deploy it to another agent, or report what is where, by driving Skills Manager instead of writing into an agent's folder behind its back — so sources, presets, update tracking and per-agent state stay intact. The Dashboard sets this up in one click; see [Let your agents manage skills](#let-your-agents-manage-skills).
 - **Presets** — Group skills into named presets. In any workspace, click a preset pill to instantly activate or deactivate all its skills for the current agent scope. Applying a preset is a one-time copy, not a live sync. The sidebar lists all presets for quick access.
@@ -81,32 +87,20 @@
 - **Backup & multi-device sync** — Connect a private GitHub repository with one sign-in (or any Git remote), and the app backs your library up automatically and keeps all connected devices in sync. Merges are skill-aware — a rename on one machine combines cleanly with an edit on another — and true conflicts never block: your local version stays put until you choose keep mine / use remote / keep both. Snapshot versions are restorable at any time.
 - **Activity log & Export Logs** — Install / remove / update / sync operations are recorded locally. Use **Settings → Export Logs** to bundle recent logs and activity history into a single zip for easier issue reports.
 - **Flexible app settings** — Configure repo path, sync mode, theme, text size, language, tray behavior, proxy, Git remote, update checks, and the order agents appear throughout the app — all in one place.
-- **In-app updates** — The app tells you when a new version is out and installs it for you on macOS and Windows. Nothing downloads or installs on its own: checking only notifies, and installing and restarting each take a click.
+- **Fork app updates are disabled** until there is an independent signed release channel. Skill source updates are unaffected.
 
-## Install
+## Install this fork from source
 
-### macOS
+No independently signed installer is available for this fork yet. Upstream
+Homebrew, Scoop and GitHub Releases commands install the original Skills
+Manager, **not** Agent Tool Chain Manager.
 
-Install with [Homebrew](https://brew.sh):
+On a machine with Rust, Cargo, Node and Tauri build prerequisites:
 
-```bash
-brew install --cask skills-manager
-```
+    npm ci
+    npm run tauri:build
 
-You can also download the `.dmg` for your Mac from the [latest release](https://github.com/xingkongliang/skills-manager/releases/latest).
-
-### Windows and Linux
-
-Download the installer for your platform from the [latest release](https://github.com/xingkongliang/skills-manager/releases/latest): `.exe` or `.msi` for Windows, and `.AppImage`, `.deb`, or `.rpm` for Linux (x64 and arm64).
-
-On Windows you can also install with [Scoop](https://scoop.sh):
-
-```powershell
-scoop bucket add extras
-scoop install extras/skills-manager
-```
-
-Every installer ships the CLI inside the app — see [Where the binary lives](#where-the-binary-lives).
+See [Fork release isolation](FORK_RELEASE_ISOLATION.md) before installation.
 
 ## Quick Start
 
@@ -226,7 +220,7 @@ Available command groups:
 - `git` — operate on the git-backed `skills/` repository (`clone`, `pull`, `push`, `commit`, `versions`, `restore`)
 
 Extra flags:
-- `--skills-root <path>` — operate on a cloned/exported skills repo directly instead of the local app default. The manager's state (DB, presets, cache, logs) lives in `~/.skills-manager/external/<name>-<hash>/`, namespaced by the canonical path of the skills root, so the external checkout itself stays clean.
+- `--skills-root <path>` — operate on a cloned/exported skills repo directly instead of the local app default. The manager's state (DB, presets, cache, logs) lives in `~/.agent-tool-chain-manager/external/<name>-<hash>/`, namespaced by the canonical path of the skills root, so the external checkout itself stays clean.
 - `--json` — machine-readable output for scripts/agents. Failures print `{"ok": false, "code": …, "message": …}` on stderr with a non-zero exit. A deployment refused because the target is not ours carries the paths as data (`code: "TARGET_CONFLICT"`, `details.conflicts[].path`) so a caller can name the directory in the way instead of quoting a sentence.
 
 ```bash
@@ -238,30 +232,29 @@ npm run -s cli -- --skills-root /path/to/my-skills --json skills list
 The Windows app cannot create links inside WSL, so it can only copy skills there. If your agents live in WSL, run the Linux CLI inside WSL instead — it keeps its own library there and deploys with real symlinks:
 
 ```bash
-mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/skills-manager-cli \
-  https://github.com/xingkongliang/skills-manager/releases/latest/download/skills-manager-cli-Linux-x64
-chmod +x ~/.local/bin/skills-manager-cli
-export PATH="$HOME/.local/bin:$PATH"
-skills-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
-skills-manager-cli skills install ./my-skill
-skills-manager-cli skills deploy my-skill --agent hermes-work
+# Build the CLI from this fork on Linux, with Rust/Cargo and Node:
+npm run cli:build
+# Place src-tauri/target/debug/agent-tool-chain-manager-cli on PATH.
+agent-tool-chain-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
+agent-tool-chain-manager-cli skills install ./my-skill
+agent-tool-chain-manager-cli skills deploy my-skill --agent hermes-work
 ```
 
 #### Where the binary lives
 
-At startup the app publishes a copy of its own CLI to `~/.skills-manager/bin/skills-manager-cli`, always matching the running app, so agents can find it without anything on your PATH. A `.version` stamp beside it is written only after the copy is verified and removed before each republish, so a copy that failed — a binary held open on Windows, say — is never presented as usable.
+At startup the app publishes a copy of its own CLI to `~/.agent-tool-chain-manager/bin/agent-tool-chain-manager-cli`, always matching the running app, so agents can find it without anything on your PATH. A `.version` stamp beside it is written only after the copy is verified and removed before each republish, so a copy that failed — a binary held open on Windows, say — is never presented as usable.
 
 Putting the CLI on your *own* PATH, for typing commands yourself, is separate:
 
 ```bash
 npm run cli:install
 # equivalent to:
-# cargo install --path src-tauri --bin skills-manager-cli --locked --force
+# cargo install --path src-tauri --bin agent-tool-chain-manager-cli --locked --force
 ```
 
-This drops the binary at `~/.cargo/bin/skills-manager-cli`. Re-run after pulling updates to refresh it.
+This drops the binary at `~/.cargo/bin/agent-tool-chain-manager-cli`. Re-run after pulling updates to refresh it.
 
-Official releases also publish standalone CLI binaries for macOS arm64/x64, Windows x64, and Linux x64. Download the matching `skills-manager-cli-*` asset, make it executable on macOS/Linux, and place it on PATH.
+This fork currently has no signed standalone CLI releases. When available, use only this fork's `agent-tool-chain-manager-cli-*` asset, make it executable on macOS/Linux, and place it on PATH.
 
 #### Concurrent use with the desktop app
 

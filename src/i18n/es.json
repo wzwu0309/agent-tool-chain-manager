@@ -1,6 +1,6 @@
 {
   "app": {
-    "name": "Skills Manager"
+    "name": "Agent Tool Chain Manager"
   },
   "sidebar": {
     "dashboard": "Panel",
@@ -713,6 +713,8 @@
     "installUpdate": "Instalar actualización",
     "installing": "Instalando…",
     "language": "Idioma",
+    "forkUpdatesDisabled": "Las actualizaciones de esta bifurcación están desactivadas hasta contar con publicaciones firmadas propias.",
+    "forkReleases": "Versiones de la bifurcación",
     "noUpdate": "Tienes la última versión.",
     "notInstalled": "No instalado",
     "openBackupPage": "Abrir copia de seguridad",

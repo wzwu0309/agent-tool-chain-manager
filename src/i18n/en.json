@@ -1,6 +1,6 @@
 {
   "app": {
-    "name": "Skills Manager"
+    "name": "Agent Tool Chain Manager"
   },
   "sidebar": {
     "dashboard": "Dashboard",
@@ -667,6 +667,8 @@
     "checkUpdate": "Check for Updates",
     "checking": "Checking…",
     "updateAvailable": "New version {{version}} available!",
+    "forkUpdatesDisabled": "Fork app updates are disabled until an independent signed release channel is ready.",
+    "forkReleases": "Fork releases",
     "noUpdate": "You're on the latest version.",
     "download": "Download",
     "installUpdate": "Install Update",

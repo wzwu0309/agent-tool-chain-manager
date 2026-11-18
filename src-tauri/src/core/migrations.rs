@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 9;
+const LATEST_VERSION: u32 = 10;
 
 /// Run all pending migrations on the database.
 ///
@@ -56,6 +56,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         6 => migrate_v6_to_v7(conn),
         7 => migrate_v7_to_v8(conn),
         8 => migrate_v8_to_v9(conn),
+        9 => migrate_v9_to_v10(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -338,6 +339,35 @@ fn migrate_v8_to_v9(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v9 → v10: project Skill deployments are bound to immutable Git Commit/Tree
+/// content, not to a best-effort hash of the central working directory.
+/// This is NOT the abandoned PR #9 project_copy_baselines table.
+fn migrate_v9_to_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS project_skill_deployments (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+            target_path TEXT NOT NULL UNIQUE,
+            agent TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            management_state TEXT NOT NULL,
+            management_origin TEXT NOT NULL,
+            version_match TEXT NOT NULL,
+            base_commit_oid TEXT,
+            base_tree_oid TEXT,
+            path_at_commit TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_skill_deployments_project
+            ON project_skill_deployments(project_id, skill_id);
+        ",
+    )?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn add_column_if_missing(
@@ -558,11 +588,19 @@ mod tests {
             ["[\"claude_code\",\"codex\"]"],
         )
         .unwrap();
-        assert_eq!(count_setting(&conn), 1, "precondition: the row must exist, or this test proves nothing");
+        assert_eq!(
+            count_setting(&conn),
+            1,
+            "precondition: the row must exist, or this test proves nothing"
+        );
 
         run_migrations(&conn).unwrap();
 
-        assert_eq!(count_setting(&conn), 0, "v7→v8 must delete the orphaned preference");
+        assert_eq!(
+            count_setting(&conn),
+            0,
+            "v7→v8 must delete the orphaned preference"
+        );
         // Unrelated settings must survive.
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('theme', 'dark')",
@@ -571,7 +609,9 @@ mod tests {
         .unwrap();
         run_migrations(&conn).unwrap();
         let theme: String = conn
-            .query_row("SELECT value FROM settings WHERE key = 'theme'", [], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key = 'theme'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(theme, "dark");
     }

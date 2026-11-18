@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -96,6 +96,26 @@ pub struct ProjectRecord {
     pub linked_agent_name: Option<String>,
     pub disabled_path: Option<String>,
     pub sort_order: i32,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Stable ownership and Git content baseline for one project Skill directory.
+/// Unlike discovery, a row here asserts an explicit management relationship.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSkillDeploymentRecord {
+    pub id: String,
+    pub project_id: String,
+    pub skill_id: String,
+    pub target_path: String,
+    pub agent: String,
+    pub mode: String,
+    pub management_state: String,
+    pub management_origin: String,
+    pub version_match: String,
+    pub base_commit_oid: Option<String>,
+    pub base_tree_oid: Option<String>,
+    pub path_at_commit: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -627,7 +647,12 @@ impl SkillStore {
                 "INSERT OR REPLACE INTO pending_conflicts
                  (skill_id, theirs_commit, theirs_path, detected_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![row.skill_id, row.theirs_commit, row.theirs_path, row.detected_at],
+                params![
+                    row.skill_id,
+                    row.theirs_commit,
+                    row.theirs_path,
+                    row.detected_at
+                ],
             )?;
         }
         tx.commit()?;
@@ -1173,6 +1198,151 @@ impl SkillStore {
         Ok(())
     }
 
+    // ── Project Skill deployments / immutable Git baselines ──
+
+    pub fn insert_project_skill_deployment(
+        &self,
+        row: &ProjectSkillDeploymentRecord,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "INSERT INTO project_skill_deployments
+                (id, project_id, skill_id, target_path, agent, mode, management_state,
+                 management_origin, version_match, base_commit_oid, base_tree_oid,
+                 path_at_commit, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(target_path) DO UPDATE SET
+                 agent = excluded.agent,
+                 mode = excluded.mode,
+                 management_state = excluded.management_state,
+                 management_origin = excluded.management_origin,
+                 version_match = excluded.version_match,
+                 base_commit_oid = excluded.base_commit_oid,
+                 base_tree_oid = excluded.base_tree_oid,
+                 path_at_commit = excluded.path_at_commit,
+                 updated_at = excluded.updated_at
+             WHERE project_skill_deployments.project_id = excluded.project_id
+               AND project_skill_deployments.skill_id = excluded.skill_id
+               AND project_skill_deployments.management_state = 'managed'
+               AND project_skill_deployments.mode = 'copy'",
+            params![
+                row.id,
+                row.project_id,
+                row.skill_id,
+                row.target_path,
+                row.agent,
+                row.mode,
+                row.management_state,
+                row.management_origin,
+                row.version_match,
+                row.base_commit_oid,
+                row.base_tree_oid,
+                row.path_at_commit,
+                row.created_at,
+                row.updated_at
+            ],
+        )?;
+        if affected != 1 {
+            anyhow::bail!("Project Skill path is already owned by another deployment");
+        }
+        Ok(())
+    }
+
+    pub fn get_project_skill_deployment(
+        &self,
+        project_id: &str,
+        target_path: &str,
+    ) -> Result<Option<ProjectSkillDeploymentRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, project_id, skill_id, target_path, agent, mode, management_state,
+                    management_origin, version_match, base_commit_oid, base_tree_oid,
+                    path_at_commit, created_at, updated_at
+             FROM project_skill_deployments WHERE project_id = ?1 AND target_path = ?2",
+            params![project_id, target_path],
+            |row| {
+                Ok(ProjectSkillDeploymentRecord {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    skill_id: row.get(2)?,
+                    target_path: row.get(3)?,
+                    agent: row.get(4)?,
+                    mode: row.get(5)?,
+                    management_state: row.get(6)?,
+                    management_origin: row.get(7)?,
+                    version_match: row.get(8)?,
+                    base_commit_oid: row.get(9)?,
+                    base_tree_oid: row.get(10)?,
+                    path_at_commit: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn update_project_skill_deployment_version(
+        &self,
+        id: &str,
+        commit_oid: &str,
+        tree_oid: &str,
+        path_at_commit: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE project_skill_deployments
+             SET base_commit_oid = ?2, base_tree_oid = ?3, path_at_commit = ?4,
+                 version_match = 'exact', updated_at = ?5
+             WHERE id = ?1 AND management_state = 'managed' AND mode = 'copy'",
+            params![
+                id,
+                commit_oid,
+                tree_oid,
+                path_at_commit,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        if affected != 1 {
+            anyhow::bail!("managed Copy deployment record no longer exists");
+        }
+        Ok(())
+    }
+
+    pub fn move_project_skill_deployment(
+        &self,
+        project_id: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE project_skill_deployments SET target_path = ?3, updated_at = ?4
+             WHERE project_id = ?1 AND target_path = ?2",
+            params![
+                project_id,
+                old_path,
+                new_path,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_project_skill_deployment(
+        &self,
+        project_id: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM project_skill_deployments WHERE project_id = ?1 AND target_path = ?2",
+            params![project_id, target_path],
+        )?;
+        Ok(())
+    }
+
     // ── Projects ──
 
     pub fn insert_project(&self, project: &ProjectRecord) -> Result<()> {
@@ -1504,22 +1674,23 @@ mod scenario_membership_tests {
         let tmp = tempdir().unwrap();
         let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
 
-        store.insert_scenario(&ScenarioRecord {
-            id: "s1".to_string(),
-            name: "S1".to_string(),
-            description: None,
-            icon: None,
-            sort_order: 0,
-            created_at: 1,
-            updated_at: 1,
-        })
-        .unwrap();
+        store
+            .insert_scenario(&ScenarioRecord {
+                id: "s1".to_string(),
+                name: "S1".to_string(),
+                description: None,
+                icon: None,
+                sort_order: 0,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
         store.upsert_skill(&sample_skill("k1")).unwrap();
 
         let memberships = vec![
-            membership("s1", "k1"),       // valid
-            membership("s1", "ghost"),    // skill missing
-            membership("ghost-s", "k1"),  // scenario missing
+            membership("s1", "k1"),      // valid
+            membership("s1", "ghost"),   // skill missing
+            membership("ghost-s", "k1"), // scenario missing
         ];
 
         // Must not panic with a FOREIGN KEY constraint failure.
@@ -1529,7 +1700,9 @@ mod scenario_membership_tests {
 
         assert_eq!(store.get_skill_ids_for_scenario("s1").unwrap(), vec!["k1"]);
         assert_eq!(
-            store.get_enabled_tools_for_scenario_skill("s1", "k1").unwrap(),
+            store
+                .get_enabled_tools_for_scenario_skill("s1", "k1")
+                .unwrap(),
             vec!["ToolA"]
         );
         assert!(store

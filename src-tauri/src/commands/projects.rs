@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
 use tauri::State;
 
+use crate::core::audit_log::AuditDraft;
 use crate::core::error::TargetConflictDetail;
 use crate::core::repo_lock::RepoLock;
-use crate::core::audit_log::AuditDraft;
-use crate::core::skill_store::{ProjectRecord, SkillRecord, SkillStore};
+use crate::core::skill_store::{
+    ProjectRecord, ProjectSkillDeploymentRecord, SkillRecord, SkillStore,
+};
 use crate::core::timing::should_log_first_or_slow;
 use crate::core::{
-    error::AppError, file_manager, installer, project_scanner, sync_engine, sync_metadata,
-    tool_adapters,
+    central_repo, error::AppError, file_manager, git_skill_versions, installer, project_scanner,
+    sync_engine, sync_metadata, tool_adapters,
 };
 
 #[derive(Serialize, Default, Debug)]
@@ -568,6 +570,50 @@ fn unique_center_match<'a>(
     }
 }
 
+/// Publish a staged directory only if the destination is still unoccupied.
+/// On macOS/Linux this is an OS-level no-replace rename, not a vulnerable
+/// stat-then-rename pair. Other platforms retain a conservative preflight.
+fn rename_directory_no_replace(source: &Path, target: &Path) -> Result<(), AppError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            target,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|err| AppError::io(std::io::Error::from_raw_os_error(err.raw_os_error())))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        if std::fs::symlink_metadata(target).is_ok() {
+            return Err(AppError::invalid_input("Destination already occupied"));
+        }
+        std::fs::rename(source, target).map_err(AppError::io)
+    }
+}
+
+/// The only authoritative Copy classification uses its immutable deployment
+/// baseline; mtimes and the mutable central working tree play no role.
+fn managed_copy_status(deployment: &ProjectSkillDeploymentRecord, path: &Path) -> String {
+    let Some(base) = deployment.base_tree_oid.as_deref() else {
+        return "diverged".to_string();
+    };
+    let root = central_repo::skills_dir();
+    let local_clean = git_skill_versions::matches_skill_tree(&root, base, path).unwrap_or(false);
+    let central_clean =
+        git_skill_versions::resolve_skill_version(&root, &deployment.skill_id, None)
+            .is_ok_and(|v| v.tree_oid == base);
+    match (local_clean, central_clean) {
+        (true, true) => "in_sync",
+        (true, false) => "center_newer",
+        (false, true) => "project_newer",
+        (false, false) => "diverged",
+    }
+    .to_string()
+}
+
 pub(crate) fn classify_sync_status(
     skill: &project_scanner::ProjectSkillInfo,
     managed: Option<&SkillRecord>,
@@ -908,10 +954,8 @@ pub async fn get_project_skills(
     project_id: String,
 ) -> Result<Vec<project_scanner::ProjectSkillInfo>, AppError> {
     let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        get_project_skills_internal(&store, project_id)
-    })
-    .await?
+    tauri::async_runtime::spawn_blocking(move || get_project_skills_internal(&store, project_id))
+        .await?
 }
 
 pub fn get_project_skills_internal(
@@ -938,6 +982,20 @@ pub fn get_project_skills_internal(
             .and_then(|skill_id| tags_map.get(skill_id).cloned())
             .unwrap_or_default();
         skill.sync_status = classify_sync_status(skill, matched);
+        if let Some(deployment) = store
+            .get_project_skill_deployment(&project_id, &skill.path)
+            .map_err(AppError::db)?
+        {
+            if deployment.mode == "copy" && deployment.management_state == "managed" {
+                skill.in_center = true;
+                skill.center_skill_id = Some(deployment.skill_id.clone());
+                skill.tags = tags_map
+                    .get(&deployment.skill_id)
+                    .cloned()
+                    .unwrap_or_default();
+                skill.sync_status = managed_copy_status(&deployment, Path::new(&skill.path));
+            }
+        }
     }
 
     Ok(skills)
@@ -1194,10 +1252,17 @@ pub async fn export_skill_to_project(
     skill_id: String,
     project_id: String,
     agents: Option<Vec<String>>,
+    commit_oid: Option<String>,
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        export_skill_to_project_internal(&store, skill_id, project_id, agents)
+        export_skill_to_project_internal_with_commit(
+            &store,
+            skill_id,
+            project_id,
+            agents,
+            commit_oid.as_deref(),
+        )
     })
     .await?
 }
@@ -1207,6 +1272,16 @@ pub fn export_skill_to_project_internal(
     skill_id: String,
     project_id: String,
     agents: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    export_skill_to_project_internal_with_commit(store, skill_id, project_id, agents, None)
+}
+
+pub fn export_skill_to_project_internal_with_commit(
+    store: &SkillStore,
+    skill_id: String,
+    project_id: String,
+    agents: Option<Vec<String>>,
+    commit_oid: Option<&str>,
 ) -> Result<(), AppError> {
     let project = get_project_record(store, &project_id)?;
 
@@ -1251,7 +1326,8 @@ pub fn export_skill_to_project_internal(
         filtered
     };
 
-    let plan = plan_project_deploy(store, &project_id, &[skill_id], &agent_keys)?;
+    let plan =
+        plan_project_deploy_with_commit(store, &project_id, &[skill_id], &agent_keys, commit_oid)?;
     // The GUI only offers "add" where nothing is there yet, so anything in the
     // way, even this same skill, is refused as before.
     if let Some(occupied) = plan
@@ -1266,71 +1342,219 @@ pub fn export_skill_to_project_internal(
     apply_project_deploy(store, &plan)
 }
 
+/// Update a manager-owned Copy using the *recorded Git subtree* as the
+/// conflict baseline. Files modified by the project are never overwritten.
+pub fn update_managed_project_copy(
+    store: &SkillStore,
+    project_id: &str,
+    target_path: &Path,
+    commit_oid: Option<&str>,
+) -> Result<(), AppError> {
+    let target_string = target_path.to_string_lossy();
+    let deployment = store
+        .get_project_skill_deployment(project_id, &target_string)
+        .map_err(AppError::db)?
+        .ok_or_else(|| {
+            AppError::invalid_input(
+                "No managed Copy baseline exists; explicit adoption is required",
+            )
+        })?;
+    if deployment.management_state != "managed" || deployment.mode != "copy" {
+        return Err(AppError::invalid_input("This target is not a managed Copy"));
+    }
+    let base_tree = deployment
+        .base_tree_oid
+        .as_deref()
+        .ok_or_else(|| AppError::invalid_input("Managed Copy has no trusted Git Tree baseline"))?;
+    let root = central_repo::skills_dir();
+    let _lock = RepoLock::acquire_foreground("project Copy update").map_err(AppError::io)?;
+    if !git_skill_versions::matches_skill_tree(&root, base_tree, target_path)
+        .map_err(AppError::io)?
+    {
+        return Err(AppError::invalid_input(
+            "Project Skill contains local changes; refusing to overwrite the Copy",
+        ));
+    }
+    let wanted = git_skill_versions::resolve_skill_version(&root, &deployment.skill_id, commit_oid)
+        .map_err(AppError::io)?;
+    if wanted.tree_oid == base_tree {
+        store
+            .update_project_skill_deployment_version(
+                &deployment.id,
+                &wanted.commit_oid,
+                &wanted.tree_oid,
+                &wanted.path_at_commit,
+            )
+            .map_err(AppError::db)?;
+        return Ok(());
+    }
+
+    let staging = tempfile::Builder::new()
+        .prefix(".atm-skill-update-")
+        .tempdir_in(
+            target_path
+                .parent()
+                .ok_or_else(|| AppError::invalid_input("Invalid managed Copy path"))?,
+        )
+        .map_err(AppError::io)?;
+    let staged = staging.path().join("new");
+    let backup = staging.path().join("previous");
+    git_skill_versions::materialize_skill_version(&root, &wanted, &staged).map_err(AppError::io)?;
+
+    // Re-check at the destructive boundary, not only at the UI preflight.
+    if !git_skill_versions::matches_skill_tree(&root, base_tree, target_path)
+        .map_err(AppError::io)?
+    {
+        return Err(AppError::invalid_input(
+            "Project Skill changed during update; old Copy preserved",
+        ));
+    }
+    rename_directory_no_replace(target_path, &backup)?;
+    let result: Result<(), AppError> = (|| {
+        // A foreign writer could occupy the target during the rename gap.
+        if std::fs::symlink_metadata(target_path).is_ok() {
+            return Err(AppError::invalid_input(
+                "Target occupied during managed Copy update",
+            ));
+        }
+        rename_directory_no_replace(&staged, target_path)?;
+        if !git_skill_versions::matches_skill_tree(&root, &wanted.tree_oid, target_path)
+            .map_err(AppError::io)?
+        {
+            return Err(AppError::invalid_input(
+                "Published Copy did not match selected Git Tree",
+            ));
+        }
+        store
+            .update_project_skill_deployment_version(
+                &deployment.id,
+                &wanted.commit_oid,
+                &wanted.tree_oid,
+                &wanted.path_at_commit,
+            )
+            .map_err(AppError::db)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if std::fs::symlink_metadata(target_path).is_ok() {
+            // Once published, our *unchanged* new tree may be moved aside to
+            // restore the prior Copy after a database failure. If anyone has
+            // touched it (or inserted a foreign entry), never delete it.
+            let still_ours =
+                git_skill_versions::matches_skill_tree(&root, &wanted.tree_oid, target_path)
+                    .unwrap_or(false);
+            if still_ours {
+                if rename_directory_no_replace(target_path, &staging.path().join("failed-new"))
+                    .is_ok()
+                {
+                    if let Err(rollback) = rename_directory_no_replace(&backup, target_path) {
+                        let recovery = staging.keep();
+                        return Err(AppError::invalid_input(format!(
+                            "{error}; rollback failed ({rollback}); previous Copy at {}",
+                            recovery.join("previous").display(),
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+            // The foreign occupant is not ours to delete. Retain the original
+            // Copy in a persistent recovery directory instead.
+            let recovery = staging.keep();
+            return Err(AppError::invalid_input(format!(
+                "{error}; original Copy preserved at {}",
+                recovery.join("previous").display(),
+            )));
+        }
+        if let Err(rollback) = std::fs::rename(&backup, target_path) {
+            let recovery = staging.keep();
+            return Err(AppError::invalid_input(format!(
+                "{error}; rollback failed ({rollback}); original at {}",
+                recovery.join("previous").display(),
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_project_skill_from_center(
     store: State<'_, Arc<SkillStore>>,
     project_id: String,
     skill_relative_path: String,
     agent: String,
+    commit_oid: Option<String>,
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         ensure_safe_skill_relative_path(&skill_relative_path)?;
-
-        let record = store
-            .get_project_by_id(&project_id)
+        let record = get_project_record(&store, &project_id)?;
+        let (skills_root, disabled_root) = resolve_agent_skills_roots(&store, &record, &agent)
+            .ok_or_else(|| AppError::not_found(format!("Unknown agent: {agent}")))?;
+        let normal = skills_root.join(&skill_relative_path);
+        let disabled = disabled_root
+            .as_ref()
+            .map(|root| root.join(&skill_relative_path));
+        let (target_path, root) = if std::fs::symlink_metadata(&normal).is_ok() {
+            (normal, skills_root)
+        } else if let Some(disabled_path) =
+            disabled.filter(|p| std::fs::symlink_metadata(p).is_ok())
+        {
+            (
+                disabled_path,
+                disabled_root.expect("disabled root was checked"),
+            )
+        } else {
+            return Err(AppError::not_found("Project Skill directory not found"));
+        };
+        ensure_dir_within_root(&target_path, &root)?;
+        if store
+            .get_project_skill_deployment(&project_id, &target_path.to_string_lossy())
             .map_err(AppError::db)?
-            .ok_or_else(|| AppError::not_found("Workspace not found"))?;
+            .is_some()
+        {
+            return update_managed_project_copy(
+                &store,
+                &project_id,
+                &target_path,
+                commit_oid.as_deref(),
+            );
+        }
 
-        let configs = agent_skill_configs(&store);
-        let skills = read_workspace_skills(&record, &configs);
-        let skill = skills
-            .iter()
-            .find(|s| s.relative_path == skill_relative_path && s.agent == agent)
-            .ok_or_else(|| AppError::not_found("Skill not found in workspace"))?;
-
-        let all_managed = store.get_all_skills().unwrap_or_default();
-        let managed = find_best_center_match(skill, &all_managed)
-            .ok_or_else(|| AppError::not_found("No matching skill in center"))?;
-
-        // Mirror the global-workspace protection (agent_workspace.rs): never
-        // overwrite a project copy that has unsynced local edits (#225 review).
-        if classify_sync_status(skill, Some(managed)) == "project_newer" {
+        // Unknown real directories are external/untracked regardless of how
+        // closely they resemble a central Skill. Finding them is not consent.
+        let meta = std::fs::symlink_metadata(&target_path)?;
+        if !meta.file_type().is_symlink() {
             return Err(AppError::invalid_input(
-                "Project skill is newer than the Skills Center version",
+                "Project Copy is not managed; explicitly adopt it before updating",
             ));
         }
-
-        let (skills_root, disabled_root) = resolve_agent_skills_roots(&store, &record, &agent)
-            .ok_or_else(|| AppError::not_found(format!("Unknown agent: {}", agent)))?;
-        let target_path = PathBuf::from(&skill.path);
-        if target_path.starts_with(&skills_root) {
-            ensure_dir_within_root(&target_path, &skills_root)?;
-        } else if disabled_root
-            .as_ref()
-            .map(|root| target_path.starts_with(root))
-            .unwrap_or(false)
-        {
-            let disabled_root = disabled_root.expect("checked above");
-            ensure_dir_within_root(&target_path, &disabled_root)?;
-        } else {
-            return Err(AppError::invalid_input("Invalid skill directory path"));
+        if commit_oid.is_some() {
+            return Err(AppError::invalid_input(
+                "A fixed historical CommitId cannot be deployed as a Symlink",
+            ));
         }
-
+        let configs = agent_skill_configs(&store);
+        let variants = read_workspace_skills(&record, &configs);
+        let variant = variants
+            .iter()
+            .find(|v| v.path == target_path.to_string_lossy())
+            .ok_or_else(|| AppError::not_found("Project link is not a known Skill"))?;
+        let all = store.get_all_skills().map_err(AppError::db)?;
+        let managed = find_best_center_match(variant, &all)
+            .ok_or_else(|| AppError::not_found("No matching central Skill"))?;
         let source = PathBuf::from(&managed.central_path);
-        let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
-        let mode = sync_engine::sync_mode_for_tool(&agent, configured_mode.as_deref());
-        // UserConfirmed: this intentionally replaces an existing project copy
-        // the user chose to update, and project deployments never create
-        // `skill_targets` rows, so no record could vouch for it. The
-        // project_newer check above is the guard that makes this safe.
-        sync_engine::sync_skill(
+        if !sync_engine::is_target_current(
             &source,
             &target_path,
-            mode,
-            sync_engine::ReplacePolicy::UserConfirmed,
-        )
-        .map_err(AppError::io)?;
+            sync_engine::SyncMode::Symlink,
+            None,
+            None,
+        ) {
+            return Err(AppError::invalid_input(
+                "Unmanaged or foreign Symlink cannot be replaced automatically",
+            ));
+        }
         Ok(())
     })
     .await?
@@ -1359,7 +1583,28 @@ pub async fn toggle_project_skill(
             AppError::invalid_input("This workspace does not support disabling skills")
         })?;
 
-        set_project_skill_enabled_state(&skills_dir, &disabled_dir, &skill_relative_path, enabled)
+        set_project_skill_enabled_state(&skills_dir, &disabled_dir, &skill_relative_path, enabled)?;
+        let (old, new) = if enabled {
+            (
+                disabled_dir.join(&skill_relative_path),
+                skills_dir.join(&skill_relative_path),
+            )
+        } else {
+            (
+                skills_dir.join(&skill_relative_path),
+                disabled_dir.join(&skill_relative_path),
+            )
+        };
+        if std::fs::symlink_metadata(&old).is_err() && std::fs::symlink_metadata(&new).is_ok() {
+            store
+                .move_project_skill_deployment(
+                    &project_id,
+                    &old.to_string_lossy(),
+                    &new.to_string_lossy(),
+                )
+                .map_err(AppError::db)?;
+        }
+        Ok(())
     })
     .await?
 }
@@ -1421,6 +1666,9 @@ pub fn delete_project_skill_internal(
         ensure_removable(store, &record, &target)?;
     }
     remove_workspace_skill_target(&target)?;
+    store
+        .delete_project_skill_deployment(&project_id, &target.to_string_lossy())
+        .map_err(AppError::db)?;
     Ok(())
 }
 
@@ -1445,12 +1693,20 @@ pub fn remove_planned_project_copy(
     if !force {
         ensure_removable(store, &record, &path)?;
     }
-    remove_workspace_skill_target(&path)
+    remove_workspace_skill_target(&path)?;
+    store
+        .delete_project_skill_deployment(project_id, &path.to_string_lossy())
+        .map_err(AppError::db)?;
+    Ok(())
 }
 
 /// Refuse unless what sits at `target` is a scanned project skill whose
 /// removal cannot lose content the library lacks.
-fn ensure_removable(store: &SkillStore, record: &ProjectRecord, target: &Path) -> Result<(), AppError> {
+fn ensure_removable(
+    store: &SkillStore,
+    record: &ProjectRecord,
+    target: &Path,
+) -> Result<(), AppError> {
     let configs = agent_skill_configs(store);
     let variants = read_workspace_skills(record, &configs);
     let all_managed = store.get_all_skills().map_err(AppError::db)?;
@@ -1459,7 +1715,7 @@ fn ensure_removable(store: &SkillStore, record: &ProjectRecord, target: &Path) -
         Some(variant) => {
             let matched = find_best_center_match(variant, &all_managed);
             let status = classify_sync_status(variant, matched);
-            (!removal_is_safe(variant, matched, &status))
+            (!managed_removal_is_safe(store, &record.id, variant, matched, &status)?)
                 .then(|| unsafe_removal_reason(&status))
         }
     };
@@ -1593,9 +1849,9 @@ fn find_variant<'a>(
         .iter()
         .find(|v| v.agent == agent && v.relative_path == relative_path)
         .or_else(|| {
-            variants.iter().find(|v| {
-                v.agent == agent && v.relative_path.eq_ignore_ascii_case(relative_path)
-            })
+            variants
+                .iter()
+                .find(|v| v.agent == agent && v.relative_path.eq_ignore_ascii_case(relative_path))
         })
 }
 
@@ -1619,6 +1875,10 @@ pub struct ProjectDeployTarget {
     pub sync_status: Option<String>,
     #[serde(skip)]
     source: PathBuf,
+    #[serde(skip)]
+    project_id: String,
+    #[serde(skip)]
+    version: Option<git_skill_versions::GitSkillVersion>,
 }
 
 /// Decide, without writing, what deploying `skill_ids` to `agents` in a
@@ -1633,6 +1893,18 @@ pub fn plan_project_deploy(
     project_id: &str,
     skill_ids: &[String],
     agents: &[String],
+) -> Result<Vec<ProjectDeployTarget>, AppError> {
+    plan_project_deploy_with_commit(store, project_id, skill_ids, agents, None)
+}
+
+/// Plan a Git-pinned project Copy. A selected CommitId cannot represent a
+/// Symlink deployment because that link tracks a mutable working directory.
+pub fn plan_project_deploy_with_commit(
+    store: &SkillStore,
+    project_id: &str,
+    skill_ids: &[String],
+    agents: &[String],
+    commit_oid: Option<&str>,
 ) -> Result<Vec<ProjectDeployTarget>, AppError> {
     let project = get_project_record(store, project_id)?;
     ensure_workspace_path_exists(&project)?;
@@ -1657,7 +1929,10 @@ pub fn plan_project_deploy(
                 )));
             }
             if !row.enabled {
-                return Err(AppError::invalid_input(format!("Agent is disabled: {}", agent)));
+                return Err(AppError::invalid_input(format!(
+                    "Agent is disabled: {}",
+                    agent
+                )));
             }
         }
         if !groups.iter().any(|existing| existing.key == group.key) {
@@ -1668,6 +1943,7 @@ pub fn plan_project_deploy(
     let configs = agent_skill_configs(store);
     let variants = read_workspace_skills(&project, &configs);
     let all_managed = store.get_all_skills().map_err(AppError::db)?;
+    let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
 
     let mut plan = Vec::new();
     for skill_id in skill_ids {
@@ -1676,21 +1952,46 @@ pub fn plan_project_deploy(
             .map_err(AppError::db)?
             .ok_or_else(|| AppError::not_found("Skill not found"))?;
         let source = PathBuf::from(&skill.central_path);
-        // The write copies or links this directory; without it the run fails,
-        // so the plan (and with it a dry run) fails first.
-        if !source.is_dir() {
-            return Err(AppError::not_found(format!(
-                "Library copy of \"{}\" is missing: {}",
-                skill.name,
-                source.display()
-            )));
-        }
-        let dir_name = sync_engine::target_dir_name(&source, &skill.name);
-        ensure_safe_skill_relative_path(&dir_name)?;
-
         for group in &groups {
+            let mode = sync_engine::sync_mode_for_tool(&group.key, configured_mode.as_deref());
+            // A fixed Git Commit can remain deployable after its working-tree
+            // directory was renamed/deleted. A Symlink cannot.
+            if matches!(mode, sync_engine::SyncMode::Symlink) && !source.is_dir() {
+                return Err(AppError::not_found(format!(
+                    "Library copy of \"{}\" is missing: {}",
+                    skill.name,
+                    source.display(),
+                )));
+            }
+            if commit_oid.is_some() && matches!(mode, sync_engine::SyncMode::Symlink) {
+                return Err(AppError::invalid_input(
+                    "A selected Git CommitId requires Copy mode; Symlinks track mutable content",
+                ));
+            }
+            let version = if matches!(mode, sync_engine::SyncMode::Copy) {
+                Some(
+                    git_skill_versions::resolve_skill_version(
+                        &central_repo::skills_dir(),
+                        &skill.id,
+                        commit_oid,
+                    )
+                    .map_err(AppError::io)?,
+                )
+            } else {
+                None
+            };
+            let dir_name = version
+                .as_ref()
+                .and_then(|v| Path::new(&v.path_at_commit).file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| sync_engine::target_dir_name(&source, &skill.name));
+            ensure_safe_skill_relative_path(&dir_name)?;
             let enabled_path = Path::new(&group.skills_root).join(&dir_name);
-            let disabled_path = group.disabled_root.as_ref().map(|root| root.join(&dir_name));
+            let disabled_path = group
+                .disabled_root
+                .as_ref()
+                .map(|root| root.join(&dir_name));
             // symlink_metadata, not exists(): a dangling link is in the way too.
             let occupied = std::iter::once(enabled_path.clone())
                 .chain(disabled_path)
@@ -1701,13 +2002,35 @@ pub fn plan_project_deploy(
                 Some(path) => {
                     let variant = find_variant(&variants, &group.key, &dir_name);
                     let matched = variant.and_then(|v| find_best_center_match(v, &all_managed));
-                    match (variant, matched) {
-                        (Some(variant), Some(matched)) if matched.id == skill.id => (
-                            ProjectDeployState::AlreadyDeployed,
-                            Some(classify_sync_status(variant, Some(matched))),
-                            path,
-                        ),
-                        _ => (ProjectDeployState::Conflict, None, path),
+                    if version.is_some() {
+                        // Content equality is not a managed ownership record.
+                        // An externally installed same-named Skill is a conflict.
+                        let ownership = store
+                            .get_project_skill_deployment(project_id, &path.to_string_lossy())
+                            .map_err(AppError::db)?;
+                        match ownership {
+                            Some(row)
+                                if row.skill_id == skill.id
+                                    && row.mode == "copy"
+                                    && row.management_state == "managed" =>
+                            {
+                                (
+                                    ProjectDeployState::AlreadyDeployed,
+                                    Some(managed_copy_status(&row, &path)),
+                                    path,
+                                )
+                            }
+                            _ => (ProjectDeployState::Conflict, None, path),
+                        }
+                    } else {
+                        match (variant, matched) {
+                            (Some(variant), Some(matched)) if matched.id == skill.id => (
+                                ProjectDeployState::AlreadyDeployed,
+                                Some(classify_sync_status(variant, Some(matched))),
+                                path,
+                            ),
+                            _ => (ProjectDeployState::Conflict, None, path),
+                        }
                     }
                 }
             };
@@ -1720,6 +2043,8 @@ pub fn plan_project_deploy(
                 state,
                 sync_status,
                 source: source.clone(),
+                project_id: project_id.to_string(),
+                version,
             });
         }
     }
@@ -1809,13 +2134,58 @@ pub fn apply_project_deploy(
             std::fs::create_dir_all(parent)?;
         }
         let mode = sync_engine::sync_mode_for_tool(&target.agent, configured_mode.as_deref());
-        sync_engine::sync_skill(
-            &target.source,
-            &target_dir,
-            mode,
-            sync_engine::ReplacePolicy::NoClobber,
-        )
-        .map_err(AppError::io)?;
+        if let Some(version) = target.version.as_ref() {
+            if !matches!(mode, sync_engine::SyncMode::Copy) {
+                return Err(AppError::invalid_input(
+                    "Deployment mode changed during Copy planning",
+                ));
+            }
+            let staging = tempfile::Builder::new()
+                .prefix(".atm-skill-")
+                .tempdir_in(target_dir.parent().expect("project Skill has a parent"))
+                .map_err(AppError::io)?;
+            let staged = staging.path().join("content");
+            git_skill_versions::materialize_skill_version(
+                &central_repo::skills_dir(),
+                version,
+                &staged,
+            )
+            .map_err(AppError::io)?;
+            if std::fs::symlink_metadata(&target_dir).is_ok() {
+                return Err(AppError::invalid_input(
+                    "Project Skill target became occupied",
+                ));
+            }
+            rename_directory_no_replace(&staged, &target_dir)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let record = ProjectSkillDeploymentRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                project_id: target.project_id.clone(),
+                skill_id: target.skill_id.clone(),
+                target_path: target.path.clone(),
+                agent: target.agent.clone(),
+                mode: "copy".to_string(),
+                management_state: "managed".to_string(),
+                management_origin: "deployed_by_manager".to_string(),
+                version_match: "exact".to_string(),
+                base_commit_oid: Some(version.commit_oid.clone()),
+                base_tree_oid: Some(version.tree_oid.clone()),
+                path_at_commit: Some(version.path_at_commit.clone()),
+                created_at: now,
+                updated_at: now,
+            };
+            store
+                .insert_project_skill_deployment(&record)
+                .map_err(AppError::db)?;
+        } else {
+            sync_engine::sync_skill(
+                &target.source,
+                &target_dir,
+                mode,
+                sync_engine::ReplacePolicy::NoClobber,
+            )
+            .map_err(AppError::io)?;
+        }
     }
     Ok(())
 }
@@ -1845,8 +2215,8 @@ fn removal_is_safe(
     matched: Option<&SkillRecord>,
     sync_status: &str,
 ) -> bool {
-    let is_link = std::fs::symlink_metadata(&variant.path)
-        .is_ok_and(|meta| meta.file_type().is_symlink());
+    let is_link =
+        std::fs::symlink_metadata(&variant.path).is_ok_and(|meta| meta.file_type().is_symlink());
     if is_link {
         return matched.is_some_and(|managed| {
             match (
@@ -1870,6 +2240,43 @@ fn removal_is_safe(
             )
             .is_ok_and(|extra| extra.is_empty())
         })
+}
+
+/// Only a recorded manager-owned Copy can be removed without explicit force.
+/// An externally installed equal-content directory has no management consent.
+fn managed_removal_is_safe(
+    store: &SkillStore,
+    project_id: &str,
+    variant: &project_scanner::ProjectSkillInfo,
+    matched: Option<&SkillRecord>,
+    sync_status: &str,
+) -> Result<bool, AppError> {
+    let is_link =
+        std::fs::symlink_metadata(&variant.path).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link {
+        return Ok(removal_is_safe(variant, matched, sync_status));
+    }
+    let row = store
+        .get_project_skill_deployment(project_id, &variant.path)
+        .map_err(AppError::db)?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    if row.mode != "copy"
+        || row.management_state != "managed"
+        || !matched.is_some_and(|m| m.id == row.skill_id)
+    {
+        return Ok(false);
+    }
+    let Some(tree) = row.base_tree_oid.as_deref() else {
+        return Ok(false);
+    };
+    Ok(git_skill_versions::matches_skill_tree(
+        &central_repo::skills_dir(),
+        tree,
+        Path::new(&variant.path),
+    )
+    .unwrap_or(false))
 }
 
 /// Why a copy is not safe to remove. An in-sync copy can only be unsafe
@@ -1909,7 +2316,11 @@ pub fn plan_project_undeploy(
         groups
     };
     for skill_id in skill_ids {
-        if store.get_skill_by_id(skill_id).map_err(AppError::db)?.is_none() {
+        if store
+            .get_skill_by_id(skill_id)
+            .map_err(AppError::db)?
+            .is_none()
+        {
             return Err(AppError::not_found("Skill not found"));
         }
     }
@@ -1937,7 +2348,7 @@ pub fn plan_project_undeploy(
             shared_by: group.shared_by.clone(),
             relative_path: variant.relative_path.clone(),
             path: variant.path.clone(),
-            safe: removal_is_safe(variant, Some(matched), &sync_status),
+            safe: managed_removal_is_safe(store, project_id, variant, Some(matched), &sync_status)?,
             sync_status,
         });
     }
@@ -2049,7 +2460,9 @@ fn resolve_project_import(
         ProjectImportResult {
             action,
             skill_id: matched.map(|m| m.id.clone()),
-            name: matched.map(|m| m.name.clone()).unwrap_or_else(|| skill.name.clone()),
+            name: matched
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| skill.name.clone()),
             central_path: matched.map(|m| m.central_path.clone()),
             agent: group_key,
             relative_path: skill.relative_path.clone(),
@@ -2762,7 +3175,10 @@ mod add_project_tests {
         assert_eq!(dto.name, "repo");
         assert_eq!(fs::read_dir(&project_dir).unwrap().count(), 0);
         for agent_dir in [".claude", ".codex", ".agents"] {
-            assert!(!project_dir.join(agent_dir).exists(), "{agent_dir} must be opt-in");
+            assert!(
+                !project_dir.join(agent_dir).exists(),
+                "{agent_dir} must be opt-in"
+            );
         }
         assert_eq!(store.get_all_projects().unwrap().len(), 1);
     }
@@ -2782,7 +3198,10 @@ mod add_project_tests {
         assert!(!project_dir.join(".codex").exists());
 
         let duplicate = add_project_internal(&store, format!("{}/", project_dir.display()));
-        assert!(duplicate.unwrap_err().to_string().contains("already registered"));
+        assert!(duplicate
+            .unwrap_err()
+            .to_string()
+            .contains("already registered"));
         assert_eq!(fs::read_to_string(&existing).unwrap(), "user-owned skill");
         assert!(!project_dir.join(".claude/skills-disabled").exists());
 
@@ -2814,7 +3233,10 @@ mod add_project_tests {
         use super::stored_project_path as stored;
         use std::path::Path;
         assert_eq!(
-            stored(Path::new(r"\\?\UNC\server\share\repo"), Path::new(r"\\server\share\repo")),
+            stored(
+                Path::new(r"\\?\UNC\server\share\repo"),
+                Path::new(r"\\server\share\repo")
+            ),
             Path::new(r"\\server\share\repo")
         );
         assert_eq!(
@@ -2830,10 +3252,22 @@ mod add_project_tests {
     #[test]
     fn dunce_simplifies_only_what_keeps_its_meaning() {
         use std::path::Path;
-        assert_eq!(dunce::simplified(Path::new(r"\\?\C:\Users\me\repo")), Path::new(r"C:\Users\me\repo"));
-        assert_eq!(dunce::simplified(Path::new(r"\\?\C:\repo.")), Path::new(r"\\?\C:\repo."));
-        assert_eq!(dunce::simplified(Path::new(r"\\?\C:\CON\x")), Path::new(r"\\?\C:\CON\x"));
-        assert_eq!(dunce::simplified(Path::new(r"\\?\UNC\server\share\repo")), Path::new(r"\\?\UNC\server\share\repo"));
+        assert_eq!(
+            dunce::simplified(Path::new(r"\\?\C:\Users\me\repo")),
+            Path::new(r"C:\Users\me\repo")
+        );
+        assert_eq!(
+            dunce::simplified(Path::new(r"\\?\C:\repo.")),
+            Path::new(r"\\?\C:\repo.")
+        );
+        assert_eq!(
+            dunce::simplified(Path::new(r"\\?\C:\CON\x")),
+            Path::new(r"\\?\C:\CON\x")
+        );
+        assert_eq!(
+            dunce::simplified(Path::new(r"\\?\UNC\server\share\repo")),
+            Path::new(r"\\?\UNC\server\share\repo")
+        );
     }
 
     /// `/a/b`, `/a/b/` and `/a/x/../b` are one project. The raw-string UNIQUE
@@ -2844,14 +3278,22 @@ mod add_project_tests {
         let project_dir = tmp.path().join("repo");
         fs::create_dir(&project_dir).unwrap();
         let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
-        let first = add_project_internal(&store, project_dir.to_string_lossy().to_string()).unwrap();
+        let first =
+            add_project_internal(&store, project_dir.to_string_lossy().to_string()).unwrap();
 
         for spelling in [
             format!("{}/", project_dir.to_string_lossy()),
-            project_dir.join("..").join("repo").to_string_lossy().to_string(),
+            project_dir
+                .join("..")
+                .join("repo")
+                .to_string_lossy()
+                .to_string(),
         ] {
             let err = add_project_internal(&store, spelling.clone()).unwrap_err();
-            assert!(err.to_string().contains("already registered"), "{spelling}: {err}");
+            assert!(
+                err.to_string().contains("already registered"),
+                "{spelling}: {err}"
+            );
             assert!(err.to_string().contains(&first.id), "{spelling}: {err}");
         }
         assert_eq!(store.get_all_projects().unwrap().len(), 1);
@@ -2890,11 +3332,17 @@ mod project_plan_tests {
             .iter()
             .map(|key| {
                 let dir = tmp.path().join("global").join(key);
-                (key.to_string(), serde_json::Value::String(dir.to_string_lossy().to_string()))
+                (
+                    key.to_string(),
+                    serde_json::Value::String(dir.to_string_lossy().to_string()),
+                )
             })
             .collect();
         store
-            .set_setting("custom_tool_paths", &serde_json::Value::Object(overrides).to_string())
+            .set_setting(
+                "custom_tool_paths",
+                &serde_json::Value::Object(overrides).to_string(),
+            )
             .unwrap();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -2902,7 +3350,13 @@ mod project_plan_tests {
             .unwrap()
             .id;
         let repo = dunce::canonicalize(&repo).unwrap();
-        Fixture { _guard: guard, _tmp: tmp, store, project_id, repo }
+        Fixture {
+            _guard: guard,
+            _tmp: tmp,
+            store,
+            project_id,
+            repo,
+        }
     }
 
     fn write_skill(dir: &Path, name: &str, body: &str) {
@@ -2944,6 +3398,49 @@ mod project_plan_tests {
         record
     }
 
+    /// Commit the fixture's central Skills with their stable IDs. Versioned
+    /// Copy deploys deliberately fail closed when there is no Git commit.
+    fn commit_library(fx: &Fixture) {
+        let root = central_repo::skills_dir();
+        fs::create_dir_all(&root).unwrap();
+        let repo = git2::Repository::open(&root)
+            .unwrap_or_else(|_| git2::Repository::init(&root).unwrap());
+        for skill in fx.store.get_all_skills().unwrap() {
+            let rel = Path::new(&skill.central_path)
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let file = root.join(format!(".skills-manager/skills/{}.json", skill.id));
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let value = serde_json::json!({
+                "schema_version": 1, "skill_id": skill.id,
+                "path": rel, "path_key": rel, "enabled": true, "tags": [],
+                "source": {"type": "local", "ref": null, "subpath": null, "branch": null}
+            });
+            fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let identity = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit<'_>> = head.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &identity,
+            &identity,
+            "fixture",
+            &tree,
+            &parents,
+        )
+        .unwrap();
+    }
+
     fn ids(skills: &[&SkillRecord]) -> Vec<String> {
         skills.iter().map(|s| s.id.clone()).collect()
     }
@@ -2951,7 +3448,11 @@ mod project_plan_tests {
     /// Compared as paths, not strings: on Windows a conflict path mixes `\` with
     /// the `/` of an agent directory such as `.claude/skills`.
     fn conflict_paths(err: &AppError) -> Vec<PathBuf> {
-        assert_eq!(err.kind, crate::core::error::ErrorKind::TargetConflict, "{err}");
+        assert_eq!(
+            err.kind,
+            crate::core::error::ErrorKind::TargetConflict,
+            "{err}"
+        );
         err.details
             .as_ref()
             .unwrap()
@@ -2962,22 +3463,247 @@ mod project_plan_tests {
     }
 
     #[test]
+    fn git_copy_deploys_committed_bytes_and_tracks_exact_version() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "committed");
+        commit_library(&fx);
+        let selected =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &demo.id, None)
+                .unwrap();
+        fs::write(
+            Path::new(&demo.central_path).join("SKILL.md"),
+            "uncommitted",
+        )
+        .unwrap();
+        let plan = plan_project_deploy_with_commit(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+            Some(&selected.commit_oid),
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("committed"));
+        assert!(!fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("uncommitted"));
+        let record = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.skill_id, demo.id);
+        assert_eq!(
+            record.base_commit_oid.as_deref(),
+            Some(selected.commit_oid.as_str())
+        );
+        assert_eq!(
+            record.base_tree_oid.as_deref(),
+            Some(selected.tree_oid.as_str())
+        );
+        assert_eq!(record.management_origin, "deployed_by_manager");
+        assert_eq!(record.management_state, "managed");
+
+        let again = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(again[0].state, ProjectDeployState::AlreadyDeployed);
+        assert_eq!(again[0].sync_status.as_deref(), Some("in_sync"));
+    }
+
+    #[test]
+    fn project_copy_update_uses_trusted_tree_not_mtime_and_preserves_local_edits() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let original = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let base = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .base_tree_oid
+            .unwrap();
+
+        let central = Path::new(&demo.central_path).join("SKILL.md");
+        fs::write(&central, "not yet committed").unwrap();
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            original
+        );
+        fs::write(&central, "---\nname: demo\ndescription: test\n---\nv2\n").unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("v2"));
+        assert_ne!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .base_tree_oid
+                .as_deref(),
+            Some(base.as_str())
+        );
+
+        fs::write(target.join(".custom"), "my local edit").unwrap();
+        fs::write(&central, "---\nname: demo\ndescription: test\n---\nv3\n").unwrap();
+        commit_library(&fx);
+        let err =
+            update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap_err();
+        assert!(err.to_string().contains("local changes"));
+        assert!(target.join(".custom").is_file());
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("v2"));
+        let status = get_project_skills_internal(&fx.store, fx.project_id.clone()).unwrap();
+        assert!(status
+            .iter()
+            .any(|v| v.relative_path == "demo" && v.sync_status == "diverged"));
+    }
+
+    #[test]
+    fn update_database_failure_rolls_back_the_original_copy_and_baseline() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let before = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let base = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .base_tree_oid;
+
+        fs::write(
+            Path::new(&demo.central_path).join("SKILL.md"),
+            "---\\nname: demo\\ndescription: test\\n---\\nv2\\n",
+        )
+        .unwrap();
+        commit_library(&fx);
+        let conn = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_base_update BEFORE UPDATE OF base_tree_oid
+             ON project_skill_deployments BEGIN
+               SELECT RAISE(ABORT, 'injected database failure');
+             END;",
+        )
+        .unwrap();
+        assert!(update_managed_project_copy(&fx.store, &fx.project_id, &target, None).is_err());
+        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), before);
+        let after = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.base_tree_oid, base);
+    }
+
+    #[test]
+    fn publish_no_replace_never_overwrites_an_existing_directory() {
+        let root = tempdir().unwrap();
+        let staged = root.path().join("staged");
+        let occupied = root.path().join("occupied");
+        fs::create_dir(&staged).unwrap();
+        fs::create_dir(&occupied).unwrap();
+        fs::write(occupied.join("mine"), "original").unwrap();
+        assert!(rename_directory_no_replace(&staged, &occupied).is_err());
+        assert_eq!(
+            fs::read_to_string(occupied.join("mine")).unwrap(),
+            "original"
+        );
+        assert!(staged.exists());
+    }
+
+    #[test]
+    fn matching_unmanaged_copy_is_not_automatically_adopted_or_updated() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let external = fx.repo.join(".claude/skills/demo");
+        write_skill(&external, "demo", "v1");
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(plan[0].state, ProjectDeployState::Conflict);
+        assert!(update_managed_project_copy(&fx.store, &fx.project_id, &external, None).is_err());
+        assert!(external.join("SKILL.md").exists());
+    }
+
+    #[test]
     fn first_deploy_creates_only_selected_agent_directories() {
         let fx = fixture(&["claude_code", "codex"]);
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
-        assert_eq!(fs::read_dir(&fx.repo).unwrap().count(), 0, "registration is metadata-only");
+        assert_eq!(
+            fs::read_dir(&fx.repo).unwrap().count(),
+            0,
+            "registration is metadata-only"
+        );
 
-        let claude = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        let claude = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         assert_eq!(claude[0].state, ProjectDeployState::Create);
-        assert!(!fx.repo.join(".claude").exists(), "planning must not create directories");
+        assert!(
+            !fx.repo.join(".claude").exists(),
+            "planning must not create directories"
+        );
         apply_project_deploy(&fx.store, &claude).unwrap();
         assert!(fx.repo.join(".claude/skills/demo/SKILL.md").is_file());
         assert!(!fx.repo.join(".claude/skills-disabled").exists());
-        assert!(!fx.repo.join(".codex").exists(), "unselected agent must remain untouched");
+        assert!(
+            !fx.repo.join(".codex").exists(),
+            "unselected agent must remain untouched"
+        );
 
-        let codex = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["codex".into()]).unwrap();
+        let codex =
+            plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["codex".into()])
+                .unwrap();
         assert_eq!(codex[0].state, ProjectDeployState::Create);
-        assert!(!fx.repo.join(".codex").exists(), "planning must not create directories");
+        assert!(
+            !fx.repo.join(".codex").exists(),
+            "planning must not create directories"
+        );
         apply_project_deploy(&fx.store, &codex).unwrap();
         assert!(fx.repo.join(".codex/skills/demo/SKILL.md").is_file());
         assert!(!fx.repo.join(".codex/skills-disabled").exists());
@@ -2990,20 +3716,40 @@ mod project_plan_tests {
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         let target = fx.repo.join(".claude/skills/demo");
 
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].state, ProjectDeployState::Create);
-        assert!(fs::symlink_metadata(&target).is_err(), "planning must not write");
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "planning must not write"
+        );
 
         apply_project_deploy(&fx.store, &plan).unwrap();
         assert!(target.join("SKILL.md").is_file());
 
-        let again = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        let again = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         assert_eq!(again[0].state, ProjectDeployState::AlreadyDeployed);
         assert_eq!(again[0].sync_status.as_deref(), Some("in_sync"));
 
         // The GUI path keeps refusing anything already there, as before.
-        let gui = export_skill_to_project_internal(&fx.store, demo.id.clone(), fx.project_id.clone(), None);
+        let gui = export_skill_to_project_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            None,
+        );
         assert!(gui.unwrap_err().to_string().contains("already exists"));
     }
 
@@ -3018,18 +3764,36 @@ mod project_plan_tests {
         fs::create_dir_all(squatter.parent().unwrap()).unwrap();
         // Byte-identical to `other`, so its unique hash names `other`.
         fs::create_dir_all(&squatter).unwrap();
-        fs::copy(Path::new(&other.central_path).join("SKILL.md"), squatter.join("SKILL.md")).unwrap();
+        fs::copy(
+            Path::new(&other.central_path).join("SKILL.md"),
+            squatter.join("SKILL.md"),
+        )
+        .unwrap();
         let before = fs::read_to_string(squatter.join("SKILL.md")).unwrap();
 
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         assert_eq!(plan[0].state, ProjectDeployState::Conflict);
         let err = project_deploy_conflicts(&plan).expect("a conflict");
         assert_eq!(conflict_paths(&err), vec![squatter.clone()]);
 
         // The GUI path refuses as well, and the directory is untouched.
-        let gui = export_skill_to_project_internal(&fx.store, demo.id.clone(), fx.project_id.clone(), Some(vec!["claude_code".into()]));
+        let gui = export_skill_to_project_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["claude_code".into()]),
+        );
         assert!(gui.unwrap_err().to_string().contains("already exists"));
-        assert_eq!(fs::read_to_string(squatter.join("SKILL.md")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(squatter.join("SKILL.md")).unwrap(),
+            before
+        );
     }
 
     /// Review finding 5: two library skills whose directories share a name
@@ -3042,7 +3806,8 @@ mod project_plan_tests {
         for (id, group, body) in [("s-a", "a", "# A's demo"), ("s-b", "b", "# B's demo")] {
             let central = central_repo::skills_dir().join(group).join("demo");
             write_skill(&central, "demo", body);
-            let mut record = library_skill(&fx, &format!("{id}-tmp"), &format!("{group}-tmp"), body);
+            let mut record =
+                library_skill(&fx, &format!("{id}-tmp"), &format!("{group}-tmp"), body);
             fs::remove_dir_all(&record.central_path).unwrap();
             fx.store.delete_skill(&record.id).unwrap();
             record.id = id.to_string();
@@ -3052,12 +3817,20 @@ mod project_plan_tests {
             skills.push(record);
         }
 
-        let err = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&skills[0], &skills[1]]), &["claude_code".into()])
-            .expect_err("two skills on one directory");
+        let err = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skills[0], &skills[1]]),
+            &["claude_code".into()],
+        )
+        .expect_err("two skills on one directory");
         let target = fx.repo.join(".claude/skills/demo");
         assert_eq!(conflict_paths(&err), vec![target.clone()]);
         let reason = &err.details.as_ref().unwrap().conflicts[0].reason;
-        assert!(reason.contains("a-demo") && reason.contains("b-demo"), "{reason}");
+        assert!(
+            reason.contains("a-demo") && reason.contains("b-demo"),
+            "{reason}"
+        );
         assert!(
             reason.contains(&skills[0].central_path) && reason.contains(&skills[1].central_path),
             "names can coincide, so the library directories are named: {reason}"
@@ -3073,7 +3846,13 @@ mod project_plan_tests {
         fs::create_dir_all(&squatter).unwrap();
         fs::write(squatter.join("notes.txt"), "mine").unwrap();
 
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         assert_eq!(plan[0].state, ProjectDeployState::Conflict);
         assert!(project_deploy_conflicts(&plan).is_some());
     }
@@ -3084,15 +3863,33 @@ mod project_plan_tests {
     fn any_agent_reading_a_shared_directory_can_deploy_into_it() {
         let fx = fixture(&["warp"]);
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
-        let rep = project_agent_group(&fx.store, &get_project_record(&fx.store, &fx.project_id).unwrap(), "warp").unwrap();
-        assert_ne!(rep.key, "warp", "the row must be filed under another agent for this test to mean anything");
+        let rep = project_agent_group(
+            &fx.store,
+            &get_project_record(&fx.store, &fx.project_id).unwrap(),
+            "warp",
+        )
+        .unwrap();
+        assert_ne!(
+            rep.key, "warp",
+            "the row must be filed under another agent for this test to mean anything"
+        );
         assert!(rep.shared_by.contains(&"warp".to_string()));
 
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["warp".into()]).unwrap();
+        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["warp".into()])
+            .unwrap();
         assert_eq!(plan[0].agent, rep.key);
-        assert_eq!(PathBuf::from(&plan[0].path), fx.repo.join(".agents/skills/demo"));
+        assert_eq!(
+            PathBuf::from(&plan[0].path),
+            fx.repo.join(".agents/skills/demo")
+        );
 
-        export_skill_to_project_internal(&fx.store, demo.id.clone(), fx.project_id.clone(), Some(vec!["warp".into()])).unwrap();
+        export_skill_to_project_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["warp".into()]),
+        )
+        .unwrap();
         assert!(fx.repo.join(".agents/skills/demo/SKILL.md").is_file());
     }
 
@@ -3102,11 +3899,31 @@ mod project_plan_tests {
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         fs::remove_dir_all(&fx.repo).unwrap();
 
-        let err = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap_err();
-        assert!(err.to_string().contains("Project path does not exist"), "{err}");
-        let gui = export_skill_to_project_internal(&fx.store, demo.id.clone(), fx.project_id.clone(), None);
-        assert!(gui.unwrap_err().to_string().contains("Project path does not exist"));
-        assert!(!fx.repo.exists(), "the project folder must not be recreated");
+        let err = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Project path does not exist"),
+            "{err}"
+        );
+        let gui = export_skill_to_project_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            None,
+        );
+        assert!(gui
+            .unwrap_err()
+            .to_string()
+            .contains("Project path does not exist"));
+        assert!(
+            !fx.repo.exists(),
+            "the project folder must not be recreated"
+        );
         assert!(plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).is_err());
         assert!(plan_project_import(&fx.store, &fx.project_id, "demo", "claude_code").is_err());
     }
@@ -3117,21 +3934,53 @@ mod project_plan_tests {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         apply_project_deploy(&fx.store, &plan).unwrap();
         let copy = fx.repo.join(".claude/skills/demo");
-        fs::write(copy.join("SKILL.md"), "---\nname: demo\n---\n# Edited in the project\n").unwrap();
+        fs::write(
+            copy.join("SKILL.md"),
+            "---\nname: demo\n---\n# Edited in the project\n",
+        )
+        .unwrap();
 
-        let removal = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
+        let removal =
+            plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
         assert_eq!(removal.len(), 1);
         assert!(!removal[0].safe, "status {}", removal[0].sync_status);
-        assert_eq!(conflict_paths(&project_removal_conflicts(&removal).unwrap()), vec![copy.clone()]);
+        assert_eq!(
+            conflict_paths(&project_removal_conflicts(&removal).unwrap()),
+            vec![copy.clone()]
+        );
 
-        let err = delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).unwrap_err();
+        let err = delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(conflict_paths(&err).len(), 1);
-        assert!(copy.join("SKILL.md").is_file(), "a refused removal deletes nothing");
+        assert!(
+            copy.join("SKILL.md").is_file(),
+            "a refused removal deletes nothing"
+        );
 
-        delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), true).unwrap();
+        delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            true,
+        )
+        .unwrap();
         assert!(!copy.exists());
     }
 
@@ -3140,18 +3989,35 @@ mod project_plan_tests {
         let fx = fixture(&["claude_code"]);
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         let other = library_skill(&fx, "s-other", "other", "# Other");
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo, &other]), &["claude_code".into()]).unwrap();
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo, &other]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         apply_project_deploy(&fx.store, &plan).unwrap();
         // A skill written in the project, matching nothing in the library.
         write_skill(&fx.repo.join(".claude/skills/mine"), "mine", "# Mine");
 
-        let removal = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
+        let removal =
+            plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
         assert_eq!(removal.len(), 1);
         assert_eq!(removal[0].relative_path, "demo");
         assert!(removal[0].safe);
-        assert!(fx.repo.join(".claude/skills/demo").exists(), "planning must not delete");
+        assert!(
+            fx.repo.join(".claude/skills/demo").exists(),
+            "planning must not delete"
+        );
 
-        delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).unwrap();
+        delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap();
         assert!(!fx.repo.join(".claude/skills/demo").exists());
         assert!(fx.repo.join(".claude/skills/other").exists());
         assert!(fx.repo.join(".claude/skills/mine").exists());
@@ -3163,7 +4029,14 @@ mod project_plan_tests {
     fn delete_without_force_refuses_a_project_only_skill() {
         let fx = fixture(&["claude_code"]);
         write_skill(&fx.repo.join(".claude/skills/mine"), "mine", "# Mine");
-        let err = delete_project_skill_internal(&fx.store, fx.project_id.clone(), "mine".into(), "claude_code".into(), false).unwrap_err();
+        let err = delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "mine".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(conflict_paths(&err).len(), 1);
         assert!(fx.repo.join(".claude/skills/mine/SKILL.md").is_file());
     }
@@ -3176,7 +4049,14 @@ mod project_plan_tests {
         let junk = fx.repo.join(".claude/skills/junk");
         fs::create_dir_all(&junk).unwrap();
         fs::write(junk.join("notes.txt"), "mine").unwrap();
-        let err = delete_project_skill_internal(&fx.store, fx.project_id.clone(), "junk".into(), "claude_code".into(), false).unwrap_err();
+        let err = delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "junk".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(conflict_paths(&err).len(), 1);
         assert!(junk.join("notes.txt").is_file());
     }
@@ -3190,27 +4070,42 @@ mod project_plan_tests {
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         let disabled = fx.repo.join(".claude/skills-disabled/demo");
         fs::create_dir_all(&disabled).unwrap();
-        fs::copy(Path::new(&demo.central_path).join("SKILL.md"), disabled.join("SKILL.md")).unwrap();
+        fs::copy(
+            Path::new(&demo.central_path).join("SKILL.md"),
+            disabled.join("SKILL.md"),
+        )
+        .unwrap();
         let junk = fx.repo.join(".claude/skills/demo");
         fs::create_dir_all(&junk).unwrap();
         fs::write(junk.join("notes.txt"), "mine").unwrap();
 
         // By relative path: the slot that would be deleted is the junk one,
         // which is not a recognizable skill, so it is refused.
-        let err = delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).unwrap_err();
+        let err = delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(conflict_paths(&err), vec![junk.clone()]);
         assert!(junk.join("notes.txt").is_file());
     }
 
-    /// Same layout, removing through the plan: the planned copy is the
-    /// disabled one, and only it goes.
+    /// A hand-installed equal-content Copy is not automatically owned. It
+    /// needs explicit --force even though the other slot is unrelated junk.
     #[test]
-    fn a_planned_removal_deletes_exactly_the_planned_copy() {
+    fn a_planned_removal_preserves_unmanaged_copy_until_explicit_force() {
         let fx = fixture(&["claude_code"]);
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         let disabled = fx.repo.join(".claude/skills-disabled/demo");
         fs::create_dir_all(&disabled).unwrap();
-        fs::copy(Path::new(&demo.central_path).join("SKILL.md"), disabled.join("SKILL.md")).unwrap();
+        fs::copy(
+            Path::new(&demo.central_path).join("SKILL.md"),
+            disabled.join("SKILL.md"),
+        )
+        .unwrap();
         let junk = fx.repo.join(".claude/skills/demo");
         fs::create_dir_all(&junk).unwrap();
         fs::write(junk.join("notes.txt"), "mine").unwrap();
@@ -3218,7 +4113,10 @@ mod project_plan_tests {
         let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(PathBuf::from(&plan[0].path), disabled);
-        remove_planned_project_copy(&fx.store, &fx.project_id, &plan[0], false).unwrap();
+        assert!(!plan[0].safe, "unmanaged Copy is never implicitly owned");
+        assert!(remove_planned_project_copy(&fx.store, &fx.project_id, &plan[0], false).is_err());
+        assert!(disabled.exists());
+        remove_planned_project_copy(&fx.store, &fx.project_id, &plan[0], true).unwrap();
         assert!(!disabled.exists());
         assert!(junk.join("notes.txt").is_file());
     }
@@ -3235,20 +4133,41 @@ mod project_plan_tests {
         fs::create_dir_all(&skills).unwrap();
         let link = skills.join("demo");
 
-        for (label, body) in [("different", "# Someone else's demo"), ("identical", "# Demo")] {
+        for (label, body) in [
+            ("different", "# Someone else's demo"),
+            ("identical", "# Demo"),
+        ] {
             let elsewhere = fx._tmp.path().join(format!("elsewhere-{label}/demo"));
             write_skill(&elsewhere, "demo", body);
             if label == "identical" {
-                fs::copy(Path::new(&demo.central_path).join("SKILL.md"), elsewhere.join("SKILL.md")).unwrap();
+                fs::copy(
+                    Path::new(&demo.central_path).join("SKILL.md"),
+                    elsewhere.join("SKILL.md"),
+                )
+                .unwrap();
             }
             let _ = fs::remove_file(&link);
             std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
 
-            let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
+            let plan =
+                plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
             assert_eq!(plan.len(), 1, "{label}");
             assert!(!plan[0].safe, "{label}: status {}", plan[0].sync_status);
-            assert!(delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).is_err(), "{label}");
-            assert!(fs::symlink_metadata(&link).is_ok(), "{label}: the link stays");
+            assert!(
+                delete_project_skill_internal(
+                    &fx.store,
+                    fx.project_id.clone(),
+                    "demo".into(),
+                    "claude_code".into(),
+                    false
+                )
+                .is_err(),
+                "{label}"
+            );
+            assert!(
+                fs::symlink_metadata(&link).is_ok(),
+                "{label}: the link stays"
+            );
         }
 
         // Our own deployment (a link to the library copy) is still removable.
@@ -3256,9 +4175,19 @@ mod project_plan_tests {
         std::os::unix::fs::symlink(&demo.central_path, &link).unwrap();
         let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
         assert!(plan[0].safe);
-        delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).unwrap();
+        delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap();
         assert!(fs::symlink_metadata(&link).is_err());
-        assert!(Path::new(&demo.central_path).join("SKILL.md").is_file(), "the library copy survives");
+        assert!(
+            Path::new(&demo.central_path).join("SKILL.md").is_file(),
+            "the library copy survives"
+        );
     }
 
     /// Equal hashes do not prove a copy holds nothing of its own: the hash
@@ -3270,34 +4199,67 @@ mod project_plan_tests {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        commit_library(&fx);
         let copy = fx.repo.join(".claude/skills/demo");
         let extras: [(&str, fn(&Path)); 3] = [
-            (".gitignore", |copy| fs::write(copy.join(".gitignore"), "secrets/\n").unwrap()),
+            (".gitignore", |copy| {
+                fs::write(copy.join(".gitignore"), "secrets/\n").unwrap()
+            }),
             (".git", |copy| {
                 fs::create_dir_all(copy.join(".git")).unwrap();
                 fs::write(copy.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
             }),
-            ("link", |copy| std::os::unix::fs::symlink("/tmp", copy.join("link")).unwrap()),
+            ("link", |copy| {
+                std::os::unix::fs::symlink("/tmp", copy.join("link")).unwrap()
+            }),
         ];
 
         for (label, add_extra) in extras {
             let _ = fs::remove_dir_all(&copy);
-            let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+            let plan = plan_project_deploy(
+                &fx.store,
+                &fx.project_id,
+                &ids(&[&demo]),
+                &["claude_code".into()],
+            )
+            .unwrap();
             apply_project_deploy(&fx.store, &plan).unwrap();
             add_extra(&copy);
 
-            let removal = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
-            assert_eq!(removal[0].sync_status, "in_sync", "{label}: the hash cannot see it");
+            let removal =
+                plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
+            assert_eq!(
+                removal[0].sync_status, "in_sync",
+                "{label}: the hash cannot see it"
+            );
             assert!(!removal[0].safe, "{label}: must not be safe");
-            assert!(delete_project_skill_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).is_err(), "{label}");
+            assert!(
+                delete_project_skill_internal(
+                    &fx.store,
+                    fx.project_id.clone(),
+                    "demo".into(),
+                    "claude_code".into(),
+                    false
+                )
+                .is_err(),
+                "{label}"
+            );
             assert!(copy.exists(), "{label}: kept");
         }
 
         // A plain copy with nothing extra is still removable.
         fs::remove_dir_all(&copy).unwrap();
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         apply_project_deploy(&fx.store, &plan).unwrap();
-        assert!(plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap()[0].safe);
+        assert!(
+            plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap()[0].safe
+        );
     }
 
     /// Review finding 4: whether an import may overwrite is decided under the
@@ -3307,12 +4269,22 @@ mod project_plan_tests {
     #[test]
     fn import_decides_whether_it_overwrites_under_the_lock() {
         let fx = fixture(&["claude_code"]);
-        write_skill(&fx.repo.join(".claude/skills/mine"), "mine", "# Project version");
+        write_skill(
+            &fx.repo.join(".claude/skills/mine"),
+            "mine",
+            "# Project version",
+        );
         let held = RepoLock::acquire_foreground("test holds the lock").unwrap();
 
         let result = std::thread::scope(|scope| {
             let import = scope.spawn(|| {
-                import_project_skill_to_center_internal(&fx.store, fx.project_id.clone(), "mine".into(), "claude_code".into(), false)
+                import_project_skill_to_center_internal(
+                    &fx.store,
+                    fx.project_id.clone(),
+                    "mine".into(),
+                    "claude_code".into(),
+                    false,
+                )
             });
             // Long enough for the import to plan and block on the lock.
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -3324,7 +4296,9 @@ mod project_plan_tests {
         let err = result.expect_err("an overwrite without --force must be refused");
         assert_eq!(conflict_paths(&err).len(), 1);
         let library = central_repo::skills_dir().join("mine/SKILL.md");
-        assert!(fs::read_to_string(library).unwrap().contains("Someone else's version"));
+        assert!(fs::read_to_string(library)
+            .unwrap()
+            .contains("Someone else's version"));
     }
 
     /// Review finding 7: a dry run must fail where the run certainly will.
@@ -3335,8 +4309,13 @@ mod project_plan_tests {
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
         fs::remove_dir_all(&demo.central_path).unwrap();
 
-        let err = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()])
-            .expect_err("the run would fail, so the plan must");
+        let err = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .expect_err("the run would fail, so the plan must");
         assert!(err.to_string().contains(&demo.central_path), "{err}");
         assert!(fs::symlink_metadata(fx.repo.join(".claude/skills/demo")).is_err());
     }
@@ -3348,7 +4327,13 @@ mod project_plan_tests {
         let fx = fixture(&["claude_code"]);
         write_skill(&fx.repo.join(".claude/skills/dots"), "...", "# Dots");
 
-        let real = import_project_skill_to_center_internal(&fx.store, fx.project_id.clone(), "dots".into(), "claude_code".into(), false);
+        let real = import_project_skill_to_center_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "dots".into(),
+            "claude_code".into(),
+            false,
+        );
         assert!(real.is_err(), "the installer rejects the name");
         let err = plan_project_import(&fx.store, &fx.project_id, "dots", "claude_code")
             .expect_err("the plan must refuse what the run refuses");
@@ -3364,16 +4349,36 @@ mod project_plan_tests {
 
         let plan = plan_project_import(&fx.store, &fx.project_id, "mine", "claude_code").unwrap();
         assert_eq!(plan.action, ProjectImportAction::Create);
-        assert!(fx.store.get_all_skills().unwrap().is_empty(), "planning must not write the library");
+        assert!(
+            fx.store.get_all_skills().unwrap().is_empty(),
+            "planning must not write the library"
+        );
 
-        let done = import_project_skill_to_center_internal(&fx.store, fx.project_id.clone(), "mine".into(), "claude_code".into(), false).unwrap();
+        let done = import_project_skill_to_center_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "mine".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap();
         assert_eq!(done.action, ProjectImportAction::Create);
         let skills = fx.store.get_all_skills().unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(Some(skills[0].id.clone()), done.skill_id);
-        assert!(Path::new(&skills[0].central_path).join("SKILL.md").is_file());
-        assert!(fx.store.list_audit(None).unwrap().iter().any(|e| e.action == "import"));
-        assert!(sync_metadata::has_complete_skill_snapshot(), "sync metadata must be written");
+        assert!(Path::new(&skills[0].central_path)
+            .join("SKILL.md")
+            .is_file());
+        assert!(fx
+            .store
+            .list_audit(None)
+            .unwrap()
+            .iter()
+            .any(|e| e.action == "import"));
+        assert!(
+            sync_metadata::has_complete_skill_snapshot(),
+            "sync metadata must be written"
+        );
 
         let again = plan_project_import(&fx.store, &fx.project_id, "mine", "claude_code").unwrap();
         assert_eq!(again.action, ProjectImportAction::Unchanged);
@@ -3384,20 +4389,59 @@ mod project_plan_tests {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
         let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
-        let plan = plan_project_deploy(&fx.store, &fx.project_id, &ids(&[&demo]), &["claude_code".into()]).unwrap();
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
         apply_project_deploy(&fx.store, &plan).unwrap();
-        fs::write(fx.repo.join(".claude/skills/demo/SKILL.md"), "---\nname: demo\n---\n# Better\n").unwrap();
+        fs::write(
+            fx.repo.join(".claude/skills/demo/SKILL.md"),
+            "---\nname: demo\n---\n# Better\n",
+        )
+        .unwrap();
         let library_file = Path::new(&demo.central_path).join("SKILL.md");
         let before = fs::read_to_string(&library_file).unwrap();
 
-        assert_eq!(plan_project_import(&fx.store, &fx.project_id, "demo", "claude_code").unwrap().action, ProjectImportAction::Overwrite);
-        let err = import_project_skill_to_center_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), false).unwrap_err();
-        assert_eq!(conflict_paths(&err), vec![PathBuf::from(&demo.central_path)]);
-        assert_eq!(fs::read_to_string(&library_file).unwrap(), before, "refused import must not write");
+        assert_eq!(
+            plan_project_import(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap()
+                .action,
+            ProjectImportAction::Overwrite
+        );
+        let err = import_project_skill_to_center_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict_paths(&err),
+            vec![PathBuf::from(&demo.central_path)]
+        );
+        assert_eq!(
+            fs::read_to_string(&library_file).unwrap(),
+            before,
+            "refused import must not write"
+        );
 
-        let done = import_project_skill_to_center_internal(&fx.store, fx.project_id.clone(), "demo".into(), "claude_code".into(), true).unwrap();
+        let done = import_project_skill_to_center_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            true,
+        )
+        .unwrap();
         assert_eq!(done.action, ProjectImportAction::Overwrite);
-        assert!(fs::read_to_string(&library_file).unwrap().contains("# Better"));
+        assert!(fs::read_to_string(&library_file)
+            .unwrap()
+            .contains("# Better"));
     }
 
     /// Two agents' copies both differ from the library: pushing either would
@@ -3405,11 +4449,26 @@ mod project_plan_tests {
     #[test]
     fn import_refuses_when_several_copies_differ_even_with_force() {
         let fx = fixture(&["claude_code", "cursor"]);
-        write_skill(&fx.repo.join(".claude/skills/mine"), "mine", "# Claude edit");
-        write_skill(&fx.repo.join(".cursor/skills/mine"), "mine", "# Cursor edit");
+        write_skill(
+            &fx.repo.join(".claude/skills/mine"),
+            "mine",
+            "# Claude edit",
+        );
+        write_skill(
+            &fx.repo.join(".cursor/skills/mine"),
+            "mine",
+            "# Cursor edit",
+        );
 
         for force in [false, true] {
-            let err = import_project_skill_to_center_internal(&fx.store, fx.project_id.clone(), "mine".into(), "claude_code".into(), force).unwrap_err();
+            let err = import_project_skill_to_center_internal(
+                &fx.store,
+                fx.project_id.clone(),
+                "mine".into(),
+                "claude_code".into(),
+                force,
+            )
+            .unwrap_err();
             assert_eq!(conflict_paths(&err).len(), 2, "force={force}");
         }
         assert!(plan_project_import(&fx.store, &fx.project_id, "mine", "cursor").is_err());

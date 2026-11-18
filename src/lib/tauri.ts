@@ -830,14 +830,20 @@ export const getProjectSkillDocument = (projectId: string, skillRelativePath: st
 export const importProjectSkillToCenter = (projectId: string, skillRelativePath: string, agent: string) =>
   invoke<void>("import_project_skill_to_center", { projectId, skillRelativePath, agent });
 
-export const exportSkillToProject = (skillId: string, projectId: string, agents?: string[]) =>
-  invoke<void>("export_skill_to_project", { skillId, projectId, agents: agents ?? null });
+export const exportSkillToProject = (
+  skillId: string, projectId: string, agents?: string[], commitOid?: string
+) => invoke<void>("export_skill_to_project", {
+  skillId, projectId, agents: agents ?? null, commitOid: commitOid ?? null,
+});
 
 export const updateProjectSkillToCenter = (projectId: string, skillRelativePath: string, agent: string) =>
   invoke<void>("update_project_skill_to_center", { projectId, skillRelativePath, agent });
 
-export const updateProjectSkillFromCenter = (projectId: string, skillRelativePath: string, agent: string) =>
-  invoke<void>("update_project_skill_from_center", { projectId, skillRelativePath, agent });
+export const updateProjectSkillFromCenter = (
+  projectId: string, skillRelativePath: string, agent: string, commitOid?: string
+) => invoke<void>("update_project_skill_from_center", {
+  projectId, skillRelativePath, agent, commitOid: commitOid ?? null,
+});
 
 export const toggleProjectSkill = (projectId: string, skillRelativePath: string, agent: string, enabled: boolean) =>
   invoke<void>("toggle_project_skill", { projectId, skillRelativePath, agent, enabled });

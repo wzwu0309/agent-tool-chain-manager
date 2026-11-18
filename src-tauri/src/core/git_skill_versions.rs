@@ -40,12 +40,7 @@ pub fn resolve_skill_version(
         bail!("invalid SkillId");
     }
 
-    let repo = Repository::open(skills_dir).with_context(|| {
-        format!(
-            "central Skill store at {} is not an initialized Git repository",
-            skills_dir.display()
-        )
-    })?;
+    let repo = open_exact_store(skills_dir)?;
     let head = repo
         .head()
         .context("central Skill Git repository has no HEAD")?
@@ -102,6 +97,22 @@ pub fn resolve_skill_version(
     })
 }
 
+fn open_exact_store(skills_dir: &Path) -> Result<Repository> {
+    let repo = Repository::open(skills_dir).with_context(|| {
+        format!(
+            "central Skill store at {} is not an initialized Git repository",
+            skills_dir.display()
+        )
+    })?;
+    let workdir = repo
+        .workdir()
+        .context("central Skill Git repository is bare")?;
+    if std::fs::canonicalize(workdir)? != std::fs::canonicalize(skills_dir)? {
+        bail!("Central Skill store does not have its own Git repository");
+    }
+    Ok(repo)
+}
+
 fn valid_name_component(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -119,6 +130,190 @@ fn valid_relative_skill_path(raw: &str) -> bool {
         && !path
             .components()
             .any(|component| component.as_os_str() == ".git")
+}
+
+/// Write the exact committed Skill subtree to a **new** destination. Neither
+/// uncommitted source files nor ignored working-tree files are ever read.
+/// Callers should materialize inside a same-parent staging directory and only
+/// publish after verifying the result.
+pub fn materialize_skill_version(
+    skills_dir: &Path,
+    version: &GitSkillVersion,
+    destination: &Path,
+) -> Result<()> {
+    let repo = open_exact_store(skills_dir)?;
+    let tree = repo.find_tree(Oid::from_str(&version.tree_oid)?)?;
+    if std::fs::symlink_metadata(destination).is_ok() {
+        bail!(
+            "Skill deployment target already exists: {}",
+            destination.display()
+        );
+    }
+    std::fs::create_dir(destination)?;
+    materialize_tree(&repo, &tree, destination, Path::new(""))?;
+    validate_symlink_resolution(destination)?;
+    if !matches_skill_tree(skills_dir, &version.tree_oid, destination)? {
+        bail!("materialized Skill differs from selected Git Tree");
+    }
+    Ok(())
+}
+
+/// Compare the entire on-disk directory to the committed Git tree, without
+/// following symlinks. Unlike the legacy content hash this includes hidden
+/// files, executable bits, symlink targets, and unexpected empty directories.
+pub fn matches_skill_tree(skills_dir: &Path, tree_oid: &str, target: &Path) -> Result<bool> {
+    let repo = open_exact_store(skills_dir)?;
+    let tree = repo.find_tree(Oid::from_str(tree_oid)?)?;
+    if !match_tree(&repo, &tree, target)? {
+        return Ok(false);
+    }
+    Ok(validate_symlink_resolution(target).is_ok())
+}
+
+fn materialize_tree(
+    repo: &Repository,
+    tree: &git2::Tree<'_>,
+    target: &Path,
+    relative: &Path,
+) -> Result<()> {
+    for entry in tree {
+        let name = entry
+            .name()
+            .context("non-UTF8 Git filename is not supported")?;
+        if name == ".git" || !valid_entry_name(name) {
+            bail!("unsafe Git filename in Skill Tree");
+        }
+        let child = target.join(name);
+        match entry.filemode() {
+            0o040000 => {
+                std::fs::create_dir(&child)?;
+                let subtree = repo.find_tree(entry.id())?;
+                materialize_tree(repo, &subtree, &child, &relative.join(name))?;
+            }
+            0o100644 | 0o100755 => {
+                let blob = repo.find_blob(entry.id())?;
+                std::fs::write(&child, blob.content())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if entry.filemode() == 0o100755 {
+                        0o755
+                    } else {
+                        0o644
+                    };
+                    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+            0o120000 => {
+                let blob = repo.find_blob(entry.id())?;
+                let link =
+                    std::str::from_utf8(blob.content()).context("symlink target is not UTF-8")?;
+                if !safe_symlink_target(relative, link) {
+                    bail!("Skill Tree contains an escaping or absolute symlink: {name}");
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(link, &child)?;
+                #[cfg(not(unix))]
+                bail!("Git Skill symlinks cannot be deployed on this platform");
+            }
+            _ => bail!("unsupported Git Tree entry mode {:o}", entry.filemode()),
+        }
+    }
+    Ok(())
+}
+
+fn match_tree(repo: &Repository, tree: &git2::Tree<'_>, root: &Path) -> Result<bool> {
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let actual = std::fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
+    if actual.len() != tree.len() {
+        return Ok(false);
+    }
+    for entry in tree {
+        let name = entry
+            .name()
+            .context("non-UTF8 Git filename is not supported")?;
+        if name == ".git" || !valid_entry_name(name) {
+            bail!("unsafe Git filename in Skill Tree");
+        }
+        let path = root.join(name);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        let same = match entry.filemode() {
+            0o040000 => match_tree(repo, &repo.find_tree(entry.id())?, &path)?,
+            0o100644 | 0o100755 if meta.is_file() && !meta.file_type().is_symlink() => {
+                #[cfg(unix)]
+                let executable_matches = {
+                    use std::os::unix::fs::PermissionsExt;
+                    (meta.permissions().mode() & 0o111 != 0) == (entry.filemode() == 0o100755)
+                };
+                #[cfg(not(unix))]
+                let executable_matches = true;
+                executable_matches
+                    && Oid::hash_object(ObjectType::Blob, &std::fs::read(&path)?)? == entry.id()
+            }
+            0o120000 if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&path)?;
+                Oid::hash_object(ObjectType::Blob, link.to_string_lossy().as_bytes())? == entry.id()
+            }
+            _ => false,
+        };
+        if !same {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Lexical containment is not enough: a relative symlink may point through
+/// another symlink that ultimately escapes the Skill root. Validate the full
+/// chain after materialization, and reject dangling links or loops.
+fn validate_symlink_resolution(root: &Path) -> Result<()> {
+    let canonical_root = std::fs::canonicalize(root)?;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            let resolved = std::fs::canonicalize(entry.path()).with_context(|| {
+                format!("unresolvable Skill symlink {}", entry.path().display())
+            })?;
+            if !resolved.starts_with(&canonical_root) {
+                bail!("Skill symlink escapes the deployment root");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+}
+
+/// Every symlink stays inside this Skill root even after the deployment folder
+/// is moved. Do not allow external project files to be read through a link.
+fn safe_symlink_target(parent: &Path, link: &str) -> bool {
+    let path = Path::new(link);
+    if link.is_empty() || path.is_absolute() {
+        return false;
+    }
+    let mut depth = parent.components().count();
+    for part in path.components() {
+        match part {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -239,6 +434,77 @@ mod tests {
         assert!(resolve_skill_version(fx.dir.path(), "not-managed", None).is_err());
         let plain = tempfile::tempdir().unwrap();
         assert!(resolve_skill_version(plain.path(), "demo-skill", None).is_err());
+    }
+
+    #[test]
+    fn materialize_is_exact_and_detects_every_unexpected_file() {
+        let fx = Fixture::new();
+        fx.write_skill("toolkit/demo", "committed text");
+        fs::write(fx.dir.path().join("toolkit/demo/.hidden"), "hidden").unwrap();
+        fs::create_dir(fx.dir.path().join("toolkit/demo/refs")).unwrap();
+        fs::write(fx.dir.path().join("toolkit/demo/refs/guide.md"), "guide").unwrap();
+        let commit = fx.commit("snapshot");
+        let version =
+            resolve_skill_version(fx.dir.path(), "demo-skill", Some(&commit.to_string())).unwrap();
+
+        fs::write(fx.dir.path().join("toolkit/demo/SKILL.md"), "uncommitted").unwrap();
+        let dest_root = tempfile::tempdir().unwrap();
+        let dest = dest_root.path().join("deployed");
+        materialize_skill_version(fx.dir.path(), &version, &dest).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "committed text"
+        );
+        assert!(matches_skill_tree(fx.dir.path(), &version.tree_oid, &dest).unwrap());
+        fs::create_dir(dest.join("unexpected-empty")).unwrap();
+        assert!(!matches_skill_tree(fx.dir.path(), &version.tree_oid, &dest).unwrap());
+        fs::remove_dir(dest.join("unexpected-empty")).unwrap();
+        fs::write(dest.join(".hidden"), "edited").unwrap();
+        assert!(!matches_skill_tree(fx.dir.path(), &version.tree_oid, &dest).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_symlinks_work_and_escaping_symlinks_are_rejected() {
+        let fx = Fixture::new();
+        fx.write_skill("toolkit/demo", "base");
+        let refs = fx.dir.path().join("toolkit/demo/refs");
+        fs::create_dir_all(&refs).unwrap();
+        std::os::unix::fs::symlink("../SKILL.md", refs.join("local-link")).unwrap();
+        let safe = fx.commit("safe link");
+        let version =
+            resolve_skill_version(fx.dir.path(), "demo-skill", Some(&safe.to_string())).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        materialize_skill_version(fx.dir.path(), &version, &dst.path().join("safe")).unwrap();
+        assert!(
+            matches_skill_tree(fx.dir.path(), &version.tree_oid, &dst.path().join("safe"),)
+                .unwrap()
+        );
+
+        std::os::unix::fs::symlink("/tmp", fx.dir.path().join("toolkit/demo/escape")).unwrap();
+        let bad = fx.commit("escaping link");
+        let bad_version =
+            resolve_skill_version(fx.dir.path(), "demo-skill", Some(&bad.to_string())).unwrap();
+        assert!(
+            materialize_skill_version(fx.dir.path(), &bad_version, &dst.path().join("reject"),)
+                .is_err()
+        );
+
+        // Neither link is absolute, but following the second through the
+        // first leaves the Skill root. A lexical-only check misses this.
+        fs::remove_file(fx.dir.path().join("toolkit/demo/escape")).unwrap();
+        std::os::unix::fs::symlink("..", fx.dir.path().join("toolkit/demo/refs/out")).unwrap();
+        std::os::unix::fs::symlink("refs/out/..", fx.dir.path().join("toolkit/demo/chain"))
+            .unwrap();
+        let chained = fx.commit("chained escape");
+        let chained_version =
+            resolve_skill_version(fx.dir.path(), "demo-skill", Some(&chained.to_string())).unwrap();
+        assert!(materialize_skill_version(
+            fx.dir.path(),
+            &chained_version,
+            &dst.path().join("chained"),
+        )
+        .is_err());
     }
 
     #[test]

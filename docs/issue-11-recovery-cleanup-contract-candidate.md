@@ -235,3 +235,37 @@ and separate fault-injection tests.
 **Implementation status:** V2 is a design baseline for independent review,
 not authorization to ship archival or deletion. Existing read-only recovery
 views continue to work, and permanent recovery deletion remains prohibited.
+
+## 8. Implementation note after Issue #11 legacy-access repair
+
+This section reports implementation progress; it does **not** change the V2
+recovery *archival* authorization policy above.
+
+- **Pre-v13 Copy identity reauthorization:** a separate, explicit read-only
+  preview and one-shot confirmation are available for a previously
+  manager-deployed Copy whose \`copy_identity\` is \`NULL\`. Confirmation binds
+  only the exact observed directory identity to the existing DeploymentId
+  and pinned Git Commit/Tree/path baseline after Core revalidation under
+  RepoLock. SQLite consumes the consent through a guarded
+  \`copy_identity IS NULL\` compare-and-swap. It writes no Skill files,
+  never accepts an unowned external Copy, rejects changed contents and
+  same-content replacements after preview, and does not permit rebinding
+  an already known (non-NULL) identity. CLI requires a preview followed by
+  the exact \`--confirm-identity\`; GUI requires a separate checked consent.
+  This remains a snapshot-based guard, **not** macOS handle-bound immunity
+  from malicious external inode reuse or path swaps.
+- **Historically unregistered project recovery:** a separate read-only
+  SQLite LEFT JOIN index exposes still-pending operation logs whose
+  ProjectId is no longer present (e.g., logs orphaned by older releases).
+  The CLI and dashboard can show their paths and phases without following
+  recovery-directory symlinks, adopting an object, transitioning its phase,
+  or deleting anything. This does **not** relax the current rule prohibiting
+  project unregistration while non-complete recovery records exist, and
+  does not yet implement an explicit, durable project detach/archive
+  lifecycle with independent recovery authorization.
+- **No new recovery disposal implementation:** no V2 archival transaction,
+  user-supplied archive destination, permanent delete, automatic
+  expiration or Git-pin release was enabled by these changes. The
+  independent macOS handle-relative file APIs, source-copy consistency
+  under active writers, and power-loss durability barriers remain
+  separate implementation admission gates.

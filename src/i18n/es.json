@@ -69,6 +69,15 @@
     }
   },
   "dashboard": {
+    "orphanedRecovery": {
+      "title": "Registros de recuperación de proyectos no registrados",
+      "readOnly": "Las versiones anteriores podían desregistrar proyectos y conservar sus datos de recuperación. Este índice es de solo lectura; no adopta, restaura ni elimina archivos.",
+      "error": "No se pudo leer el historial de recuperación.",
+      "target": "Destino original",
+      "recovery": "Ubicación conservada",
+      "present": "Existe el directorio de recuperación (no autoriza eliminarlo)",
+      "missing": "Falta el directorio o no es un directorio normal"
+    },
     "greeting": "¡Hola!",
     "summary": "{{skills}} skills en la Biblioteca · {{agents}} agentes conectados · {{projects}} proyectos",
     "librarySkills": "Skills de la Biblioteca",
@@ -905,6 +914,16 @@
     }
   },
   "project": {
+    "legacyCopyReauth": {
+      "resolvedPath": "Ruta resuelta del sistema de archivos",
+      "title": "Reautorizar una copia administrada anterior",
+      "explanation": "Esta copia anterior a v13 no tiene una identidad de directorio registrada. El mismo contenido Git no demuestra que sea el directorio original. Comprueba la ruta exacta antes de autorizar; no se modificarán archivos.",
+      "identity": "Identidad del directorio observado",
+      "consent": "He revisado este directorio específico y autorizo expresamente vincularlo al DeploymentId y a la versión Git registrada. Comprendo que el contenido idéntico no demuestra la propiedad.",
+      "confirm": "Reautorizar este directorio",
+      "success": "Identidad de copia antigua reautorizada. No se modificaron archivos.",
+      "unavailable": "No se puede reautorizar esta copia antigua"
+    },
     "gitUpdate": {
       "title": "Actualizar versión del Copy administrado",
       "scope": "Actualiza un solo Copy administrado por agente. No se sobrescribirán archivos externos o con ediciones locales.",

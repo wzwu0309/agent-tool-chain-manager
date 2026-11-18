@@ -69,6 +69,15 @@
     }
   },
   "dashboard": {
+    "orphanedRecovery": {
+      "title": "Recovery records from unregistered projects",
+      "readOnly": "Old versions could unregister projects while their recovery files remained. This is a read-only index; no file is adopted, restored or deleted.",
+      "error": "Could not read the legacy recovery journal.",
+      "target": "Original target",
+      "recovery": "Retained recovery path",
+      "present": "Recovery directory exists (not a deletion authorization)",
+      "missing": "Recovery directory is missing or not an ordinary directory"
+    },
     "greeting": "Hello!",
     "summary": "{{skills}} Skills in Library · {{agents}} Agents connected · {{projects}} Projects",
     "librarySkills": "Library Skills",
@@ -925,6 +934,16 @@
     }
   },
   "project": {
+    "legacyCopyReauth": {
+      "resolvedPath": "Resolved filesystem path",
+      "title": "Reauthorize an older managed Copy",
+      "explanation": "This pre-v13 Copy has no recorded directory identity. Matching Git content does not prove the directory is the original one. Confirm the exact directory below before restoring management; no files will be changed.",
+      "identity": "Observed directory identity",
+      "consent": "I have inspected this exact project directory and explicitly authorize the manager to bind it to the recorded DeploymentId and Git baseline. I understand that identical content alone does not establish ownership.",
+      "confirm": "Reauthorize this directory",
+      "success": "Legacy Copy directory identity reauthorized. No files were changed.",
+      "unavailable": "Legacy reauthorization cannot proceed"
+    },
     "gitUpdate": {
       "title": "Update managed Copy version",
       "scope": "Update one Agent's managed Copy. External files and locally modified copies are never overwritten.",

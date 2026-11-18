@@ -69,6 +69,15 @@
     }
   },
   "dashboard": {
+    "orphanedRecovery": {
+      "title": "已注销项目的恢复记录",
+      "readOnly": "旧版管理器可能注销项目后仍保留恢复数据。此处仅供查看，不会认领、恢复或删除任何文件。",
+      "error": "无法读取旧版恢复日志。",
+      "target": "原目标路径",
+      "recovery": "保留的恢复目录",
+      "present": "恢复目录存在（不代表可以删除）",
+      "missing": "恢复目录不存在或不是普通目录"
+    },
     "greeting": "你好！",
     "summary": "Library 中 {{skills}} 个 Skills · 已接入 {{agents}} 个 Agent · {{projects}} 个 Project",
     "librarySkills": "Library Skills",
@@ -925,6 +934,16 @@
     }
   },
   "project": {
+    "legacyCopyReauth": {
+      "resolvedPath": "实际解析路径",
+      "title": "重新授权旧版受管 Copy",
+      "explanation": "此 v13 之前的 Copy 缺少目录身份记录。Git 内容相同不能证明它仍是原目录。请检查下方准确路径并明确确认；此操作不会修改文件内容。",
+      "identity": "当前观察到的目录身份",
+      "consent": "我已检查该项目中的具体目录，并明确授权管理器将它绑定到原 DeploymentId 和 Git 基线。我理解仅凭内容相同不能证明目录管理权。",
+      "confirm": "明确授权此目录",
+      "success": "旧版 Copy 目录身份已重新授权，未修改文件内容。",
+      "unavailable": "当前无法重新授权旧版 Copy"
+    },
     "gitUpdate": {
       "title": "更新受管 Copy 版本",
       "scope": "仅更新一个 Agent 的受管 Copy；不会覆盖外部目录或本地修改。",

@@ -911,6 +911,48 @@ pub fn get_project_skill_recoveries_internal(
     Ok(rows)
 }
 
+/// Historical recovery journal rows whose ProjectId is no longer registered.
+/// This independent index exists because old versions allowed unregistering
+/// projects before their retained recovery was resolved. It is deliberately
+/// read-only and never treats path existence as management authority.
+pub fn get_unregistered_project_recoveries_internal(
+    store: &SkillStore,
+) -> Result<Vec<ProjectSkillRecoveryDto>, AppError> {
+    let rows = store
+        .unregistered_project_skill_operations()
+        .map_err(AppError::db)?;
+    Ok(rows
+        .into_iter()
+        .map(|op| ProjectSkillRecoveryDto {
+            operation_id: op.id,
+            project_id: op.project_id,
+            skill_id: op.skill_id,
+            deployment_id: op.deployment_id,
+            kind: op.kind,
+            phase: op.phase,
+            target_exists: std::fs::symlink_metadata(&op.target_path).is_ok(),
+            recovery_root_exists: std::fs::symlink_metadata(&op.recovery_root)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()),
+            target_path: op.target_path,
+            recovery_root: op.recovery_root,
+            destination_path: op.destination_path,
+            created_at: op.created_at,
+            updated_at: op.updated_at,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_unregistered_project_skill_recoveries(
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<Vec<ProjectSkillRecoveryDto>, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        get_unregistered_project_recoveries_internal(&store)
+    })
+    .await?
+}
+
 #[tauri::command]
 pub async fn get_project_skill_recoveries(
     store: State<'_, Arc<SkillStore>>,
@@ -1873,6 +1915,245 @@ pub fn plan_managed_project_copy_update(
         target_tree_oid: target.tree_oid,
         uncommitted_central_changes_excluded: dirty,
     })
+}
+
+/// Explicit one-shot consent to bind a *pre-v13* manager-deployed Copy to
+/// the currently observed filesystem directory. This never changes the
+/// directory or infers ownership from a matching Git Tree: the existing
+/// deployment row, immutable Git base and user confirmation are mandatory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyCopyReauthorizationPreview {
+    pub project_id: String,
+    pub skill_relative_path: String,
+    pub agent: String,
+    pub skill_id: String,
+    pub deployment_id: String,
+    pub target_path: String,
+    /// Show where this path resolves, so symlinked project roots cannot
+    /// conceal the actual object a user is explicitly reauthorizing.
+    pub resolved_target_path: String,
+    pub observed_copy_identity: String,
+    pub base_commit_oid: String,
+    pub base_tree_oid: String,
+    pub path_at_commit: String,
+}
+
+/// This preview is intentionally read-only and requires a v12 legacy NULL
+/// identity. An already-known (even content-identical) replacement cannot
+/// use this pathway to overwrite the stored original identity.
+pub fn preview_legacy_copy_reauthorization(
+    store: &SkillStore,
+    project_id: &str,
+    skill_relative_path: &str,
+    agent: &str,
+) -> Result<LegacyCopyReauthorizationPreview, AppError> {
+    ensure_safe_skill_relative_path(skill_relative_path)?;
+    let project = get_project_record(store, project_id)?;
+    ensure_workspace_path_exists(&project)?;
+    let (enabled_root, disabled_root) = resolve_agent_skills_roots(store, &project, agent)
+        .ok_or_else(|| AppError::not_found(format!("Unknown project agent: {agent}")))?;
+    let enabled = enabled_root.join(skill_relative_path);
+    let disabled = disabled_root
+        .as_ref()
+        .map(|root| root.join(skill_relative_path));
+    let enabled_exists = std::fs::symlink_metadata(&enabled).is_ok();
+    let disabled_exists = disabled
+        .as_ref()
+        .is_some_and(|path| std::fs::symlink_metadata(path).is_ok());
+    if enabled_exists && disabled_exists {
+        return Err(AppError::invalid_input(
+            "Both enabled and disabled Copy paths exist; reauthorization is ambiguous",
+        ));
+    }
+    let (target, root) = if enabled_exists {
+        (enabled, enabled_root)
+    } else if disabled_exists {
+        (
+            disabled.expect("verified disabled Copy exists"),
+            disabled_root.expect("verified disabled root exists"),
+        )
+    } else {
+        return Err(AppError::not_found("Legacy Copy target no longer exists"));
+    };
+    ensure_dir_within_root(&target, &root)?;
+    // A symlinked parent can redirect a lexical project path outside its
+    // configured Agent root. Refuse this during explicit consent.
+    let canonical_target = std::fs::canonicalize(&target).map_err(AppError::io)?;
+    let canonical_root = std::fs::canonicalize(&root).map_err(AppError::io)?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(AppError::invalid_input(
+            "Legacy Copy path resolves outside the configured Agent root",
+        ));
+    }
+    let target_str = target.to_string_lossy().to_string();
+    let row = store
+        .get_project_skill_deployment(project_id, &target_str)
+        .map_err(AppError::db)?
+        .ok_or_else(|| {
+            AppError::invalid_input(
+            "No existing manager-deployed Copy record; external Copy adoption is not authorized",
+        )
+        })?;
+    if row.mode != "copy"
+        || row.management_state != "managed"
+        || row.management_origin != "deployed_by_manager"
+    {
+        return Err(AppError::invalid_input(
+            "Only a previously manager-deployed Copy can be reauthorized",
+        ));
+    }
+    if row.copy_identity.is_some() {
+        return Err(AppError::invalid_input(
+            "Copy identity is already recorded; a replaced known object cannot be reauthorized here",
+        ));
+    }
+    let observed = project_copy_directory_identity(&target).ok_or_else(|| {
+        AppError::invalid_input("Legacy Copy must be an existing ordinary directory, not a Symlink")
+    })?;
+    if store
+        .pending_project_skill_operations()
+        .map_err(AppError::db)?
+        .iter()
+        .any(|op| {
+            op.project_id == project_id
+                && op.target_path == target_str
+                && matches!(
+                    op.phase.as_str(),
+                    "preparing" | "publishing" | "needs_attention" | "recovery_available"
+                )
+        })
+    {
+        return Err(AppError::invalid_input(
+            "Legacy Copy has unresolved operations; reauthorization is blocked",
+        ));
+    }
+    let commit = row.base_commit_oid.ok_or_else(|| {
+        AppError::invalid_input("Legacy Copy has no recorded Git Commit baseline")
+    })?;
+    let tree = row
+        .base_tree_oid
+        .ok_or_else(|| AppError::invalid_input("Legacy Copy has no recorded Git Tree baseline"))?;
+    let history_path = row.path_at_commit.ok_or_else(|| {
+        AppError::invalid_input("Legacy Copy has no recorded historical Skill path")
+    })?;
+    let central = central_repo::skills_dir();
+    git_skill_versions::verify_recorded_skill_base(
+        &central,
+        &row.id,
+        &row.skill_id,
+        &commit,
+        &tree,
+        &history_path,
+    )
+    .map_err(AppError::io)?;
+    if !git_skill_versions::matches_skill_tree(&central, &tree, &target).map_err(AppError::io)? {
+        return Err(AppError::invalid_input(
+            "Legacy Copy contains local modifications; consent cannot silently overwrite its baseline",
+        ));
+    }
+    // A source can be changed by a non-cooperating writer during a recursive
+    // content scan; re-read the single directory identity before returning.
+    if project_copy_directory_identity(&target).as_deref() != Some(observed.as_str()) {
+        return Err(AppError::invalid_input(
+            "Legacy Copy directory changed during inspection; retry from a fresh preview",
+        ));
+    }
+    Ok(LegacyCopyReauthorizationPreview {
+        project_id: project_id.to_owned(),
+        skill_relative_path: skill_relative_path.to_owned(),
+        agent: agent.to_owned(),
+        skill_id: row.skill_id,
+        deployment_id: row.id,
+        target_path: target_str,
+        resolved_target_path: canonical_target.to_string_lossy().to_string(),
+        observed_copy_identity: observed,
+        base_commit_oid: commit,
+        base_tree_oid: tree,
+        path_at_commit: history_path,
+    })
+}
+
+/// Explicit confirmation must bind to the *same* inspected directory and
+/// historical Git baseline. No filesystem mutation is involved. The atomic
+/// NULL→identity database CAS consumes consent once; a stale or replayed
+/// preview never receives or extends ownership.
+pub fn apply_legacy_copy_reauthorization(
+    store: &SkillStore,
+    preview: &LegacyCopyReauthorizationPreview,
+) -> Result<(), AppError> {
+    let _lock =
+        RepoLock::acquire_foreground("legacy Copy reauthorization").map_err(AppError::io)?;
+    let current = preview_legacy_copy_reauthorization(
+        store,
+        &preview.project_id,
+        &preview.skill_relative_path,
+        &preview.agent,
+    )?;
+    if current.deployment_id != preview.deployment_id
+        || current.skill_id != preview.skill_id
+        || current.target_path != preview.target_path
+        || current.resolved_target_path != preview.resolved_target_path
+        || current.observed_copy_identity != preview.observed_copy_identity
+        || current.base_commit_oid != preview.base_commit_oid
+        || current.base_tree_oid != preview.base_tree_oid
+        || current.path_at_commit != preview.path_at_commit
+    {
+        return Err(AppError::invalid_input(
+            "Legacy Copy reauthorization preview is stale; inspect and confirm again",
+        ));
+    }
+    store
+        .reauthorize_legacy_project_copy_identity(
+            &current.project_id,
+            &current.deployment_id,
+            &current.target_path,
+            &current.skill_id,
+            &current.agent,
+            &current.base_commit_oid,
+            &current.base_tree_oid,
+            &current.observed_copy_identity,
+        )
+        .map_err(AppError::db)?;
+    // Best-effort user-facing audit. The guarded SQLite identity CAS above,
+    // not this bounded audit log, is the authoritative authorization event.
+    store.log_audit(
+        AuditDraft::new("reauthorize_legacy_copy")
+            .skill(current.skill_id, current.skill_relative_path)
+            .tool(current.agent)
+            .detail(format!(
+                "project {}, deployment {}, directory identity {}",
+                current.project_id, current.deployment_id, current.observed_copy_identity,
+            ))
+            .ok(),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn preview_legacy_project_copy_reauthorization(
+    store: State<'_, Arc<SkillStore>>,
+    project_id: String,
+    skill_relative_path: String,
+    agent: String,
+) -> Result<LegacyCopyReauthorizationPreview, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_legacy_copy_reauthorization(&store, &project_id, &skill_relative_path, &agent)
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn confirm_legacy_project_copy_reauthorization(
+    store: State<'_, Arc<SkillStore>>,
+    preview: LegacyCopyReauthorizationPreview,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_legacy_copy_reauthorization(&store, &preview)
+    })
+    .await?
 }
 
 /// UI applies only the precise version and target that were explicitly
@@ -5026,6 +5307,114 @@ mod project_plan_tests {
     }
 
     #[test]
+    fn historical_orphaned_recovery_remains_discoverable_without_project_registration() {
+        let fx = fixture(&["claude_code"]);
+        let archived_root = fx._tmp.path().join("formerly-registered");
+        fs::create_dir_all(&archived_root).unwrap();
+        let old_project =
+            add_project_internal(&fx.store, archived_root.to_string_lossy().to_string()).unwrap();
+        let old_target = archived_root.join(".claude/skills/old");
+        let old_id = uuid::Uuid::new_v4().to_string();
+        let old_recovery = archived_root
+            .join(".claude/skills/.atm-recovery")
+            .join(&old_id);
+        fs::create_dir_all(old_recovery.join("previous")).unwrap();
+        fs::write(old_recovery.join("previous/SKILL.md"), "OLD RETAINED DATA").unwrap();
+        let active_id = uuid::Uuid::new_v4().to_string();
+        let active_target = fx.repo.join(".claude/skills/active");
+        let active_root = fx
+            .repo
+            .join(".claude/skills/.atm-recovery")
+            .join(&active_id);
+        let insert = |id: String, project_id: String, target: &Path, root: &Path| {
+            fx.store
+                .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                    id: id.clone(),
+                    project_id,
+                    skill_id: "legacy".to_string(),
+                    deployment_id: None,
+                    kind: "update".to_string(),
+                    phase: "preparing".to_string(),
+                    target_path: target.to_string_lossy().to_string(),
+                    recovery_root: root.to_string_lossy().to_string(),
+                    base_tree_oid: None,
+                    new_tree_oid: None,
+                    created_at: 1,
+                    updated_at: 2,
+                    destination_path: None,
+                    observed_identity: None,
+                })
+                .unwrap();
+            fx.store
+                .transition_project_skill_operation(&id, "preparing", "publishing")
+                .unwrap();
+            fx.store
+                .transition_project_skill_operation(&id, "publishing", "cleanup_pending")
+                .unwrap();
+        };
+        insert(
+            old_id.clone(),
+            old_project.id.clone(),
+            &old_target,
+            &old_recovery,
+        );
+        insert(
+            active_id.clone(),
+            fx.project_id.clone(),
+            &active_target,
+            &active_root,
+        );
+        let bytes_before = fs::read(old_recovery.join("previous/SKILL.md")).unwrap();
+        let sqlite = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        // Simulate a pre-v13 release that directly unregistered a project
+        // despite leaving a durable cleanup_pending operation behind.
+        sqlite
+            .execute("DELETE FROM projects WHERE id=?1", [&old_project.id])
+            .unwrap();
+
+        assert!(fx
+            .store
+            .get_project_by_id(&old_project.id)
+            .unwrap()
+            .is_none());
+        assert!(get_project_skill_recoveries_internal(&fx.store, &old_project.id).is_err());
+        let orphaned = get_unregistered_project_recoveries_internal(&fx.store).unwrap();
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0].operation_id, old_id);
+        assert_eq!(orphaned[0].project_id, old_project.id);
+        assert!(orphaned[0].recovery_root_exists);
+        assert_eq!(orphaned[0].phase, "cleanup_pending");
+        assert!(
+            get_project_skill_recoveries_internal(&fx.store, &fx.project_id,)
+                .unwrap()
+                .iter()
+                .any(|op| op.operation_id == active_id)
+        );
+        assert_eq!(
+            fs::read(old_recovery.join("previous/SKILL.md")).unwrap(),
+            bytes_before,
+            "discovery must not alter retained data",
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == old_id && op.phase == "cleanup_pending"));
+
+        // A symlink to another recovery root is not reported as a safe
+        // recovery directory; inspection never follows it.
+        fs::remove_dir_all(&old_recovery).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&active_root, &old_recovery).unwrap();
+            let link_list = get_unregistered_project_recoveries_internal(&fx.store).unwrap();
+            assert_eq!(link_list.len(), 1);
+            assert!(!link_list[0].recovery_root_exists);
+        }
+    }
+
+    #[test]
     fn recovery_journal_visibility_is_project_scoped_and_does_not_change_files() {
         let fx = fixture(&["claude_code"]);
         let other_path = fx._tmp.path().join("other-project");
@@ -6678,6 +7067,372 @@ mod project_plan_tests {
         );
         assert_eq!(fs::read(&retained).unwrap(), retained_bytes);
         assert!(target.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn legacy_copy_reauthorization_requires_one_shot_confirmation_and_keeps_bytes() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "LEGACY MANAGED");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let original = fs::read(target.join("SKILL.md")).unwrap();
+        let known = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        // A recorded v13 identity can never be overwritten with the new
+        // explicit legacy consent mechanism.
+        assert!(preview_legacy_copy_reauthorization(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("already recorded"));
+
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&known.id],
+        )
+        .unwrap();
+        assert!(plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("identity"));
+        let preview =
+            preview_legacy_copy_reauthorization(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap();
+        assert_eq!(preview.deployment_id, known.id);
+        assert_eq!(preview.skill_id, skill.id);
+        assert_eq!(preview.base_commit_oid, known.base_commit_oid.unwrap());
+        assert_eq!(preview.base_tree_oid, known.base_tree_oid.unwrap());
+        assert_eq!(
+            preview.observed_copy_identity,
+            project_copy_directory_identity(&target).unwrap(),
+        );
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), original);
+
+        // Forged or stale target baseline is not consent.
+        let mut forged = preview.clone();
+        forged.deployment_id = uuid::Uuid::new_v4().to_string();
+        assert!(apply_legacy_copy_reauthorization(&fx.store, &forged)
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
+
+        apply_legacy_copy_reauthorization(&fx.store, &preview).unwrap();
+        let after = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, preview.deployment_id);
+        assert_eq!(
+            after.copy_identity.as_deref(),
+            Some(preview.observed_copy_identity.as_str())
+        );
+        assert_eq!(
+            after.base_tree_oid.as_deref(),
+            Some(preview.base_tree_oid.as_str())
+        );
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), original);
+        assert!(
+            apply_legacy_copy_reauthorization(&fx.store, &preview).is_err(),
+            "NULL-to-identity authorization cannot be replayed"
+        );
+        // The normal safe update preview is now available again.
+        assert!(plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn legacy_copy_reauthorization_refuses_same_tree_swapped_directory() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "ORIGINAL");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let id = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .id;
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        let preview =
+            preview_legacy_copy_reauthorization(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap();
+        let original_parked = fx.repo.join("original-legacy-copy");
+        rename_directory_no_replace(&target, &original_parked).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::copy(original_parked.join("SKILL.md"), target.join("SKILL.md")).unwrap();
+        assert_ne!(
+            project_copy_directory_identity(&target).unwrap(),
+            preview.observed_copy_identity
+        );
+        assert!(
+            git_skill_versions::matches_skill_tree(
+                &central_repo::skills_dir(),
+                &preview.base_tree_oid,
+                &target,
+            )
+            .unwrap(),
+            "test premise: replacement has identical committed content"
+        );
+        let err = apply_legacy_copy_reauthorization(&fx.store, &preview).unwrap_err();
+        assert!(err.to_string().contains("stale"), "{err}");
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
+        assert!(target.join("SKILL.md").is_file());
+        assert!(original_parked.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn legacy_copy_reauthorization_rejects_local_edits_unowned_copy_and_unknown_identity() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "ORIGINAL");
+        commit_library(&fx);
+        let target = fx.repo.join(".claude/skills/demo");
+        write_skill(&target, "demo", "EXTERNAL");
+        let err =
+            preview_legacy_copy_reauthorization(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("No existing manager-deployed"),
+            "{err}"
+        );
+        fs::remove_dir_all(&target).unwrap();
+
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let id = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .id;
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        fs::write(target.join("SKILL.md"), "LOCAL USER EDIT").unwrap();
+        let err =
+            preview_legacy_copy_reauthorization(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap_err();
+        assert!(err.to_string().contains("local modifications"), "{err}");
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("LOCAL USER EDIT"));
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_copy_reauthorization_keeps_original_row_after_sqlite_fault() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "ORIGINAL");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&row.id],
+        )
+        .unwrap();
+        let preview =
+            preview_legacy_copy_reauthorization(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap();
+        let bytes = fs::read(target.join("SKILL.md")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER block_identity_consent BEFORE UPDATE OF copy_identity
+             ON project_skill_deployments
+             BEGIN SELECT RAISE(ABORT,'injected identity authorization DB failure'); END;",
+        )
+        .unwrap();
+        let err = apply_legacy_copy_reauthorization(&fx.store, &preview).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected identity authorization DB failure"),
+            "{err}"
+        );
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), bytes);
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
+        db.execute_batch("DROP TRIGGER block_identity_consent")
+            .unwrap();
+        apply_legacy_copy_reauthorization(&fx.store, &preview).unwrap();
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_copy_reauthorization_refuses_unresolved_operation_and_symlink() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "ORIGINAL");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&row.id],
+        )
+        .unwrap();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: operation_id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id.clone(),
+                deployment_id: Some(row.id.clone()),
+                kind: "update".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: target
+                    .parent()
+                    .unwrap()
+                    .join(".atm-recovery")
+                    .join(&operation_id)
+                    .to_string_lossy()
+                    .to_string(),
+                base_tree_oid: row.base_tree_oid.clone(),
+                new_tree_oid: row.base_tree_oid.clone(),
+                created_at: 1,
+                updated_at: 1,
+                destination_path: None,
+                observed_identity: None,
+            })
+            .unwrap();
+        let err =
+            preview_legacy_copy_reauthorization(&fx.store, &fx.project_id, "demo", "claude_code")
+                .unwrap_err();
+        assert!(err.to_string().contains("unresolved operations"), "{err}");
+        fx.store
+            .transition_project_skill_operation(&operation_id, "preparing", "complete")
+            .unwrap();
+
+        let before = fs::read(target.join("SKILL.md")).unwrap();
+        let parked = fx.repo.join(".claude/skills/parked-demo");
+        rename_directory_no_replace(&target, &parked).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&parked, &target).unwrap();
+            let err = preview_legacy_copy_reauthorization(
+                &fx.store,
+                &fx.project_id,
+                "demo",
+                "claude_code",
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("ordinary directory"), "{err}");
+            assert!(fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(fs::read(parked.join("SKILL.md")).unwrap(), before);
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
     }
 
     #[test]

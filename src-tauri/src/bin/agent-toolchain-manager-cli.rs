@@ -426,6 +426,22 @@ enum ProjectsCommand {
     },
     /// Inspect a project's persistent Copy operation recovery log (read-only).
     Recoveries { project: String },
+    /// Inspect recovery operations left after older releases unregistered a
+    /// project. This is read-only and never adopts or removes any files.
+    OrphanedRecoveries,
+    /// Explicitly reauthorize the observed on-disk identity of a pre-v13
+    /// manager-deployed Copy. Preview first, then supply the exact identity
+    /// shown by preview; matching Git contents alone never auto-adopts.
+    Reauthorize {
+        project: String,
+        relative_path: String,
+        #[arg(long, value_name = "AGENT", required = true)]
+        agent: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long = "confirm-identity", value_name = "DEV:INO")]
+        confirm_identity: Option<String>,
+    },
     /// Remove a library skill's copies from a project. Without --agent, from
     /// every agent directory of the project. Refuses copies that may hold
     /// content not in the library unless --force.
@@ -3380,6 +3396,56 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
                 json,
             );
         }
+        ProjectsCommand::OrphanedRecoveries => {
+            print_json(
+                &serde_json::json!({
+                    "read_only": true,
+                    "recoveries": project_cmd::get_unregistered_project_recoveries_internal(store)
+                        .map_err(map_app_err)?,
+                }),
+                json,
+            );
+        }
+        ProjectsCommand::Reauthorize {
+            project,
+            relative_path,
+            agent,
+            dry_run,
+            confirm_identity,
+        } => {
+            let record = resolve_project(store, &project)?;
+            let preview = project_cmd::preview_legacy_copy_reauthorization(
+                store,
+                &record.id,
+                &relative_path,
+                &agent,
+            )
+            .map_err(map_app_err)?;
+            if !dry_run {
+                let confirmed = confirm_identity.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Explicit reauthorization requires --confirm-identity from an earlier --dry-run preview; no files or ownership changed"
+                    )
+                })?;
+                if confirmed != preview.observed_copy_identity {
+                    anyhow::bail!(
+                        "Legacy Copy identity differs from explicit confirmation; rerun --dry-run and re-inspect the directory"
+                    );
+                }
+                project_cmd::apply_legacy_copy_reauthorization(store, &preview)
+                    .map_err(map_app_err)?;
+            }
+            print_json(
+                &serde_json::json!({
+                    "ok": true,
+                    "dry_run": dry_run,
+                    "reauthorized": !dry_run,
+                    "preview": preview,
+                    "notice": "Explicit identity binding only; no Copy contents were modified",
+                }),
+                json,
+            );
+        }
         ProjectsCommand::Undeploy {
             project,
             skills,
@@ -4878,6 +4944,29 @@ mod project_tests {
         ])
         .is_ok());
         assert!(parse(&["projects", "recoveries", "."]).is_ok());
+        assert!(parse(&["projects", "orphaned-recoveries"]).is_ok());
+        assert!(parse(&[
+            "projects",
+            "reauthorize",
+            ".",
+            "demo",
+            "--agent",
+            "test_agent",
+            "--dry-run"
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "projects",
+            "reauthorize",
+            ".",
+            "demo",
+            "--agent",
+            "test_agent",
+            "--confirm-identity",
+            "1:2"
+        ])
+        .is_ok());
+        assert!(parse(&["projects", "reauthorize", ".", "demo"]).is_err());
         assert!(parse(&["projects", "recoveries"]).is_err());
         assert!(parse(&[
             "projects",

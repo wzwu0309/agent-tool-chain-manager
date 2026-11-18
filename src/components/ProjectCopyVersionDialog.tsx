@@ -4,7 +4,7 @@ import { GitCommitHorizontal, Loader2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import * as api from "../lib/tauri";
-import type { GitSkillHistory, ManagedCopyUpdatePlan, ProjectSkill } from "../lib/tauri";
+import type { GitSkillHistory, ManagedCopyUpdatePlan, LegacyCopyReauthorizationPreview, ProjectSkill } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
 
 interface Props {
@@ -23,6 +23,11 @@ interface LoadedHistory {
 interface LoadedPreview {
   key: string;
   value: ManagedCopyUpdatePlan;
+}
+
+interface LoadedLegacyPreview {
+  key: string;
+  value: LegacyCopyReauthorizationPreview;
 }
 
 const shortOid = (oid: string) => oid.slice(0, 12);
@@ -48,6 +53,10 @@ export function ProjectCopyVersionDialog({
   const [applyError, setApplyError] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const [legacyPreview, setLegacyPreview] = useState<LoadedLegacyPreview | null>(null);
+  const [legacyLoading, setLegacyLoading] = useState(false);
+  const [legacyError, setLegacyError] = useState<string | null>(null);
+  const [legacyConsent, setLegacyConsent] = useState(false);
 
   const variant = variants[variantIndex];
   const skillId = variant?.center_skill_id;
@@ -57,6 +66,8 @@ export function ProjectCopyVersionDialog({
   );
   const activeHistory = history?.skillId === skillId ? history.value : null;
   const activePreview = preview?.key === queryKey ? preview.value : null;
+  const legacyKey = variant ? [projectId, variant.agent, variant.relative_path].join("\u0000") : "";
+  const activeLegacyPreview = legacyPreview?.key === legacyKey ? legacyPreview.value : null;
 
   useEffect(() => {
     if (!skillId) return;
@@ -93,6 +104,25 @@ export function ProjectCopyVersionDialog({
   }, [projectId, variant, skillId, selectedCommit, queryKey, refreshNonce, t]);
 
   useEffect(() => {
+    if (!variant || !skillId) return;
+    let cancelled = false;
+    setLegacyPreview(null);
+    setLegacyConsent(false);
+    setLegacyError(null);
+    setLegacyLoading(true);
+    void api.previewLegacyProjectCopyReauthorization(
+      projectId, variant.relative_path, variant.agent,
+    ).then((value) => {
+      if (!cancelled) setLegacyPreview({ key: legacyKey, value });
+    }).catch((e: unknown) => {
+      if (!cancelled) setLegacyError(getErrorMessage(e, t("common.error")));
+    }).finally(() => {
+      if (!cancelled) setLegacyLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [projectId, variant, skillId, legacyKey, refreshNonce, t]);
+
+  useEffect(() => {
     if (applying) return;
     const keydown = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -119,6 +149,31 @@ export function ProjectCopyVersionDialog({
     // After the Core commit, a UI refresh failure must not be reported as a
     // failed transaction. Commit success and presentation are distinct.
     toast.success(t("project.gitUpdate.success"));
+    onClose();
+    try {
+      await onApplied();
+    } catch (e) {
+      toast.error(getErrorMessage(e, t("common.error")));
+    }
+  };
+
+  const confirmLegacy = async () => {
+    if (!activeLegacyPreview || !legacyConsent || applying || legacyLoading) return;
+    setApplying(true);
+    setApplyError(null);
+    try {
+      await api.confirmLegacyProjectCopyReauthorization(activeLegacyPreview);
+    } catch (e) {
+      setApplyError(getErrorMessage(e, t("common.error")));
+      setLegacyPreview(null);
+      setLegacyConsent(false);
+      setRefreshNonce((value) => value + 1);
+      setApplying(false);
+      return;
+    }
+    // The transaction only binds the consented directory identity; it never
+    // writes, replaces or deletes the project's SKILL.md.
+    toast.success(t("project.legacyCopyReauth.success"));
     onClose();
     try {
       await onApplied();
@@ -155,6 +210,7 @@ export function ProjectCopyVersionDialog({
             setSelectedCommit("");
             setPreview(null);
             setApplyError(null);
+            setLegacyConsent(false);
           }}
         >
           {variants.map((item, index) => (
@@ -203,7 +259,12 @@ export function ProjectCopyVersionDialog({
             {t("project.gitUpdate.checking")}
           </p>
         )}
-        {previewError && <p role="alert" className="my-3 break-words text-[12px] text-amber-600 dark:text-amber-400">{previewError}</p>}
+        {previewError && !activeLegacyPreview && <p role="alert" className="my-3 break-words text-[12px] text-amber-600 dark:text-amber-400">{previewError}</p>}
+        {previewError && legacyError && !legacyLoading && (
+          <p className="my-2 break-words text-[12px] text-muted">
+            {t("project.legacyCopyReauth.unavailable")}: {legacyError}
+          </p>
+        )}
         {applyError && <p role="alert" className="my-3 break-words text-[12px] text-amber-600 dark:text-amber-400">{applyError}</p>}
         {activePreview && (
           <div className="my-3 space-y-1 rounded-lg border border-border-subtle p-3 text-[12px] text-secondary">
@@ -220,6 +281,36 @@ export function ProjectCopyVersionDialog({
               <p className="mt-2 text-muted">{t("project.gitUpdate.retainedBackup")}</p>
             )}
           </div>
+        )}
+        {activeLegacyPreview && (
+          <section className="my-3 rounded-lg border border-border p-3 text-[12px] text-secondary">
+            <p className="font-medium">{t("project.legacyCopyReauth.title")}</p>
+            <p className="mt-1 text-muted">{t("project.legacyCopyReauth.explanation")}</p>
+            <p className="mt-2 break-all">{t("project.gitUpdate.path")}: {activeLegacyPreview.targetPath}</p>
+            <p className="break-all">{t("project.legacyCopyReauth.resolvedPath")}: {activeLegacyPreview.resolvedTargetPath}</p>
+            <p className="break-all">DeploymentId: {activeLegacyPreview.deploymentId}</p>
+            <p className="break-all">Git Commit: {activeLegacyPreview.baseCommitOid}</p>
+            <p className="break-all">Git Tree: {activeLegacyPreview.baseTreeOid}</p>
+            <p className="break-all">{t("project.legacyCopyReauth.identity")}: {activeLegacyPreview.observedCopyIdentity}</p>
+            <label className="mt-3 flex cursor-pointer items-start gap-2">
+              <input
+                type="checkbox"
+                checked={legacyConsent}
+                disabled={applying}
+                onChange={(e) => setLegacyConsent(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>{t("project.legacyCopyReauth.consent")}</span>
+            </label>
+            <button
+              type="button"
+              disabled={!legacyConsent || applying || legacyLoading}
+              onClick={() => void confirmLegacy()}
+              className="mt-3 rounded-lg bg-accent px-3 py-1.5 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {t("project.legacyCopyReauth.confirm")}
+            </button>
+          </section>
         )}
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" onClick={onClose} disabled={applying} className="rounded-lg px-3 py-1.5 text-[13px] text-secondary hover:bg-surface-hover disabled:opacity-50">

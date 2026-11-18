@@ -1,14 +1,42 @@
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Layers, CheckCircle2, Bot, Plus, Download, AlertTriangle } from "lucide-react";
+import { Layers, CheckCircle2, Bot, Plus, Download, AlertTriangle, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useApp } from "../context/AppContext";
 import { AgentControlSetupCard } from "../components/AgentControlSetupCard";
+import * as api from "../lib/tauri";
+import type { ProjectSkillRecovery } from "../lib/tauri";
 
 export function Dashboard() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { tools, projects, managedSkills, openSkillDetailById } = useApp();
+
+  const [orphanedRecoveries, setOrphanedRecoveries] = useState<ProjectSkillRecovery[]>([]);
+  const [orphanError, setOrphanError] = useState(false);
+  const [orphanLoading, setOrphanLoading] = useState(false);
+  const orphanRequestRef = useRef(0);
+  const loadOrphans = useCallback(async () => {
+    const request = ++orphanRequestRef.current;
+    setOrphanLoading(true);
+    try {
+      const records = await api.getUnregisteredProjectSkillRecoveries();
+      if (request === orphanRequestRef.current) {
+        setOrphanedRecoveries(records);
+        setOrphanError(false);
+      }
+    } catch (error) {
+      console.error("Failed to load unregistered project recovery log:", error);
+      if (request === orphanRequestRef.current) setOrphanError(true);
+    } finally {
+      if (request === orphanRequestRef.current) setOrphanLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadOrphans();
+    return () => { orphanRequestRef.current++; };
+  }, [loadOrphans]);
 
   const enabledAgents = useMemo(
     () => tools.filter((tool) => tool.installed && tool.enabled),
@@ -95,6 +123,46 @@ export function Dashboard() {
           );
         })}
       </div>
+
+      {(orphanedRecoveries.length > 0 || orphanError) && (
+        <section className="app-panel border border-border p-4" aria-label={t("dashboard.orphanedRecovery.title")}>
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-[13px] font-semibold text-secondary">
+              <AlertTriangle className="mr-1.5 inline-block h-4 w-4 text-amber-600 dark:text-amber-400" />
+              {t("dashboard.orphanedRecovery.title")} ({orphanedRecoveries.length})
+            </h2>
+            <button
+              type="button"
+              onClick={() => void loadOrphans()}
+              disabled={orphanLoading}
+              className="rounded-md p-1.5 text-muted hover:bg-surface-hover disabled:opacity-50"
+              title={t("common.refresh")}
+              aria-label={t("common.refresh")}
+            >
+              <RefreshCw className={"h-4 w-4" + (orphanLoading ? " animate-spin" : "")} />
+            </button>
+          </div>
+          <p className="mt-1 text-[12px] text-muted">{t("dashboard.orphanedRecovery.readOnly")}</p>
+          {orphanError && (
+            <p role="alert" className="mt-2 text-[12px] text-amber-600 dark:text-amber-400">
+              {t("dashboard.orphanedRecovery.error")}
+            </p>
+          )}
+          <div className="mt-3 max-h-52 space-y-2 overflow-y-auto">
+            {orphanedRecoveries.map((record) => (
+              <div key={record.operation_id} className="rounded-md border border-border-subtle p-2 text-[12px]">
+                <p className="font-medium text-secondary">{record.kind} · {record.phase}</p>
+                <p className="mt-1 break-all text-muted">ProjectId: {record.project_id}</p>
+                <p className="mt-1 break-all text-muted">{t("dashboard.orphanedRecovery.target")}: {record.target_path}</p>
+                <p className="mt-1 break-all text-muted">{t("dashboard.orphanedRecovery.recovery")}: {record.recovery_root}</p>
+                <p className="mt-1 text-muted">{record.recovery_root_exists
+                  ? t("dashboard.orphanedRecovery.present")
+                  : t("dashboard.orphanedRecovery.missing")}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Actions */}
       <div className="flex gap-3">

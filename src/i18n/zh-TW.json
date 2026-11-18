@@ -69,6 +69,15 @@
     }
   },
   "dashboard": {
+    "orphanedRecovery": {
+      "title": "已註銷專案的復原記錄",
+      "readOnly": "舊版管理器可能在註銷專案後保留復原資料。此處僅供檢視，不會認領、還原或刪除檔案。",
+      "error": "無法讀取舊版復原日誌。",
+      "target": "原目標路徑",
+      "recovery": "保留的復原目錄",
+      "present": "復原目錄存在（不代表可以刪除）",
+      "missing": "復原目錄不存在或不是一般目錄"
+    },
     "greeting": "你好！",
     "summary": "Library 中 {{skills}} 個 Skills · 已接入 {{agents}} 個 Agent · {{projects}} 個 Project",
     "librarySkills": "Library Skills",
@@ -914,6 +923,16 @@
     }
   },
   "project": {
+    "legacyCopyReauth": {
+      "resolvedPath": "實際解析路徑",
+      "title": "重新授權舊版受管 Copy",
+      "explanation": "此 v13 之前的 Copy 缺少目錄身分紀錄。Git 內容相同無法證明它仍為原目錄。請檢查下方確切路徑並明確確認；此操作不會修改檔案。",
+      "identity": "目前觀察到的目錄身分",
+      "consent": "我已檢查此專案中的特定目錄，並明確授權管理器將其綁定至原 DeploymentId 和 Git 基線。我了解僅憑內容相同無法證明管理權。",
+      "confirm": "明確授權此目錄",
+      "success": "舊版 Copy 目錄身分已重新授權，未修改檔案內容。",
+      "unavailable": "目前無法重新授權舊版 Copy"
+    },
     "gitUpdate": {
       "title": "更新受管 Copy 版本",
       "scope": "僅更新單一 Agent 的受管 Copy；不會覆寫外部目錄或本機修改。",

@@ -1114,6 +1114,7 @@ pub fn run() {
             // Projects
             commands::projects::get_projects,
             commands::projects::get_project_skill_recoveries,
+            commands::projects::get_unregistered_project_skill_recoveries,
             commands::projects::add_project,
             commands::projects::add_linked_workspace,
             commands::projects::remove_project,
@@ -1128,6 +1129,8 @@ pub fn run() {
             commands::projects::get_project_skill_git_history,
             commands::projects::plan_project_skill_copy_update,
             commands::projects::apply_project_skill_copy_update,
+            commands::projects::preview_legacy_project_copy_reauthorization,
+            commands::projects::confirm_legacy_project_copy_reauthorization,
             commands::projects::update_project_skill_to_center,
             commands::projects::update_project_skill_from_center,
             commands::projects::toggle_project_skill,

@@ -1597,6 +1597,44 @@ impl SkillStore {
             .map_err(Into::into)
     }
 
+    /// Read-only legacy orphan inventory. Older releases could unregister a
+    /// project while durable operation logs remained. Do not infer a current
+    /// project root, adopt the files or delete the journal on discovery.
+    pub fn unregistered_project_skill_operations(
+        &self,
+    ) -> Result<Vec<ProjectSkillOperationRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT o.id, o.project_id, o.skill_id, o.deployment_id, o.kind, o.phase,
+                    o.target_path, o.recovery_root, o.base_tree_oid, o.new_tree_oid,
+                    o.created_at, o.updated_at, o.destination_path, o.observed_identity
+             FROM project_skill_operations o
+             LEFT JOIN projects p ON p.id = o.project_id
+             WHERE o.phase != 'complete' AND p.id IS NULL
+             ORDER BY o.updated_at DESC, o.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ProjectSkillOperationRecord {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                skill_id: r.get(2)?,
+                deployment_id: r.get(3)?,
+                kind: r.get(4)?,
+                phase: r.get(5)?,
+                target_path: r.get(6)?,
+                recovery_root: r.get(7)?,
+                base_tree_oid: r.get(8)?,
+                new_tree_oid: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+                destination_path: r.get(12)?,
+                observed_identity: r.get(13)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     // ── Project Skill deployments / immutable Git baselines ──
 
     pub fn insert_project_skill_deployment(
@@ -1714,6 +1752,60 @@ impl SkillStore {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Single-use explicit reauthorization of a v12 managed Copy whose v13
+    /// directory identity is unknown. The NULL-to-value CAS is the consent
+    /// consumption point: never infer ownership from equal Git Tree bytes,
+    /// and never silently rebind an already-known (possibly replaced) Copy.
+    pub fn reauthorize_legacy_project_copy_identity(
+        &self,
+        project_id: &str,
+        deployment_id: &str,
+        target_path: &str,
+        skill_id: &str,
+        agent: &str,
+        base_commit_oid: &str,
+        base_tree_oid: &str,
+        observed_identity: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let count = tx.execute(
+            "UPDATE project_skill_deployments
+             SET copy_identity=?8, updated_at=?9
+             WHERE id=?1 AND project_id=?2 AND target_path=?3
+               AND skill_id=?4 AND agent=?5
+               AND mode='copy' AND management_state='managed'
+               AND management_origin='deployed_by_manager'
+               AND version_match='exact'
+               AND base_commit_oid=?6 AND base_tree_oid=?7
+               AND copy_identity IS NULL
+               AND EXISTS (SELECT 1 FROM projects WHERE id=?2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM project_skill_operations o
+                   WHERE o.project_id=?2 AND o.target_path=?3
+                     AND o.phase IN ('preparing','publishing','needs_attention','recovery_available')
+               )",
+            params![
+                deployment_id,
+                project_id,
+                target_path,
+                skill_id,
+                agent,
+                base_commit_oid,
+                base_tree_oid,
+                observed_identity,
+                chrono::Utc::now().timestamp_millis(),
+            ],
+        )?;
+        if count != 1 {
+            anyhow::bail!(
+                "Legacy Copy authorization is stale, was already consumed or has an unresolved operation"
+            );
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn update_project_skill_deployment_version(

@@ -232,6 +232,27 @@ pub fn verify_deployment_pin(
     Ok(())
 }
 
+/// Validate a previously recorded immutable Copy baseline without requiring
+/// its CommitId to remain in HEAD ancestry. The deployment-specific pin must
+/// already exist; this read-only check never creates or moves refs.
+pub fn verify_recorded_skill_base(
+    skills_dir: &Path,
+    deployment_id: &str,
+    skill_id: &str,
+    commit_oid: &str,
+    tree_oid: &str,
+    path_at_commit: &str,
+) -> Result<()> {
+    verify_deployment_pin(skills_dir, deployment_id, commit_oid)?;
+    let repo = open_exact_store(skills_dir)?;
+    let commit = repo.find_commit(Oid::from_str(commit_oid)?)?;
+    let version = resolve_skill_version_from_commit(&repo, skill_id, &commit)?;
+    if version.tree_oid != tree_oid || version.path_at_commit != path_at_commit {
+        bail!("Stored Copy Git Commit/Tree/path baseline no longer matches the registered SkillId");
+    }
+    Ok(())
+}
+
 /// Backfill versions previously deployed without pins. Never substitute HEAD
 /// for a missing historical commit: report object loss as a recovery error.
 pub fn reconcile_deployment_pins(

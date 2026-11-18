@@ -844,6 +844,10 @@ export interface ProjectSkillRecovery {
 export const getProjectSkillRecoveries = (projectId: string) =>
   invoke<ProjectSkillRecovery[]>("get_project_skill_recoveries", { projectId });
 
+/** Read-only index for journal records orphaned by legacy project removal. */
+export const getUnregisteredProjectSkillRecoveries = () =>
+  invoke<ProjectSkillRecovery[]>("get_unregistered_project_skill_recoveries");
+
 
 
 export const getProjectSkillDocument = (projectId: string, skillRelativePath: string, agent: string) =>
@@ -901,6 +905,32 @@ export const planProjectSkillCopyUpdate = (
 /** Server revalidates all target, DeploymentId, Commit and Tree fields. */
 export const applyProjectSkillCopyUpdate = (preview: ManagedCopyUpdatePlan) =>
   invoke<void>("apply_project_skill_copy_update", { preview });
+
+/** Explicit, read-only preview of a pre-v13 manager-deployed Copy's exact object. */
+export interface LegacyCopyReauthorizationPreview {
+  projectId: string;
+  skillRelativePath: string;
+  agent: string;
+  skillId: string;
+  deploymentId: string;
+  targetPath: string;
+  resolvedTargetPath: string;
+  observedCopyIdentity: string;
+  baseCommitOid: string;
+  baseTreeOid: string;
+  pathAtCommit: string;
+}
+
+export const previewLegacyProjectCopyReauthorization = (
+  projectId: string, skillRelativePath: string, agent: string
+) => invoke<LegacyCopyReauthorizationPreview>("preview_legacy_project_copy_reauthorization", {
+  projectId, skillRelativePath, agent,
+});
+
+/** Confirmation is one-shot; Core re-checks exact directory and Git baseline under RepoLock. */
+export const confirmLegacyProjectCopyReauthorization = (
+  preview: LegacyCopyReauthorizationPreview
+) => invoke<void>("confirm_legacy_project_copy_reauthorization", { preview });
 
 export interface ProjectSkillExportRecovery {
   operation_id: string;

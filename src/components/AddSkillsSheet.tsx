@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { cn } from "../utils";
 import * as api from "../lib/tauri";
-import type { ManagedSkill, ProjectAgentTarget } from "../lib/tauri";
+import type { ManagedSkill, ProjectAgentTarget, ProjectSkillExportTargetResult } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { countHiddenSelected } from "../lib/selectionVisibility";
@@ -82,6 +82,8 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [anchorId, setAnchorId] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
+  const [projectTargetResults, setProjectTargetResults] = useState<ProjectSkillExportTargetResult[]>([]);
+  const [projectPreflightErrors, setProjectPreflightErrors] = useState<{ skill: string; error: string }[]>([]);
 
   const initialAgents = target.kind === "project" ? target.initialSelectedAgents : [];
   const [selectedAgents, setSelectedAgents] = useState<string[]>(initialAgents);
@@ -387,6 +389,10 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
   const handleInstall = async () => {
     if (selectableSelected.length === 0) return;
     setInstalling(true);
+    setProjectTargetResults([]);
+    setProjectPreflightErrors([]);
+    const preflightErrors: { skill: string; error: string }[] = [];
+    const completedProjectTargets: ProjectSkillExportTargetResult[] = [];
     let ok = 0;
     let failed = 0;
     const failures: string[] = [];
@@ -414,17 +420,33 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
             if (!skill) continue;
             const agents = targetsToInstall(skill, projectCtx);
             if (agents.length === 0) continue;
-            await api.exportSkillToProject(id, target.projectId, agents);
-            ok++;
+            const report = await api.exportSkillToProjectWithReport(id, target.projectId, agents);
+            completedProjectTargets.push(...report.targets);
+            if (report.ok) {
+              ok++;
+            } else {
+              failed++;
+              const partial = report.targets.find((result) => result.result === "failed");
+              failures.push(partial?.error || t("common.error"));
+            }
           } catch (e) {
             failed++;
-            failures.push(getErrorMessage(e, t("common.error")));
+            const error = getErrorMessage(e, t("common.error"));
+            failures.push(error);
+            preflightErrors.push({
+              skill: managedSkills.find((skill) => skill.id === id)?.name || id,
+              error,
+            });
           }
         }
       }
+      if (target.kind === "project") {
+        setProjectTargetResults(completedProjectTargets);
+        setProjectPreflightErrors(preflightErrors);
+      }
       if (ok > 0) {
         toast.success(t("addFromLibrary.toastInstalled", { count: ok }));
-        setSelectedIds(new Set());
+        if (failed === 0) setSelectedIds(new Set());
       }
       if (failed > 0) {
         // Surface why. A refusal carries the path it protected and what to do
@@ -662,6 +684,39 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
             </div>
           )}
         </div>
+
+        {target.kind === "project" && (projectTargetResults.length > 0 || projectPreflightErrors.length > 0) && (
+          <section aria-label={t("addFromLibrary.deploymentResults")} className="shrink-0 border-t border-border-subtle px-5 py-2">
+            <p className="mb-1 text-[12px] font-medium text-secondary">
+              {t("addFromLibrary.deploymentResults")}
+            </p>
+            <div className="max-h-[160px] space-y-1 overflow-y-auto text-[12px]">
+              {projectPreflightErrors.map((item, index) => (
+                <div key={item.skill + index} className="rounded border border-border-subtle p-2">
+                  <p className="font-medium text-secondary">{item.skill} · {t("addFromLibrary.deployState.failed")}</p>
+                  <p className="mt-1 break-words text-amber-600 dark:text-amber-400">{item.error}</p>
+                </div>
+              ))}
+              {projectTargetResults.map((item) => (
+                <div key={item.skill_id + ":" + item.agent + ":" + item.path} className="rounded border border-border-subtle p-2">
+                  <p className="font-medium text-secondary">
+                    {managedSkills.find((skill) => skill.id === item.skill_id)?.name || item.skill_id}
+                    {" · "}{item.agent}
+                    {" · "}{t("addFromLibrary.deployState." + item.result)}
+                  </p>
+                  <p className="break-all text-muted">{item.path}</p>
+                  {item.error && <p className="mt-1 break-words text-amber-600 dark:text-amber-400">{item.error}</p>}
+                  {item.recovery.map((op) => (
+                    <p key={op.operation_id} className="mt-1 break-all text-muted">
+                      {t("addFromLibrary.recoverySaved")}: {op.recovery_root} ({op.phase})
+                    </p>
+                  ))}
+                </div>
+              ))}
+            </div>
+            <p className="mt-1 text-[11px] text-muted">{t("addFromLibrary.recoveryReadOnly")}</p>
+          </section>
+        )}
 
         <div className="shrink-0 border-t border-border-subtle bg-bg-secondary px-5 py-3">
           <div className="mb-2 flex items-center justify-between gap-2">

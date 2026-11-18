@@ -858,6 +858,33 @@ export const exportSkillToProject = (
   skillId, projectId, agents: agents ?? null, commitOid: commitOid ?? null,
 });
 
+export interface ProjectSkillExportRecovery {
+  operation_id: string;
+  phase: string;
+  recovery_root: string;
+}
+
+export interface ProjectSkillExportTargetResult {
+  skill_id: string;
+  agent: string;
+  path: string;
+  result: "created" | "failed" | "not_attempted";
+  error: string | null;
+  recovery: ProjectSkillExportRecovery[];
+}
+
+export interface ProjectSkillExportReport {
+  ok: boolean;
+  targets: ProjectSkillExportTargetResult[];
+}
+
+/** Same protected publisher as exportSkillToProject, with per-agent outcomes. */
+export const exportSkillToProjectWithReport = (
+  skillId: string, projectId: string, agents?: string[], commitOid?: string
+) => invoke<ProjectSkillExportReport>("export_skill_to_project_with_report", {
+  skillId, projectId, agents: agents ?? null, commitOid: commitOid ?? null,
+});
+
 export const updateProjectSkillToCenter = (projectId: string, skillRelativePath: string, agent: string) =>
   invoke<void>("update_project_skill_to_center", { projectId, skillRelativePath, agent });
 

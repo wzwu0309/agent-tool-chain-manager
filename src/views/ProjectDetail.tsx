@@ -1748,7 +1748,7 @@ export function ProjectDetail() {
           }}
           managedSkills={managedSkills}
           onInstalled={async () => {
-            await Promise.all([loadSkills(), refreshProjects()]);
+            await Promise.all([loadSkills(), refreshProjects(), loadRecoveries()]);
           }}
         />
       )}

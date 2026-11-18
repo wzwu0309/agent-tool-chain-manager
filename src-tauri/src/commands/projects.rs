@@ -1497,6 +1497,126 @@ pub fn slugify_skill_names(names: Vec<String>) -> Vec<String> {
     names.iter().map(|n| slugify_skill_dir_name(n)).collect()
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProjectSkillExportRecovery {
+    pub operation_id: String,
+    pub phase: String,
+    pub recovery_root: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectSkillExportTargetResult {
+    pub skill_id: String,
+    pub agent: String,
+    pub path: String,
+    pub result: String,
+    pub error: Option<String>,
+    pub recovery: Vec<ProjectSkillExportRecovery>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectSkillExportReport {
+    pub ok: bool,
+    pub targets: Vec<ProjectSkillExportTargetResult>,
+}
+
+/// Same authority and no-clobber publisher as ordinary GUI deployment.
+/// A partially succeeded per-agent request is a report, not a thrown error
+/// whose caller could incorrectly interpret as a full rollback.
+pub fn export_skill_to_project_with_report_internal(
+    store: &SkillStore,
+    skill_id: String,
+    project_id: String,
+    agents: Option<Vec<String>>,
+    commit_oid: Option<&str>,
+) -> Result<ProjectSkillExportReport, AppError> {
+    let plan = plan_gui_project_skill_deploy(store, &skill_id, &project_id, agents, commit_oid)?;
+    let mut failed = false;
+    let mut targets = Vec::with_capacity(plan.len());
+    for target in &plan {
+        if failed {
+            targets.push(ProjectSkillExportTargetResult {
+                skill_id: target.skill_id.clone(),
+                agent: target.agent.clone(),
+                path: target.path.clone(),
+                result: "not_attempted".to_string(),
+                error: None,
+                recovery: Vec::new(),
+            });
+            continue;
+        }
+        let previous = store
+            .pending_project_skill_operations()
+            .map_err(AppError::db)?
+            .into_iter()
+            .map(|op| op.id)
+            .collect::<std::collections::HashSet<_>>();
+        let applied = apply_project_deploy(store, &[target.clone()]).and_then(|_| {
+            if std::fs::symlink_metadata(&target.path).is_err() {
+                return Err(AppError::invalid_input(
+                    "Deployment reported success but target no longer exists",
+                ));
+            }
+            Ok(())
+        });
+        let (result, error, recovery) = match applied {
+            Ok(()) => ("created".to_string(), None, Vec::new()),
+            Err(err) => {
+                failed = true;
+                let recoveries = store
+                    .pending_project_skill_operations()
+                    .map_err(AppError::db)?
+                    .into_iter()
+                    .filter(|op| {
+                        !previous.contains(&op.id)
+                            && op.project_id == project_id
+                            && op.target_path == target.path
+                    })
+                    .map(|op| ProjectSkillExportRecovery {
+                        operation_id: op.id,
+                        phase: op.phase,
+                        recovery_root: op.recovery_root,
+                    })
+                    .collect();
+                ("failed".to_string(), Some(err.to_string()), recoveries)
+            }
+        };
+        targets.push(ProjectSkillExportTargetResult {
+            skill_id: target.skill_id.clone(),
+            agent: target.agent.clone(),
+            path: target.path.clone(),
+            result,
+            error,
+            recovery,
+        });
+    }
+    Ok(ProjectSkillExportReport {
+        ok: !failed,
+        targets,
+    })
+}
+
+#[tauri::command]
+pub async fn export_skill_to_project_with_report(
+    store: State<'_, Arc<SkillStore>>,
+    skill_id: String,
+    project_id: String,
+    agents: Option<Vec<String>>,
+    commit_oid: Option<String>,
+) -> Result<ProjectSkillExportReport, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        export_skill_to_project_with_report_internal(
+            &store,
+            skill_id,
+            project_id,
+            agents,
+            commit_oid.as_deref(),
+        )
+    })
+    .await?
+}
+
 #[tauri::command]
 pub async fn export_skill_to_project(
     store: State<'_, Arc<SkillStore>>,
@@ -1534,10 +1654,21 @@ pub fn export_skill_to_project_internal_with_commit(
     agents: Option<Vec<String>>,
     commit_oid: Option<&str>,
 ) -> Result<(), AppError> {
-    let project = get_project_record(store, &project_id)?;
+    let plan = plan_gui_project_skill_deploy(store, &skill_id, &project_id, agents, commit_oid)?;
+    apply_project_deploy(store, &plan)
+}
+
+fn plan_gui_project_skill_deploy(
+    store: &SkillStore,
+    skill_id: &str,
+    project_id: &str,
+    agents: Option<Vec<String>>,
+    commit_oid: Option<&str>,
+) -> Result<Vec<ProjectDeployTarget>, AppError> {
+    let project = get_project_record(store, project_id)?;
 
     let skill = store
-        .get_skill_by_id(&skill_id)
+        .get_skill_by_id(skill_id)
         .map_err(AppError::db)?
         .ok_or_else(|| AppError::not_found("Skill not found"))?;
 
@@ -1577,8 +1708,13 @@ pub fn export_skill_to_project_internal_with_commit(
         filtered
     };
 
-    let plan =
-        plan_project_deploy_with_commit(store, &project_id, &[skill_id], &agent_keys, commit_oid)?;
+    let plan = plan_project_deploy_with_commit(
+        store,
+        project_id,
+        &[skill_id.to_string()],
+        &agent_keys,
+        commit_oid,
+    )?;
     // The GUI only offers "add" where nothing is there yet, so anything in the
     // way, even this same skill, is refused as before.
     if let Some(occupied) = plan
@@ -1590,7 +1726,7 @@ pub fn export_skill_to_project_internal_with_commit(
             skill.name, occupied.agent
         )));
     }
-    apply_project_deploy(store, &plan)
+    Ok(plan)
 }
 
 /// Read-only Core preview for CLI updates. Both this preview and the
@@ -5551,6 +5687,134 @@ mod project_plan_tests {
         assert_eq!(plan[0].state, ProjectDeployState::Conflict);
         assert!(update_managed_project_copy(&fx.store, &fx.project_id, &external, None).is_err());
         assert!(external.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn gui_multi_agent_export_reports_partial_success_with_recovery_path() {
+        let fx = fixture(&["claude_code", "codex"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        commit_library(&fx);
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_second_gui_deploy
+             BEFORE INSERT ON project_skill_deployments
+             WHEN NEW.target_path LIKE '%/.codex/skills/demo'
+             BEGIN SELECT RAISE(ABORT, 'injected GUI codex failure'); END;",
+        )
+        .unwrap();
+        let result = export_skill_to_project_with_report_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["claude_code".into(), "codex".into()]),
+            None,
+        )
+        .unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.targets.len(), 2);
+        assert_eq!(result.targets[0].result, "created");
+        assert_eq!(result.targets[1].result, "failed");
+        assert!(result.targets[1]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("database commit failed"));
+        assert_eq!(result.targets[1].recovery.len(), 1);
+        let recovery = &result.targets[1].recovery[0];
+        assert_eq!(recovery.phase, "recovery_available");
+        assert!(Path::new(&recovery.recovery_root)
+            .join("recovered/SKILL.md")
+            .is_file());
+        assert!(fx.repo.join(".claude/skills/demo/SKILL.md").is_file());
+        assert!(!fx.repo.join(".codex/skills/demo").exists());
+        assert!(fx
+            .store
+            .get_project_skill_deployment(
+                &fx.project_id,
+                &fx.repo.join(".claude/skills/demo").to_string_lossy(),
+            )
+            .unwrap()
+            .is_some());
+        assert!(fx
+            .store
+            .get_project_skill_deployment(
+                &fx.project_id,
+                &fx.repo.join(".codex/skills/demo").to_string_lossy(),
+            )
+            .unwrap()
+            .is_none());
+        db.execute_batch("DROP TRIGGER refuse_second_gui_deploy")
+            .unwrap();
+        let retry = export_skill_to_project_with_report_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["codex".into()]),
+            None,
+        )
+        .unwrap();
+        assert!(retry.ok);
+        assert_eq!(retry.targets[0].result, "created");
+        assert!(fx.repo.join(".codex/skills/demo/SKILL.md").is_file());
+        assert!(Path::new(&recovery.recovery_root)
+            .join("recovered/SKILL.md")
+            .is_file());
+    }
+
+    #[test]
+    fn gui_multi_agent_export_stops_after_first_failed_target() {
+        let fx = fixture(&["claude_code", "codex"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        commit_library(&fx);
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_first_gui_deploy
+             BEFORE INSERT ON project_skill_deployments
+             WHEN NEW.target_path LIKE '%/.claude/skills/demo'
+             BEGIN SELECT RAISE(ABORT, 'injected GUI claude failure'); END;",
+        )
+        .unwrap();
+        let report = export_skill_to_project_with_report_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["claude_code".into(), "codex".into()]),
+            None,
+        )
+        .unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.targets.len(), 2);
+        assert_eq!(report.targets[0].result, "failed");
+        assert_eq!(report.targets[1].result, "not_attempted");
+        assert!(report.targets[1].error.is_none());
+        assert!(report.targets[1].recovery.is_empty());
+        assert!(!fx.repo.join(".codex/skills/demo").exists());
+        assert!(!fx.repo.join(".claude/skills/demo").exists());
+        let pending = get_project_skill_recoveries_internal(&fx.store, &fx.project_id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].recovery_root_exists);
+    }
+
+    #[test]
+    fn gui_multi_agent_export_keeps_legacy_all_targets_preflight_refusal() {
+        let fx = fixture(&["claude_code", "codex"]);
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        let blocked = fx.repo.join(".codex/skills/demo");
+        write_skill(&blocked, "demo", "# external");
+        let before = fs::read(blocked.join("SKILL.md")).unwrap();
+        let err = export_skill_to_project_with_report_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["claude_code".into(), "codex".into()]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(!fx.repo.join(".claude/skills/demo").exists());
+        assert_eq!(fs::read(blocked.join("SKILL.md")).unwrap(), before);
     }
 
     #[test]

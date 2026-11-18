@@ -842,6 +842,14 @@
     "collapse": "Collapse"
   },
   "addFromLibrary": {
+    "deploymentResults": "Deployment results by agent",
+    "deployState": {
+      "created": "Created",
+      "failed": "Failed",
+      "not_attempted": "Not attempted"
+    },
+    "recoverySaved": "Retained recovery location",
+    "recoveryReadOnly": "Recovery locations are read-only here. Inspect them before any manual cleanup.",
     "title": "Add from Library",
     "targetLabel": "Target:",
     "noTargetSelected": "no target",

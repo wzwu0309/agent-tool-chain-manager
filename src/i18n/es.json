@@ -825,6 +825,14 @@
     "collapse": "Contraer"
   },
   "addFromLibrary": {
+    "deploymentResults": "Resultados de despliegue por agente",
+    "deployState": {
+      "created": "Creado",
+      "failed": "Error",
+      "not_attempted": "No iniciado"
+    },
+    "recoverySaved": "Ubicación de recuperación conservada",
+    "recoveryReadOnly": "Estas ubicaciones son de solo lectura. Revísalas antes de limpiarlas manualmente.",
     "add": "Añadir",
     "changeTarget": "Cambiar destino",
     "clearTargets": "Limpiar",

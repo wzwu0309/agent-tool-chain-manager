@@ -842,6 +842,14 @@
     "collapse": "收起"
   },
   "addFromLibrary": {
+    "deploymentResults": "各 Agent 部署结果",
+    "deployState": {
+      "created": "已创建",
+      "failed": "失败",
+      "not_attempted": "未执行"
+    },
+    "recoverySaved": "保留的恢复目录",
+    "recoveryReadOnly": "此处仅展示恢复路径。手动清理前请检查内容。",
     "title": "从技能库添加",
     "targetLabel": "目标：",
     "noTargetSelected": "未选择",

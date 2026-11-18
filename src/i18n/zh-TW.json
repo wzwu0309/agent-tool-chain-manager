@@ -831,6 +831,14 @@
     "collapse": "收合"
   },
   "addFromLibrary": {
+    "deploymentResults": "各 Agent 部署結果",
+    "deployState": {
+      "created": "已建立",
+      "failed": "失敗",
+      "not_attempted": "未執行"
+    },
+    "recoverySaved": "保留的復原目錄",
+    "recoveryReadOnly": "此處僅顯示復原路徑。手動清理前請檢查內容。",
     "title": "從技能庫新增",
     "targetLabel": "目標：",
     "noTargetSelected": "未選擇",

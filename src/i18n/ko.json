@@ -825,6 +825,14 @@
     "collapse": "접기"
   },
   "addFromLibrary": {
+    "deploymentResults": "에이전트별 배포 결과",
+    "deployState": {
+      "created": "생성됨",
+      "failed": "실패",
+      "not_attempted": "실행되지 않음"
+    },
+    "recoverySaved": "보관된 복구 경로",
+    "recoveryReadOnly": "여기에서는 복구 경로만 표시합니다. 수동 정리 전에 내용을 확인하세요.",
     "title": "라이브러리에서 추가",
     "targetLabel": "대상:",
     "noTargetSelected": "대상 없음",

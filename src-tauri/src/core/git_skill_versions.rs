@@ -61,6 +61,20 @@ pub fn resolve_skill_version(
         }
     };
 
+    resolve_skill_version_from_commit(&repo, skill_id, &commit)
+}
+
+/// Resolve an immutable historical commit without HEAD ancestry gating.
+/// Only for validating a baseline already recorded by this application:
+/// users still select new deployment versions through the public resolver.
+fn resolve_skill_version_from_commit(
+    repo: &Repository,
+    skill_id: &str,
+    commit: &git2::Commit<'_>,
+) -> Result<GitSkillVersion> {
+    if !valid_name_component(skill_id) {
+        bail!("invalid SkillId");
+    }
     let tree = commit.tree().context("selected commit has no tree")?;
     let meta_path = format!(".skills-manager/skills/{skill_id}.json");
     let meta_entry = tree
@@ -97,10 +111,131 @@ pub fn resolve_skill_version(
     })
 }
 
+/// Local immutable reachability anchor for each deployed Git commit.
+/// Each deployment can accumulate multiple commit pins during updates.
+/// Pins are never implicitly deleted while recovery data might be needed.
+const DEPLOYMENT_PIN_PREFIX: &str = "refs/skills-manager/project-deployments/";
+
+pub fn deployment_pin_ref(deployment_id: &str, commit_oid: &str) -> Result<String> {
+    let uuid = uuid::Uuid::parse_str(deployment_id)
+        .context("invalid managed Project DeploymentId for Git pin")?;
+    let commit = Oid::from_str(commit_oid).context("invalid Git commit OID to pin")?;
+    Ok(format!("{DEPLOYMENT_PIN_PREFIX}{uuid}/{commit}"))
+}
+
+/// Create a persistent ref *before* publishing any project bytes or changing
+/// SQLite's baseline. Failed deployments may leave extra safe pins behind.
+pub fn pin_deployment_version(
+    skills_dir: &Path,
+    deployment_id: &str,
+    commit_oid: &str,
+) -> Result<()> {
+    let ref_name = deployment_pin_ref(deployment_id, commit_oid)?;
+    let repo = open_exact_store(skills_dir)?;
+    let oid = Oid::from_str(commit_oid)?;
+    repo.find_commit(oid)
+        .with_context(|| format!("cannot pin missing Git CommitId {commit_oid}"))?;
+    match repo.find_reference(&ref_name) {
+        Ok(existing) if existing.target() == Some(oid) => return Ok(()),
+        Ok(_) => bail!("Git deployment version pin conflicts with existing reference"),
+        Err(err) if err.code() == git2::ErrorCode::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    repo.reference(&ref_name, oid, false, "pin deployed Project Skill version")
+        .context("failed to persist Git deployment version pin")?;
+    if repo.find_reference(&ref_name)?.target() != Some(oid) {
+        bail!("Git deployment version pin verification failed");
+    }
+    Ok(())
+}
+
+pub fn verify_deployment_pin(
+    skills_dir: &Path,
+    deployment_id: &str,
+    commit_oid: &str,
+) -> Result<()> {
+    let name = deployment_pin_ref(deployment_id, commit_oid)?;
+    let repo = open_exact_store(skills_dir)?;
+    let target = Oid::from_str(commit_oid)?;
+    let reference = repo
+        .find_reference(&name)
+        .with_context(|| format!("Git deployment pin missing for {deployment_id}"))?;
+    if reference.target() != Some(target) {
+        bail!("Git deployment pin does not match the stored CommitId");
+    }
+    repo.find_commit(target)
+        .context("Git deployment baseline CommitId is no longer present locally")?;
+    Ok(())
+}
+
+/// Backfill versions previously deployed without pins. Never substitute HEAD
+/// for a missing historical commit: report object loss as a recovery error.
+pub fn reconcile_deployment_pins(
+    skills_dir: &Path,
+    store: &super::skill_store::SkillStore,
+) -> Result<Vec<String>> {
+    let rows = store.get_managed_project_copy_version_refs()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut problems = Vec::new();
+    for row in rows {
+        let attempt = (|| -> Result<()> {
+            let commit_oid = row
+                .commit_oid
+                .as_deref()
+                .context("missing recorded CommitId")?;
+            let tree_oid = row
+                .tree_oid
+                .as_deref()
+                .context("missing recorded Skill TreeOid")?;
+            let old_path = row
+                .path_at_commit
+                .as_deref()
+                .context("missing recorded PathAtCommit")?;
+            let repo = open_exact_store(skills_dir)?;
+            let commit = repo
+                .find_commit(Oid::from_str(commit_oid)?)
+                .context("recorded Git commit object is unavailable")?;
+            let selected = resolve_skill_version_from_commit(&repo, &row.skill_id, &commit)?;
+            if selected.tree_oid != tree_oid || selected.path_at_commit != old_path {
+                bail!("stored SkillId/TreeOid/PathAtCommit do not match the recorded Git commit");
+            }
+            pin_deployment_version(skills_dir, &row.deployment_id, commit_oid)?;
+            Ok(())
+        })();
+        if let Err(err) = attempt {
+            problems.push(format!(
+                "deployment {} cannot retain trustworthy Git baseline: {err:#}",
+                row.deployment_id,
+            ));
+        }
+    }
+    Ok(problems)
+}
+
+/// Re-clone must not discard a central object database containing local pins.
+/// Remote backup deliberately omits these hidden refs. Even if a commit object
+/// happens to exist in the new clone, its future GC safety is unproven.
+pub fn has_local_deployment_pins(skills_dir: &Path) -> Result<bool> {
+    let repo = open_exact_store(skills_dir)?;
+    let refs = repo.references_glob(&format!("{DEPLOYMENT_PIN_PREFIX}*"))?;
+    for reference in refs {
+        let reference = reference?;
+        if reference
+            .name()
+            .is_some_and(|name| name.starts_with(DEPLOYMENT_PIN_PREFIX))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn open_exact_store(skills_dir: &Path) -> Result<Repository> {
     let repo = Repository::open(skills_dir).with_context(|| {
         format!(
-            "central Skill store at {} is not an initialized Git repository",
+            "central Skill store at {} is not an initialized Git repository; initialize it explicitly in Git Backup or run CLI git init",
             skills_dir.display()
         )
     })?;
@@ -505,6 +640,80 @@ mod tests {
             &dst.path().join("chained"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn pinned_commit_survives_head_rewrite_and_real_git_gc() {
+        use std::process::Command;
+        let fx = Fixture::new();
+        fx.write_skill("toolkit/demo", "v1");
+        let initial = fx.commit("initial");
+        fx.write_skill("toolkit/demo", "v2");
+        let pinned = fx.commit("deployment version");
+        let deployment_id = uuid::Uuid::new_v4().to_string();
+        pin_deployment_version(fx.dir.path(), &deployment_id, &pinned.to_string()).unwrap();
+        pin_deployment_version(fx.dir.path(), &deployment_id, &pinned.to_string()).unwrap();
+        verify_deployment_pin(fx.dir.path(), &deployment_id, &pinned.to_string()).unwrap();
+        assert!(has_local_deployment_pins(fx.dir.path()).unwrap());
+        let head_ref = fx.repo.head().unwrap().name().unwrap().to_string();
+        fx.repo
+            .reference(&head_ref, initial, true, "simulate history rewrite")
+            .unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(fx.dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["reflog", "expire", "--all", "--expire=now"]);
+        run(&["gc", "--prune=now"]);
+        verify_deployment_pin(fx.dir.path(), &deployment_id, &pinned.to_string()).unwrap();
+        let version = fx.repo.find_commit(pinned).unwrap();
+        assert_eq!(version.id(), pinned);
+        // HEAD ancestry selection remains restrictive, even though the
+        // historical object is intentionally retained for baseline recovery.
+        assert!(
+            resolve_skill_version(fx.dir.path(), "demo-skill", Some(&pinned.to_string()),).is_err()
+        );
+    }
+
+    #[test]
+    fn pins_are_deployment_scoped_immutable_and_never_retargeted() {
+        let fx = Fixture::new();
+        fx.write_skill("toolkit/demo", "first");
+        let commit = fx.commit("first");
+        let id = uuid::Uuid::new_v4().to_string();
+        let another = uuid::Uuid::new_v4().to_string();
+        pin_deployment_version(fx.dir.path(), &id, &commit.to_string()).unwrap();
+        pin_deployment_version(fx.dir.path(), &another, &commit.to_string()).unwrap();
+        let ref_name = deployment_pin_ref(&id, &commit.to_string()).unwrap();
+        assert_eq!(
+            fx.repo.find_reference(&ref_name).unwrap().target(),
+            Some(commit)
+        );
+        assert!(deployment_pin_ref("../../outside", &commit.to_string()).is_err());
+        assert!(deployment_pin_ref(&id, "not-a-git-oid").is_err());
+        fx.write_skill("toolkit/demo", "second");
+        let unrelated_target = fx.commit("another valid commit");
+        fx.repo
+            .reference(
+                &ref_name,
+                unrelated_target,
+                true,
+                "simulate corrupted pin target",
+            )
+            .unwrap();
+        assert!(verify_deployment_pin(fx.dir.path(), &id, &commit.to_string()).is_err());
+        assert!(
+            pin_deployment_version(fx.dir.path(), &id, &commit.to_string()).is_err(),
+            "a conflicting pin must never be forcibly rewritten"
+        );
     }
 
     #[test]

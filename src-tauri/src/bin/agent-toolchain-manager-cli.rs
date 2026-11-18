@@ -3663,14 +3663,14 @@ fn run_git(
             print_json(&git_backup::get_status(&central_repo::skills_dir())?, json)
         }
         GitCommand::Init => {
-            // No settings store on this path; the hostname default matches
-            // what the GUI derives, and the GUI reconciles the repo identity
-            // on its next backup anyway.
-            git_backup::init_repo(
-                &central_repo::skills_dir(),
-                &git_backup::default_device_name(),
+            // Explicit local snapshot initiation. Sync stable SkillId metadata
+            // under the *same* Git lock as the initial commit, matching the
+            // GUI path and avoiding an unusable metadata-free first HEAD.
+            let skills_dir = central_repo::skills_dir();
+            git_backup::init_repo_with_skill_metadata(
+                &skills_dir, store, &git_backup::default_device_name(),
             )?;
-            print_json(&git_backup::get_status(&central_repo::skills_dir())?, json);
+            print_json(&git_backup::get_status(&skills_dir)?, json);
         }
         GitCommand::Clone { url } => {
             let target = central_repo::skills_dir();
@@ -4378,9 +4378,7 @@ mod project_tests {
     fn fixture() -> Fx {
         let guard = PROJECT_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
-        app_lib::core::central_repo::set_runtime_base_dir_override(
-            Some(tmp.path().to_path_buf()),
-        );
+        app_lib::core::central_repo::set_runtime_base_dir_override(Some(tmp.path().to_path_buf()));
         app_lib::core::central_repo::set_runtime_skills_dir_override(Some(
             tmp.path().join("central"),
         ));
@@ -4479,6 +4477,52 @@ mod project_tests {
         Cli::try_parse_from(
             std::iter::once("agent-toolchain-manager-cli").chain(args.iter().copied()),
         )
+    }
+
+    #[test]
+    fn explicit_git_init_snapshots_stable_skill_metadata_before_first_commit() {
+        let fx = fixture();
+        let root = app_lib::core::central_repo::skills_dir();
+        // The fixture came with a repository; remove only its temporary Git
+        // data to simulate a new local Store with pre-existing Skill records.
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        let metadata = root.join(".skills-manager/skills/skill-demo.json");
+        std::fs::remove_file(&metadata).unwrap();
+        let source = root.join("demo/SKILL.md");
+        let original = std::fs::read(&source).unwrap();
+        let prior =
+            app_lib::core::git_skill_versions::resolve_skill_version(&root, "skill-demo", None);
+        assert!(prior.is_err(), "uninitialized Git cannot deploy a version");
+        assert!(!root.join(".git").exists());
+
+        run_git(
+            GitArgs {
+                command: GitCommand::Init,
+            },
+            &fx.store,
+            false,
+            true,
+        )
+        .unwrap();
+        let head =
+            app_lib::core::git_skill_versions::resolve_skill_version(&root, "skill-demo", None)
+                .unwrap();
+        assert_eq!(head.skill_id, "skill-demo");
+        assert_eq!(head.path_at_commit, "demo");
+        assert_eq!(std::fs::read(source).unwrap(), original);
+        assert!(metadata.is_file());
+        assert!(
+            run_git(
+                GitArgs {
+                    command: GitCommand::Init
+                },
+                &fx.store,
+                false,
+                true
+            )
+            .is_err(),
+            "explicit Git init must not rewrite existing history"
+        );
     }
 
     #[test]

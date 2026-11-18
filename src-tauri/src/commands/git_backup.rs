@@ -114,10 +114,9 @@ pub async fn git_backup_init(store: State<'_, Arc<SkillStore>>) -> Result<(), Ap
     let store = store.inner().clone();
     let skills_dir = central_repo::skills_dir();
     tokio::task::spawn_blocking(move || {
-        git_backup::with_repo_lock("git init", || {
-            sync_metadata::write_all_from_db_unlocked(&store)?;
-            git_backup::init_repo_unlocked(&skills_dir, &effective_device_name(&store))
-        })
+        git_backup::init_repo_with_skill_metadata(
+            &skills_dir, &store, &effective_device_name(&store),
+        )
         .map_err(AppError::git)
     })
     .await?

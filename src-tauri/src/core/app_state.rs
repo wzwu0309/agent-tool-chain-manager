@@ -5,8 +5,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use super::{
-    central_repo, scenario_service, skill_metadata, skill_store::SkillStore, sync_engine,
-    sync_metadata, tool_adapters, tool_service,
+    central_repo, git_skill_versions, repo_lock::RepoLock, scenario_service, skill_metadata,
+    skill_store::SkillStore, sync_engine, sync_metadata, tool_adapters, tool_service,
 };
 
 /// Per-stage timings collected during `initialize_store`. The struct is
@@ -177,6 +177,36 @@ fn initialize_store_inner(
         let step = Instant::now();
         reindex_or_rebuild_metadata(&store)?;
         timings.reindex_from_metadata_ms = Some(step.elapsed().as_millis());
+    }
+
+    // Existing managed Copies from pre-pin releases may have a committed
+    // baseline in SQLite but no local Git reference protecting its object
+    // from GC. Repair that before any background Git work starts, without
+    // silently changing a missing historical base to the current HEAD.
+    match store.get_managed_project_copy_version_refs() {
+        Ok(rows) if !rows.is_empty() => {
+            let result = (|| -> Result<Vec<String>> {
+                let _lock = RepoLock::acquire_foreground("reconcile deployed Git versions")?;
+                git_skill_versions::reconcile_deployment_pins(&central_repo::skills_dir(), &store)
+            })();
+            match result {
+                Ok(problems) => {
+                    for message in problems {
+                        log::warn!("Git deployment pin reconciliation: {message}");
+                        central_repo::record_startup_error(message);
+                    }
+                }
+                Err(err) => {
+                    central_repo::record_startup_error(format!(
+                        "Managed Project Git versions could not be verified: {err:#}"
+                    ));
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(err) => central_repo::record_startup_error(format!(
+            "Could not enumerate managed Project Git versions: {err:#}"
+        )),
     }
 
     let step = Instant::now();

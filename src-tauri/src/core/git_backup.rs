@@ -336,6 +336,23 @@ pub(crate) fn init_repo_unlocked(skills_dir: &Path, device_name: &str) -> Result
     Ok(())
 }
 
+/// Explicit, metadata-consistent local Git initialization shared by
+/// GUI and CLI. This intentionally does not auto-commit when a user merely
+/// requests a Project Copy: the first snapshot is a deliberate user action.
+pub fn init_repo_with_skill_metadata(
+    skills_dir: &Path,
+    store: &super::skill_store::SkillStore,
+    device_name: &str,
+) -> Result<()> {
+    with_repo_lock("git init", || {
+        if skills_dir.join(".git").exists() {
+            anyhow::bail!("Already a git repository");
+        }
+        super::sync_metadata::write_all_from_db_unlocked(store)?;
+        init_repo_unlocked(skills_dir, device_name)
+    })
+}
+
 /// Set (or update) the remote origin URL.
 pub fn set_remote(skills_dir: &Path, url: &str) -> Result<()> {
     let _lock = RepoLock::acquire_foreground("git set remote")?;
@@ -1006,6 +1023,17 @@ pub(crate) fn reclone_from_remote_unlocked(
     if !git_dir.exists() {
         let local_copies = clone_into_unlocked(skills_dir, url, set_aside)?;
         return Ok(RecloneOutcome { kept_git: None, local_copies });
+    }
+
+    // Project deployment pins are intentionally local-only (not pushed with
+    // backup). Even if the cloned repo contains their objects today, it does
+    // not retain the refs after future history rewrites or Git GC. A replace-
+    // in-place re-clone is therefore unsafe until pins can be migrated.
+    if super::git_skill_versions::has_local_deployment_pins(skills_dir)? {
+        anyhow::bail!(
+            "Re-clone refused: the central Git Store has pinned Project Skill deployments. \
+             Preserve and migrate all deployment refs and objects before replacing this .git."
+        );
     }
 
     log::info!("git reclone: re-cloning from remote, preserving local skills");
@@ -3433,6 +3461,34 @@ mod tests {
         assert_eq!(read_normalized(&skills.join("conflict-skill/SKILL.md")), "edited here\n");
         assert!(siblings_named(&skills, "skills-git-recovery").is_empty());
         assert!(siblings_named(&skills, "skills-backup-before-clone").is_empty());
+    }
+
+    #[test]
+    fn reclone_refuses_to_discard_local_project_version_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (remote, _) = seeded_remote(
+            tmp.path(), &[("remote-skill/SKILL.md", "committed skill\n")],
+        );
+        let skills = tmp.path().join("skills");
+        git_ok(tmp.path(), &[
+            "clone", remote.to_str().unwrap(), skills.to_str().unwrap(),
+        ]);
+        let commit = git_ok(&skills, &["rev-parse", "HEAD"]);
+        let deployment_id = uuid::Uuid::new_v4().to_string();
+        crate::core::git_skill_versions::pin_deployment_version(
+            &skills, &deployment_id, &commit,
+        ).unwrap();
+        // HEAD/objects might happen to be in the remote, but the pin refs
+        // deliberately are not; replacing this .git would lose protection.
+        let error = reclone_from_remote_unlocked(
+            &skills, remote.to_str().unwrap(), &[],
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("pinned Project Skill deployments"));
+        assert_eq!(git_ok(&skills, &["rev-parse", "HEAD"]), commit);
+        crate::core::git_skill_versions::verify_deployment_pin(
+            &skills, &deployment_id, &commit,
+        ).unwrap();
+        assert!(siblings_named(&skills, "skills-git-recovery").is_empty());
     }
 
     #[test]

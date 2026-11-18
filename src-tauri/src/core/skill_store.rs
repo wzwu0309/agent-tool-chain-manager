@@ -142,6 +142,17 @@ pub struct ProjectSkillDeploymentRecord {
     pub updated_at: i64,
 }
 
+/// Immutable fields needed to validate that a previously deployed version
+/// really belongs to its historical Git SkillId and committed subtree.
+#[derive(Debug, Clone)]
+pub struct ManagedProjectCopyVersionRef {
+    pub deployment_id: String,
+    pub skill_id: String,
+    pub commit_oid: Option<String>,
+    pub tree_oid: Option<String>,
+    pub path_at_commit: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScenarioSkillToolToggleRecord {
     pub scenario_id: String,
@@ -1624,6 +1635,31 @@ impl SkillStore {
             anyhow::bail!("Project Skill path is already owned by another deployment");
         }
         Ok(())
+    }
+
+    /// The only Git pins eligible for startup reconciliation. Symlink and
+    /// external/unmanaged entries do not confer a local Copy baseline.
+    pub fn get_managed_project_copy_version_refs(
+        &self,
+    ) -> Result<Vec<ManagedProjectCopyVersionRef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, skill_id, base_commit_oid, base_tree_oid, path_at_commit
+             FROM project_skill_deployments
+             WHERE mode='copy' AND management_state='managed'
+             ORDER BY id",
+        )?;
+        let refs = stmt.query_map([], |row| {
+            Ok(ManagedProjectCopyVersionRef {
+                deployment_id: row.get(0)?,
+                skill_id: row.get(1)?,
+                commit_oid: row.get(2)?,
+                tree_oid: row.get(3)?,
+                path_at_commit: row.get(4)?,
+            })
+        })?;
+        refs.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn get_project_skill_deployment(

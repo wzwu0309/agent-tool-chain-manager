@@ -1535,6 +1535,10 @@ pub fn update_managed_project_copy(
     }
     let wanted = git_skill_versions::resolve_skill_version(&root, &deployment.skill_id, commit_oid)
         .map_err(AppError::io)?;
+    // Every adopted Git base must be reachable independently of mutable HEAD.
+    // A failed pin refuses the update before touching user files/SQLite.
+    git_skill_versions::pin_deployment_version(&root, &deployment.id, &wanted.commit_oid)
+        .map_err(AppError::io)?;
     if wanted.tree_oid == base_tree {
         store
             .update_project_skill_deployment_version(
@@ -2751,6 +2755,14 @@ pub fn apply_project_deploy(
                 symlink_target: None,
                 symlink_identity: None,
             };
+            // Pin before the first filesystem publication, so a later HEAD
+            // rewrite or GC cannot orphan this project's committed baseline.
+            git_skill_versions::pin_deployment_version(
+                &central_repo::skills_dir(),
+                &record.id,
+                &version.commit_oid,
+            )
+            .map_err(AppError::io)?;
             store
                 .insert_project_skill_operation(&ProjectSkillOperationRecord {
                     id: operation_id.clone(),
@@ -4824,6 +4836,12 @@ mod project_plan_tests {
         );
         assert_eq!(record.management_origin, "deployed_by_manager");
         assert_eq!(record.management_state, "managed");
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &record.id,
+            record.base_commit_oid.as_deref().unwrap(),
+        )
+        .unwrap();
 
         let again = plan_project_deploy(
             &fx.store,
@@ -4834,6 +4852,130 @@ mod project_plan_tests {
         .unwrap();
         assert_eq!(again[0].state, ProjectDeployState::AlreadyDeployed);
         assert_eq!(again[0].sync_status.as_deref(), Some("in_sync"));
+    }
+
+    #[test]
+    fn same_skill_tree_update_pins_each_distinct_commit() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let path = fx.repo.join(".claude/skills/demo");
+        let before = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+
+        fs::write(
+            central_repo::skills_dir().join("README.md"),
+            "unrelated commit",
+        )
+        .unwrap();
+        commit_library(&fx);
+        let new_head =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &skill.id, None)
+                .unwrap();
+        assert_ne!(
+            before.base_commit_oid.as_deref(),
+            Some(new_head.commit_oid.as_str())
+        );
+        assert_eq!(
+            before.base_tree_oid.as_deref(),
+            Some(new_head.tree_oid.as_str())
+        );
+        update_managed_project_copy(&fx.store, &fx.project_id, &path, None).unwrap();
+
+        let after = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(
+            after.base_commit_oid.as_deref(),
+            Some(new_head.commit_oid.as_str())
+        );
+        assert_eq!(after.base_tree_oid, before.base_tree_oid);
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &before.id,
+            before.base_commit_oid.as_deref().unwrap(),
+        )
+        .unwrap();
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &after.id,
+            &new_head.commit_oid,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn previous_managed_copy_versions_can_be_backfilled_without_changing_head() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let path = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let oid = row.base_commit_oid.unwrap();
+        let root = central_repo::skills_dir();
+        let git = git2::Repository::open(&root).unwrap();
+        let name = git_skill_versions::deployment_pin_ref(&row.id, &oid).unwrap();
+        git.find_reference(&name).unwrap().delete().unwrap();
+        assert!(git_skill_versions::verify_deployment_pin(&root, &row.id, &oid).is_err());
+        let head = git.head().unwrap().peel_to_commit().unwrap().id();
+        let problems = git_skill_versions::reconcile_deployment_pins(&root, &fx.store).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        git_skill_versions::verify_deployment_pin(&root, &row.id, &oid).unwrap();
+        assert_eq!(git.head().unwrap().peel_to_commit().unwrap().id(), head);
+
+        // A bogus historical CommitId is never replaced with HEAD.
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET base_commit_oid=?2 WHERE id=?1",
+            rusqlite::params![row.id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .unwrap();
+        let issues = git_skill_versions::reconcile_deployment_pins(&root, &fx.store).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("cannot retain"));
+        assert_eq!(git.head().unwrap().peel_to_commit().unwrap().id(), head);
+
+        // Even if the Git commit exists, a forged/mismatched stored subtree
+        // must not be promoted to a trusted, newly pinned baseline.
+        git.find_reference(&name).unwrap().delete().unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments
+             SET base_commit_oid=?2, base_tree_oid=?3 WHERE id=?1",
+            rusqlite::params![row.id, oid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",],
+        )
+        .unwrap();
+        let mismatches = git_skill_versions::reconcile_deployment_pins(&root, &fx.store).unwrap();
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0].contains("do not match"));
+        assert!(git.find_reference(&name).is_err());
     }
 
     #[test]

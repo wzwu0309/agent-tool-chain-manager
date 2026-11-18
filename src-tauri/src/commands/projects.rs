@@ -307,6 +307,7 @@ pub(crate) fn ensure_dir_within_root(path: &Path, root: &Path) -> Result<(), App
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_workspace_skill_target(path: &Path) -> Result<(), AppError> {
     sync_engine::remove_target(path).map_err(AppError::io)
 }
@@ -315,6 +316,7 @@ fn remove_workspace_skill_target(path: &Path) -> Result<(), AppError> {
 // (and including) `root`. Stops at the first non-empty directory or any
 // other error. `fs::remove_dir` only succeeds on empty directories, so this
 // will never delete a directory that still holds skills.
+#[cfg(test)]
 fn cleanup_empty_dirs_up_to(start: &Path, root: &Path) {
     let Ok(root_canonical) = std::fs::canonicalize(root) else {
         return;
@@ -340,20 +342,9 @@ fn cleanup_empty_dirs_up_to(start: &Path, root: &Path) {
     }
 }
 
-fn remove_symlink_entry(path: &Path) -> Result<(), AppError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(AppError::io(err)),
-    };
-    if !metadata.file_type().is_symlink() {
-        return Err(AppError::invalid_input(
-            "Duplicate skill entry is not a symlink — resolve manually",
-        ));
-    }
-    sync_engine::remove_target(path).map_err(AppError::io)
-}
-
+/// Only move exactly one entry. Never interpret a duplicate Symlink as
+/// disposable: another user may own it, even if it points to central Store.
+#[cfg(test)]
 fn set_project_skill_enabled_state(
     skills_dir: &Path,
     disabled_dir: &Path,
@@ -361,66 +352,37 @@ fn set_project_skill_enabled_state(
     enabled: bool,
 ) -> Result<(), AppError> {
     ensure_safe_skill_relative_path(skill_relative_path)?;
-
     let enabled_path = skills_dir.join(skill_relative_path);
     let disabled_path = disabled_dir.join(skill_relative_path);
-
-    if enabled {
-        if enabled_path.is_dir() {
-            ensure_dir_within_root(&enabled_path, skills_dir)?;
-            if disabled_path.exists() {
-                ensure_dir_within_root(&disabled_path, disabled_dir)?;
-                remove_symlink_entry(&disabled_path)?;
-                if let Some(parent) = disabled_path.parent() {
-                    cleanup_empty_dirs_up_to(parent, disabled_dir);
-                }
-            }
-            return Ok(());
-        }
-
-        if !disabled_path.is_dir() {
-            return Err(AppError::not_found(
-                "Skill directory not found in skills-disabled",
-            ));
-        }
-        ensure_dir_within_root(&disabled_path, disabled_dir)?;
-        if let Some(parent) = enabled_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if enabled_path.exists() {
-            return Err(AppError::invalid_input(
-                "Skill already exists in skills directory",
-            ));
-        }
-        std::fs::rename(&disabled_path, &enabled_path)?;
-        if let Some(parent) = disabled_path.parent() {
-            cleanup_empty_dirs_up_to(parent, disabled_dir);
-        }
-        return Ok(());
-    }
-
-    if disabled_path.is_dir() {
-        ensure_dir_within_root(&disabled_path, disabled_dir)?;
-        if enabled_path.exists() {
-            ensure_dir_within_root(&enabled_path, skills_dir)?;
-            remove_symlink_entry(&enabled_path)?;
-        }
-        return Ok(());
-    }
-
-    if !enabled_path.is_dir() {
-        return Err(AppError::not_found("Skill directory not found"));
-    }
-    ensure_dir_within_root(&enabled_path, skills_dir)?;
-    if let Some(parent) = disabled_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if disabled_path.exists() {
+    let (source, source_root, destination, dest_root) = if enabled {
+        (&disabled_path, disabled_dir, &enabled_path, skills_dir)
+    } else {
+        (&enabled_path, skills_dir, &disabled_path, disabled_dir)
+    };
+    let source_exists = std::fs::symlink_metadata(source).is_ok();
+    let dest_exists = std::fs::symlink_metadata(destination).is_ok();
+    if source_exists && dest_exists {
         return Err(AppError::invalid_input(
-            "Skill already exists in skills-disabled directory",
+            "Both enabled and disabled entries exist; resolve duplicate explicitly",
         ));
     }
-    std::fs::rename(&enabled_path, &disabled_path)?;
+    if !source_exists {
+        if dest_exists {
+            ensure_dir_within_root(destination, dest_root)?;
+            return Ok(());
+        }
+        return Err(AppError::not_found("Skill directory not found"));
+    }
+    ensure_dir_within_root(source, source_root)?;
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    rename_directory_no_replace(source, destination)?;
+    if enabled {
+        if let Some(parent) = source.parent() {
+            cleanup_empty_dirs_up_to(parent, source_root);
+        }
+    }
     Ok(())
 }
 
@@ -640,6 +602,67 @@ pub fn recover_incomplete_project_skill_operations(
         // Do not trust database-stored paths alone to authorize a write.
         if expected.as_deref() != Some(recovery_root.as_path()) {
             notices.push(format!("Unsafe recovery path for operation {}", op.id));
+            continue;
+        }
+        if op.kind == "toggle" && matches!(op.phase.as_str(), "preparing" | "publishing") {
+            let Some(ref dest) = op.destination_path else {
+                notices.push(format!("Toggle {} missing destination", op.id));
+                continue;
+            };
+            let destination = Path::new(dest);
+            let destination_parent = destination
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok());
+            if !matches!((&project_root, &destination_parent),
+                (Some(project), Some(parent)) if parent.starts_with(project))
+                || op.observed_identity.is_none()
+            {
+                notices.push(format!(
+                    "Toggle {} recovery destination or identity is invalid",
+                    op.id,
+                ));
+                continue;
+            }
+            let expected_identity = op.observed_identity.as_deref();
+            let original = project_target_identity_string(&target);
+            let moved = project_target_identity_string(destination);
+            if original.as_deref() == expected_identity && moved.is_none() {
+                let _ = store.transition_project_skill_operation(
+                    &op.id,
+                    &op.phase,
+                    "recovery_available",
+                );
+                notices.push(format!(
+                    "Interrupted toggle {} left original entry at {}",
+                    op.id,
+                    target.display(),
+                ));
+                continue;
+            }
+            if op.phase == "publishing"
+                && original.is_none()
+                && moved.as_deref() == expected_identity
+            {
+                if rename_directory_no_replace(destination, &target).is_ok() {
+                    let _ = store.transition_project_skill_operation(
+                        &op.id,
+                        "publishing",
+                        "recovery_available",
+                    );
+                    notices.push(format!(
+                        "Restored interrupted toggle {} to {}",
+                        op.id,
+                        target.display(),
+                    ));
+                    continue;
+                }
+            }
+            notices.push(format!(
+                "Toggle {} requires manual recovery: original {}, destination {}",
+                op.id,
+                target.display(),
+                destination.display(),
+            ));
             continue;
         }
         if !matches!(op.phase.as_str(), "preparing" | "publishing") {
@@ -1555,6 +1578,8 @@ pub fn update_managed_project_copy(
             new_tree_oid: Some(wanted.tree_oid.clone()),
             created_at: now,
             updated_at: now,
+            destination_path: None,
+            observed_identity: None,
         })
         .map_err(AppError::db)?;
     std::fs::create_dir(&operation_root)?;
@@ -1767,6 +1792,162 @@ pub async fn update_project_skill_from_center(
     .await?
 }
 
+/// The single Core entry point for a project Skill path migration. Toggle
+/// changes location, not managementState; neither source content nor a
+/// central-Store match is treated as an adoption authorization.
+pub fn toggle_project_skill_internal(
+    store: &SkillStore,
+    project_id: &str,
+    skill_relative_path: &str,
+    agent: &str,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let _lock = RepoLock::acquire_foreground("project Skill toggle").map_err(AppError::io)?;
+    ensure_safe_skill_relative_path(skill_relative_path)?;
+    let record = get_project_record(store, project_id)?;
+    ensure_workspace_path_exists(&record)?;
+    let (enabled_root, disabled_root) = resolve_agent_skills_roots(store, &record, agent)
+        .ok_or_else(|| AppError::not_found(format!("Unknown agent: {agent}")))?;
+    let disabled_root = disabled_root.ok_or_else(|| {
+        AppError::invalid_input("This workspace does not support disabling skills")
+    })?;
+    let (source, source_root, destination, destination_root) = if enabled {
+        (
+            disabled_root.join(skill_relative_path),
+            &disabled_root,
+            enabled_root.join(skill_relative_path),
+            &enabled_root,
+        )
+    } else {
+        (
+            enabled_root.join(skill_relative_path),
+            &enabled_root,
+            disabled_root.join(skill_relative_path),
+            &disabled_root,
+        )
+    };
+    let old = std::fs::symlink_metadata(&source);
+    let new = std::fs::symlink_metadata(&destination);
+    if old.is_err() && new.is_ok() {
+        ensure_dir_within_root(&destination, destination_root)?;
+        if store
+            .get_project_skill_deployment(project_id, &source.to_string_lossy())
+            .map_err(AppError::db)?
+            .is_some()
+        {
+            return Err(AppError::invalid_input(
+                "Skill was moved but its deployment record is stale; recovery required",
+            ));
+        }
+        return Ok(());
+    }
+    if old.is_err() {
+        return Err(AppError::not_found("Skill directory not found"));
+    }
+    if new.is_ok() {
+        return Err(AppError::invalid_input(
+            "Both enabled and disabled Skill entries exist; refusing to remove either",
+        ));
+    }
+    ensure_dir_within_root(&source, source_root)?;
+    let observed = project_target_identity(&source)
+        .ok_or_else(|| AppError::not_found("Skill target disappeared"))?;
+    let observed_string = format!("{}:{}", observed.0, observed.1);
+    let old_record = store
+        .get_project_skill_deployment(project_id, &source.to_string_lossy())
+        .map_err(AppError::db)?;
+    if let Some(ref row) = old_record {
+        if row.management_state != "managed" {
+            return Err(AppError::invalid_input("Skill is not under management"));
+        }
+        if row.mode == "symlink" && !managed_symlink_matches(row, &source) {
+            return Err(AppError::invalid_input("Manager Symlink identity changed"));
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let recovery_root = create_project_recovery_root(&source, &id)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    store
+        .insert_project_skill_operation(&ProjectSkillOperationRecord {
+            id: id.clone(),
+            project_id: project_id.to_string(),
+            skill_id: old_record
+                .as_ref()
+                .map(|r| r.skill_id.clone())
+                .unwrap_or_else(|| "external-unmanaged".to_string()),
+            deployment_id: old_record.as_ref().map(|r| r.id.clone()),
+            kind: "toggle".to_string(),
+            phase: "preparing".to_string(),
+            target_path: source.to_string_lossy().to_string(),
+            recovery_root: recovery_root.to_string_lossy().to_string(),
+            base_tree_oid: old_record.as_ref().and_then(|r| r.base_tree_oid.clone()),
+            new_tree_oid: None,
+            created_at: now,
+            updated_at: now,
+            destination_path: Some(destination.to_string_lossy().to_string()),
+            observed_identity: Some(observed_string.clone()),
+        })
+        .map_err(AppError::db)?;
+    std::fs::create_dir_all(&recovery_root)?;
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    store
+        .transition_project_skill_operation(&id, "preparing", "publishing")
+        .map_err(AppError::db)?;
+    if project_target_identity(&source) != Some(observed) {
+        let _ = store.transition_project_skill_operation(&id, "publishing", "needs_attention");
+        return Err(AppError::invalid_input(
+            "Skill changed before enable/disable rename",
+        ));
+    }
+    rename_directory_no_replace(&source, &destination)?;
+    if project_target_identity(&destination) != Some(observed) {
+        let restored = std::fs::symlink_metadata(&source).is_err()
+            && rename_directory_no_replace(&destination, &source).is_ok();
+        let _ = store.transition_project_skill_operation(
+            &id,
+            "publishing",
+            if restored {
+                "recovery_available"
+            } else {
+                "needs_attention"
+            },
+        );
+        return Err(AppError::invalid_input(
+            "Enabled/disabled entry changed during move; recovery required",
+        ));
+    }
+    if let Err(err) = store.commit_project_skill_toggle(&id) {
+        let restored = std::fs::symlink_metadata(&source).is_err()
+            && project_target_identity(&destination) == Some(observed)
+            && rename_directory_no_replace(&destination, &source).is_ok();
+        let _ = store.transition_project_skill_operation(
+            &id,
+            "publishing",
+            if restored {
+                "recovery_available"
+            } else {
+                "needs_attention"
+            },
+        );
+        return Err(AppError::invalid_input(format!(
+            "Skill toggle DB commit failed ({err}); previous entry {} at {}",
+            if restored {
+                "restored"
+            } else {
+                "retained for recovery"
+            },
+            if restored {
+                source.display().to_string()
+            } else {
+                destination.display().to_string()
+            },
+        )));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn toggle_project_skill(
     store: State<'_, Arc<SkillStore>>,
@@ -1777,41 +1958,7 @@ pub async fn toggle_project_skill(
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        ensure_safe_skill_relative_path(&skill_relative_path)?;
-
-        let record = store
-            .get_project_by_id(&project_id)
-            .map_err(AppError::db)?
-            .ok_or_else(|| AppError::not_found("Workspace not found"))?;
-
-        let (skills_dir, disabled_dir) = resolve_agent_skills_roots(&store, &record, &agent)
-            .ok_or_else(|| AppError::not_found(format!("Unknown agent: {}", agent)))?;
-        let disabled_dir = disabled_dir.ok_or_else(|| {
-            AppError::invalid_input("This workspace does not support disabling skills")
-        })?;
-
-        set_project_skill_enabled_state(&skills_dir, &disabled_dir, &skill_relative_path, enabled)?;
-        let (old, new) = if enabled {
-            (
-                disabled_dir.join(&skill_relative_path),
-                skills_dir.join(&skill_relative_path),
-            )
-        } else {
-            (
-                skills_dir.join(&skill_relative_path),
-                disabled_dir.join(&skill_relative_path),
-            )
-        };
-        if std::fs::symlink_metadata(&old).is_err() && std::fs::symlink_metadata(&new).is_ok() {
-            store
-                .move_project_skill_deployment(
-                    &project_id,
-                    &old.to_string_lossy(),
-                    &new.to_string_lossy(),
-                )
-                .map_err(AppError::db)?;
-        }
-        Ok(())
+        toggle_project_skill_internal(&store, &project_id, &skill_relative_path, &agent, enabled)
     })
     .await?
 }
@@ -1842,17 +1989,21 @@ fn quarantine_project_skill_delete(
     project_id: &str,
     target: &Path,
     explicit_force: bool,
+    authorized_identity: Option<(u64, u64)>,
 ) -> Result<(), AppError> {
     let _lock = RepoLock::acquire_foreground("project Skill delete").map_err(AppError::io)?;
     let meta = std::fs::symlink_metadata(target)?;
-    if meta.file_type().is_symlink() {
-        // A Symlink contains no owned file bytes; removing it never follows
-        // the link into the source directory.
-        return remove_workspace_skill_target(target);
-    }
-    if !meta.is_dir() {
+    let is_link = meta.file_type().is_symlink();
+    if !is_link && !meta.is_dir() {
         return Err(AppError::invalid_input(
-            "Skill deletion target is not a directory",
+            "Skill deletion target is not a directory or Symlink",
+        ));
+    }
+    let original_identity = project_target_identity(target)
+        .ok_or_else(|| AppError::not_found("Deletion target disappeared"))?;
+    if authorized_identity.is_some_and(|identity| identity != original_identity) {
+        return Err(AppError::invalid_input(
+            "Destructive authorization expired: target identity changed before isolation",
         ));
     }
     let old = store
@@ -1861,22 +2012,33 @@ fn quarantine_project_skill_delete(
     if !explicit_force {
         let row = old.as_ref().ok_or_else(|| {
             AppError::invalid_input(
-                "Cannot delete unowned external Skill without explicit target authorization",
+                "Cannot delete an external Skill without explicit target authorization",
             )
         })?;
-        if row.management_state != "managed" || row.mode != "copy" {
-            return Err(AppError::invalid_input("Not an authorized managed Copy"));
+        if row.management_state != "managed" {
+            return Err(AppError::invalid_input("Skill is not under management"));
         }
-        let tree = row
-            .base_tree_oid
-            .as_deref()
-            .ok_or_else(|| AppError::invalid_input("Missing trusted deletion baseline"))?;
-        if !git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, target)
-            .map_err(AppError::io)?
-        {
-            return Err(AppError::invalid_input(
-                "Project Skill differs from its managed baseline; explicit deletion required",
-            ));
+        if is_link {
+            if !managed_symlink_matches(row, target) {
+                return Err(AppError::invalid_input(
+                    "External or replaced Symlink requires explicit authorization",
+                ));
+            }
+        } else {
+            if row.mode != "copy" {
+                return Err(AppError::invalid_input("Not an authorized managed Copy"));
+            }
+            let tree = row
+                .base_tree_oid
+                .as_deref()
+                .ok_or_else(|| AppError::invalid_input("Missing trusted deletion baseline"))?;
+            if !git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, target)
+                .map_err(AppError::io)?
+            {
+                return Err(AppError::invalid_input(
+                    "Project Skill differs from its managed baseline; explicit deletion required",
+                ));
+            }
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -1916,6 +2078,8 @@ fn quarantine_project_skill_delete(
             new_tree_oid: None,
             created_at: now,
             updated_at: now,
+            destination_path: None,
+            observed_identity: None,
         })
         .map_err(AppError::db)?;
     std::fs::create_dir(&recovery_root)?;
@@ -1923,15 +2087,42 @@ fn quarantine_project_skill_delete(
         .transition_project_skill_operation(&id, "preparing", "publishing")
         .map_err(AppError::db)?;
     rename_directory_no_replace(target, &backup)?;
+    // The authorized inode must still be the one that was isolated.
+    if !is_same_isolated_target(&backup, original_identity) {
+        let restored = std::fs::symlink_metadata(target).is_err()
+            && rename_directory_no_replace(&backup, target).is_ok();
+        let _ = store.transition_project_skill_operation(
+            &id,
+            "publishing",
+            if restored {
+                "recovery_available"
+            } else {
+                "needs_attention"
+            },
+        );
+        return Err(AppError::invalid_input(format!(
+            "Isolated deletion target differs from authorized object; {} at {}",
+            if restored {
+                "restored"
+            } else {
+                "retained for recovery"
+            },
+            if restored { target } else { backup.as_path() }.display(),
+        )));
+    }
     // Between the preflight and rename, an external writer may alter a Copy.
     // In ordinary removal that is a conflict, not implicit permission.
-    let moved_is_clean = old
-        .as_ref()
-        .and_then(|o| o.base_tree_oid.as_deref())
-        .is_some_and(|tree| {
-            git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, &backup)
-                .unwrap_or(false)
-        });
+    let moved_is_clean = if is_link {
+        old.as_ref()
+            .is_some_and(|record| managed_symlink_matches(record, &backup))
+    } else {
+        old.as_ref()
+            .and_then(|row| row.base_tree_oid.as_deref())
+            .is_some_and(|tree| {
+                git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, &backup)
+                    .unwrap_or(false)
+            })
+    };
     if !explicit_force && !moved_is_clean {
         let restored = rename_directory_no_replace(&backup, target).is_ok();
         let _ = store.transition_project_skill_operation(
@@ -2012,7 +2203,7 @@ pub fn delete_project_skill_internal(
     if !force {
         ensure_removable(store, &record, &target)?;
     }
-    quarantine_project_skill_delete(store, &project_id, &target, force)
+    quarantine_project_skill_delete(store, &project_id, &target, force, None)
 }
 
 /// Remove exactly the copy a removal plan named. Without `force`, the copy is
@@ -2040,9 +2231,10 @@ pub fn remove_planned_project_copy(
             "The planned Skill target was replaced; destructive authorization is stale",
         ));
     }
-    if let Some(existing) = store.get_project_skill_deployment(
-        project_id, &path.to_string_lossy(),
-    ).map_err(AppError::db)? {
+    if let Some(existing) = store
+        .get_project_skill_deployment(project_id, &path.to_string_lossy())
+        .map_err(AppError::db)?
+    {
         if existing.skill_id != target.skill_id {
             return Err(AppError::invalid_input(
                 "Planned SkillId differs from the registered deployment owner",
@@ -2052,7 +2244,13 @@ pub fn remove_planned_project_copy(
     if !force {
         ensure_removable(store, &record, &path)?;
     }
-    quarantine_project_skill_delete(store, project_id, &path, force)
+    quarantine_project_skill_delete(
+        store,
+        project_id,
+        &path,
+        force,
+        target.expected_target_identity,
+    )
 }
 
 /// Refuse unless what sits at `target` is a scanned project skill whose
@@ -2549,6 +2747,9 @@ pub fn apply_project_deploy(
                 path_at_commit: Some(version.path_at_commit.clone()),
                 created_at: now,
                 updated_at: now,
+
+                symlink_target: None,
+                symlink_identity: None,
             };
             store
                 .insert_project_skill_operation(&ProjectSkillOperationRecord {
@@ -2564,6 +2765,9 @@ pub fn apply_project_deploy(
                     new_tree_oid: Some(version.tree_oid.clone()),
                     created_at: now,
                     updated_at: now,
+
+                    destination_path: None,
+                    observed_identity: None,
                 })
                 .map_err(AppError::db)?;
             std::fs::create_dir(&operation_root)?;
@@ -2630,6 +2834,40 @@ pub fn apply_project_deploy(
                 sync_engine::ReplacePolicy::NoClobber,
             )
             .map_err(AppError::io)?;
+            if matches!(mode, sync_engine::SyncMode::Symlink) {
+                // Only register links actually created by this operation.
+                // Existing historical/external links do not become owned
+                // merely by pointing at the central Skill directory.
+                let now = chrono::Utc::now().timestamp_millis();
+                let record = ProjectSkillDeploymentRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    project_id: target.project_id.clone(),
+                    skill_id: target.skill_id.clone(),
+                    target_path: target.path.clone(),
+                    agent: target.agent.clone(),
+                    mode: "symlink".to_string(),
+                    management_state: "managed".to_string(),
+                    management_origin: "deployed_by_manager".to_string(),
+                    version_match: "mutable_link".to_string(),
+                    base_commit_oid: None,
+                    base_tree_oid: None,
+                    path_at_commit: None,
+                    symlink_target: std::fs::read_link(&target_dir)
+                        .ok()
+                        .map(|link| link.to_string_lossy().to_string()),
+                    symlink_identity: project_target_identity_string(&target_dir),
+                    created_at: now,
+                    updated_at: now,
+                };
+                if let Err(err) = store.mark_project_skill_symlink_managed(&record) {
+                    // A write failure does not grant management. Remove only
+                    // the exact manager-created link, never a replaced target.
+                    if managed_symlink_matches(&record, &target_dir) {
+                        let _ = std::fs::remove_file(&target_dir);
+                    }
+                    return Err(AppError::db(err));
+                }
+            }
         }
     }
     Ok(())
@@ -2652,6 +2890,61 @@ fn project_target_identity(path: &Path) -> Option<(u64, u64)> {
     Some((m.len(), time.as_nanos() as u64))
 }
 
+fn is_same_isolated_target(path: &Path, authorized: (u64, u64)) -> bool {
+    project_target_identity(path) == Some(authorized)
+}
+
+/// Refuse symlinked recovery directories rather than following them into a
+/// location outside the project. Caller holds the repository operation lock.
+fn create_project_recovery_root(entry: &Path, operation_id: &str) -> Result<PathBuf, AppError> {
+    let parent = entry
+        .parent()
+        .ok_or_else(|| AppError::invalid_input("Skill entry has no parent"))?;
+    let recovery_home = parent.join(".atm-recovery");
+    match std::fs::symlink_metadata(&recovery_home) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(AppError::invalid_input(
+                "Unsafe project Skill recovery directory",
+            ))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&recovery_home)?
+        }
+        Err(error) => return Err(AppError::io(error)),
+    };
+    let operation_root = recovery_home.join(operation_id);
+    if std::fs::symlink_metadata(&operation_root).is_ok() {
+        return Err(AppError::invalid_input(
+            "Project Skill recovery operation already exists",
+        ));
+    }
+    Ok(operation_root)
+}
+
+fn project_target_identity_string(path: &Path) -> Option<String> {
+    project_target_identity(path).map(|(dev, ino)| format!("{dev}:{ino}"))
+}
+
+/// A matching central path is never proof of management. Only a manager-owned
+/// deployment row and its exact link text/object identity confer authority.
+fn managed_symlink_matches(row: &ProjectSkillDeploymentRecord, path: &Path) -> bool {
+    if row.management_state != "managed" || row.mode != "symlink" {
+        return false;
+    }
+    let Some(expected_target) = row.symlink_target.as_deref() else {
+        return false;
+    };
+    let Some(expected_identity) = row.symlink_identity.as_deref() else {
+        return false;
+    };
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        && project_target_identity_string(path).as_deref() == Some(expected_identity)
+        && std::fs::read_link(path)
+            .ok()
+            .is_some_and(|text| text.to_string_lossy() == expected_target)
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct ProjectRemovalTarget {
     pub skill_id: String,
@@ -2667,45 +2960,6 @@ pub struct ProjectRemovalTarget {
     expected_target_identity: Option<(u64, u64)>,
 }
 
-/// Only a hash match proves a copy holds nothing of its own; `center_newer`
-/// is reached after the hashes already differed (see pushSkillToCenterAndAlign
-/// in ProjectDetail.tsx). A symlink holds no content of its own either.
-///
-/// A link is safe only when it resolves to the matched library skill's own
-/// directory, i.e. it is our deployment. A link the user made to somewhere
-/// else is their configuration, whatever its target holds.
-fn removal_is_safe(
-    variant: &project_scanner::ProjectSkillInfo,
-    matched: Option<&SkillRecord>,
-    sync_status: &str,
-) -> bool {
-    let is_link =
-        std::fs::symlink_metadata(&variant.path).is_ok_and(|meta| meta.file_type().is_symlink());
-    if is_link {
-        return matched.is_some_and(|managed| {
-            match (
-                dunce::canonicalize(&variant.path),
-                dunce::canonicalize(&managed.central_path),
-            ) {
-                (Ok(link_target), Ok(library_copy)) => link_target == library_copy,
-                _ => false,
-            }
-        });
-    }
-    // A real copy needs equal hashes *and* nothing the library copy lacks:
-    // the hash skips `.gitignore`, `.git` and links, so equal hashes alone
-    // would let those go with it (#593). An unreadable entry is not proof of
-    // absence, so an error here is unsafe too.
-    sync_status == "in_sync"
-        && matched.is_some_and(|managed| {
-            crate::core::removals::removed_paths(
-                Path::new(&variant.path),
-                Path::new(&managed.central_path),
-            )
-            .is_ok_and(|extra| extra.is_empty())
-        })
-}
-
 /// Only a recorded manager-owned Copy can be removed without explicit force.
 /// An externally installed equal-content directory has no management consent.
 fn managed_removal_is_safe(
@@ -2713,12 +2967,18 @@ fn managed_removal_is_safe(
     project_id: &str,
     variant: &project_scanner::ProjectSkillInfo,
     matched: Option<&SkillRecord>,
-    sync_status: &str,
+    _sync_status: &str,
 ) -> Result<bool, AppError> {
     let is_link =
         std::fs::symlink_metadata(&variant.path).is_ok_and(|m| m.file_type().is_symlink());
     if is_link {
-        return Ok(removal_is_safe(variant, matched, sync_status));
+        let row = store
+            .get_project_skill_deployment(project_id, &variant.path)
+            .map_err(AppError::db)?;
+        return Ok(row.as_ref().is_some_and(|row| {
+            matched.is_some_and(|managed| managed.id == row.skill_id)
+                && managed_symlink_matches(row, Path::new(&variant.path))
+        }));
     }
     let row = store
         .get_project_skill_deployment(project_id, &variant.path)
@@ -3467,10 +3727,15 @@ mod tests {
         symlink(&central_skill, skills_root.join(relative_path)).unwrap();
         symlink(&central_skill, disabled_root.join(relative_path)).unwrap();
 
-        set_project_skill_enabled_state(&skills_root, &disabled_root, relative_path, false)
-            .unwrap();
+        assert!(set_project_skill_enabled_state(
+            &skills_root,
+            &disabled_root,
+            relative_path,
+            false,
+        )
+        .is_err());
 
-        assert!(!skills_root.join(relative_path).exists());
+        assert!(skills_root.join(relative_path).exists());
         assert!(disabled_root.join(relative_path).exists());
         assert!(central_skill.exists());
         assert!(central_skill.join("SKILL.md").is_file());
@@ -3499,10 +3764,13 @@ mod tests {
         symlink(&central_skill, skills_root.join(relative_path)).unwrap();
         symlink(&central_skill, disabled_root.join(relative_path)).unwrap();
 
-        set_project_skill_enabled_state(&skills_root, &disabled_root, relative_path, true).unwrap();
+        assert!(
+            set_project_skill_enabled_state(&skills_root, &disabled_root, relative_path, true,)
+                .is_err()
+        );
 
         assert!(skills_root.join(relative_path).exists());
-        assert!(!disabled_root.join(relative_path).exists());
+        assert!(disabled_root.join(relative_path).exists());
         assert!(central_skill.exists());
         assert!(central_skill.join("SKILL.md").is_file());
     }
@@ -4055,6 +4323,9 @@ mod project_plan_tests {
                 new_tree_oid: record.base_tree_oid.clone(),
                 created_at: now,
                 updated_at: now,
+
+                destination_path: None,
+                observed_identity: None,
             })
             .unwrap();
         fx.store
@@ -4120,6 +4391,9 @@ mod project_plan_tests {
                 new_tree_oid: Some(version.tree_oid.clone()),
                 created_at: now,
                 updated_at: now,
+
+                destination_path: None,
+                observed_identity: None,
             })
             .unwrap();
         git_skill_versions::materialize_skill_version(
@@ -4219,6 +4493,289 @@ mod project_plan_tests {
                 .management_state,
             "managed"
         );
+    }
+
+    #[test]
+    fn post_isolation_identity_check_rejects_replaced_target() {
+        let tmp = tempdir().unwrap();
+        let owned = tmp.path().join("owned");
+        let foreign = tmp.path().join("foreign");
+        let backup = tmp.path().join("isolated");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        fs::write(owned.join("owner"), "original").unwrap();
+        fs::write(foreign.join("user"), "external").unwrap();
+        let approved = project_target_identity(&owned).unwrap();
+        let parked = tmp.path().join("original-parked");
+        rename_directory_no_replace(&owned, &parked).unwrap();
+        rename_directory_no_replace(&foreign, &owned).unwrap();
+        rename_directory_no_replace(&owned, &backup).unwrap();
+        assert!(!is_same_isolated_target(&backup, approved));
+        assert!(backup.join("user").is_file());
+        assert!(parked.join("owner").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toggle_rejects_recovery_directory_symlink() {
+        let fx = fixture(&["claude_code"]);
+        let source = fx.repo.join(".claude/skills/demo");
+        write_skill(&source, "demo", "external");
+        let elsewhere = fx._tmp.path().join("outside");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, source.parent().unwrap().join(".atm-recovery"))
+            .unwrap();
+        assert!(toggle_project_skill_internal(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            false,
+        )
+        .is_err());
+        assert!(source.join("SKILL.md").is_file());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_manager_symlink_to_same_central_path_is_not_owned() {
+        let fx = fixture(&["claude_code"]);
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert!(managed_symlink_matches(&row, &target));
+        let parked = fx.repo.join("previous-manager-link");
+        rename_directory_no_replace(&target, &parked).unwrap();
+        std::os::unix::fs::symlink(&demo.central_path, &target).unwrap();
+        assert!(!managed_symlink_matches(&row, &target));
+        let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(!plan[0].safe);
+        assert!(delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .is_err());
+        assert!(std::fs::symlink_metadata(&target).is_ok());
+        assert!(std::fs::symlink_metadata(&parked).is_ok());
+        assert!(Path::new(&demo.central_path).join("SKILL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_registration_database_failure_never_deletes_foreign_target() {
+        let fx = fixture(&["claude_code"]);
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        let conn = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_managed_link
+             BEFORE INSERT ON project_skill_deployments
+             BEGIN SELECT RAISE(ABORT, 'injected registration failure'); END;",
+        )
+        .unwrap();
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert!(apply_project_deploy(&fx.store, &plan).is_err());
+        let target = fx.repo.join(".claude/skills/demo");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "manager-created link rolls back on failed ownership registration"
+        );
+        assert!(
+            Path::new(&demo.central_path).join("SKILL.md").is_file(),
+            "never delete the central Skill target"
+        );
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn managed_copy_toggle_database_failure_restores_original_and_preserves_deployment() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let enabled = fx.repo.join(".claude/skills/demo");
+        let disabled = fx.repo.join(".claude/skills-disabled/demo");
+        let before = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &enabled.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let conn = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_toggle BEFORE UPDATE OF target_path
+             ON project_skill_deployments
+             BEGIN SELECT RAISE(ABORT, 'injected toggle commit failure'); END;",
+        )
+        .unwrap();
+        assert!(toggle_project_skill_internal(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            false,
+        )
+        .is_err());
+        assert!(enabled.join("SKILL.md").is_file());
+        assert!(std::fs::symlink_metadata(&disabled).is_err());
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &disabled.to_string_lossy(),)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &enabled.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .id,
+            before.id
+        );
+        let ops = fx.store.pending_project_skill_operations().unwrap();
+        assert!(ops
+            .iter()
+            .any(|op| op.kind == "toggle" && op.phase == "recovery_available"));
+
+        conn.execute_batch("DROP TRIGGER refuse_toggle").unwrap();
+        toggle_project_skill_internal(&fx.store, &fx.project_id, "demo", "claude_code", false)
+            .unwrap();
+        assert!(!enabled.exists());
+        assert!(disabled.join("SKILL.md").exists());
+        let updated = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &disabled.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, before.id);
+        assert_eq!(updated.base_tree_oid, before.base_tree_oid);
+        toggle_project_skill_internal(&fx.store, &fx.project_id, "demo", "claude_code", true)
+            .unwrap();
+        assert!(enabled.join("SKILL.md").exists());
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &enabled.to_string_lossy(),)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn interrupted_toggle_recovery_restores_original_without_claiming_management() {
+        let fx = fixture(&["claude_code"]);
+        let source = fx.repo.join(".claude/skills/demo");
+        let destination = fx.repo.join(".claude/skills-disabled/demo");
+        write_skill(&source, "demo", "external skill");
+        let identity = project_target_identity_string(&source).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let recovery = source.parent().unwrap().join(".atm-recovery").join(&id);
+        std::fs::create_dir_all(&recovery).unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: "external-unmanaged".to_string(),
+                deployment_id: None,
+                kind: "toggle".to_string(),
+                phase: "preparing".to_string(),
+                target_path: source.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: None,
+                created_at: now,
+                updated_at: now,
+                destination_path: Some(destination.to_string_lossy().to_string()),
+                observed_identity: Some(identity),
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        rename_directory_no_replace(&source, &destination).unwrap();
+        assert!(!source.exists());
+        let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let messages = recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert!(messages
+            .iter()
+            .any(|msg| msg.contains(&id) && msg.contains("Restored")));
+        assert!(source.join("SKILL.md").is_file());
+        assert!(!destination.exists());
+        assert!(
+            restarted
+                .get_project_skill_deployment(&fx.project_id, &source.to_string_lossy(),)
+                .unwrap()
+                .is_none(),
+            "moving an external folder must not grant ownership"
+        );
+        // Idempotent on a second scan.
+        recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert!(source.join("SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmanaged_symlink_is_never_deleted_automatically_by_toggle_or_remove() {
+        let fx = fixture(&["claude_code"]);
+        let demo = library_skill(&fx, "s-demo", "demo", "# Demo");
+        let enabled = fx.repo.join(".claude/skills/demo");
+        let disabled = fx.repo.join(".claude/skills-disabled/demo");
+        fs::create_dir_all(enabled.parent().unwrap()).unwrap();
+        fs::create_dir_all(disabled.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&demo.central_path, &enabled).unwrap();
+        std::os::unix::fs::symlink(&demo.central_path, &disabled).unwrap();
+        assert!(toggle_project_skill_internal(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            true,
+        )
+        .is_err());
+        assert!(std::fs::symlink_metadata(&enabled).is_ok());
+        assert!(std::fs::symlink_metadata(&disabled).is_ok());
+        assert!(delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .is_err());
+        assert!(std::fs::symlink_metadata(&enabled).is_ok());
+        assert!(std::fs::symlink_metadata(&disabled).is_ok());
     }
 
     #[test]
@@ -4947,9 +5504,38 @@ mod project_plan_tests {
             );
         }
 
-        // Our own deployment (a link to the library copy) is still removable.
+        // A manually created link is external even when it points at the
+        // exact central Skill. Only an actually manager-created link is owned.
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&demo.central_path, &link).unwrap();
+        let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
+        assert!(!plan[0].safe);
+        assert!(delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        )
+        .is_err());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        fs::remove_file(&link).unwrap();
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let record = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &link.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.mode, "symlink");
+        assert_eq!(record.management_origin, "deployed_by_manager");
+        assert!(managed_symlink_matches(&record, &link));
         let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
         assert!(plan[0].safe);
         delete_project_skill_internal(

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 11;
+const LATEST_VERSION: u32 = 12;
 
 /// Run all pending migrations on the database.
 ///
@@ -58,6 +58,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         8 => migrate_v8_to_v9(conn),
         9 => migrate_v9_to_v10(conn),
         10 => migrate_v10_to_v11(conn),
+        11 => migrate_v11_to_v12(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -392,6 +393,63 @@ fn migrate_v10_to_v11(conn: &Connection) -> Result<()> {
             ON project_skill_operations(target_path)
             WHERE phase IN ('preparing', 'publishing', 'needs_attention');
         CREATE INDEX IF NOT EXISTS idx_project_skill_operation_project
+            ON project_skill_operations(project_id, updated_at);
+        ",
+    )?;
+    Ok(())
+}
+
+/// v11→v12: distinguish enable/disable path movement from Git content
+/// replacement and store verifiable manager-created Symlink identity. Earlier
+/// v11 stores are migrated in place; in-progress operations retain their rows.
+fn migrate_v11_to_v12(conn: &Connection) -> Result<()> {
+    // Some historical tests and reconstructed databases replay migrations
+    // against a newer schema. Keep this upgrade safely replayable.
+    add_column_if_missing(conn, "project_skill_deployments", "symlink_target", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "project_skill_deployments",
+        "symlink_identity",
+        "TEXT",
+    )?;
+    if has_column(conn, "project_skill_operations", "destination_path")?
+        && has_column(conn, "project_skill_operations", "observed_identity")?
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        DROP INDEX IF EXISTS idx_project_skill_active_operation;
+        DROP INDEX IF EXISTS idx_project_skill_operation_project;
+        CREATE TABLE project_skill_operations_v12 (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            deployment_id TEXT,
+            kind TEXT NOT NULL CHECK(kind IN ('deploy', 'update', 'delete', 'toggle')),
+            phase TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            recovery_root TEXT NOT NULL,
+            base_tree_oid TEXT,
+            new_tree_oid TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            destination_path TEXT,
+            observed_identity TEXT
+        );
+        INSERT INTO project_skill_operations_v12
+          (id, project_id, skill_id, deployment_id, kind, phase,
+           target_path, recovery_root, base_tree_oid, new_tree_oid,
+           created_at, updated_at)
+        SELECT id, project_id, skill_id, deployment_id, kind, phase,
+               target_path, recovery_root, base_tree_oid, new_tree_oid,
+               created_at, updated_at FROM project_skill_operations;
+        DROP TABLE project_skill_operations;
+        ALTER TABLE project_skill_operations_v12 RENAME TO project_skill_operations;
+        CREATE UNIQUE INDEX idx_project_skill_active_operation
+            ON project_skill_operations(target_path)
+            WHERE phase IN ('preparing', 'publishing', 'needs_attention');
+        CREATE INDEX idx_project_skill_operation_project
             ON project_skill_operations(project_id, updated_at);
         ",
     )?;

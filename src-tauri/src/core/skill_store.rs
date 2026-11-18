@@ -71,6 +71,8 @@ pub struct ProjectSkillOperationRecord {
     pub new_tree_oid: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub destination_path: Option<String>,
+    pub observed_identity: Option<String>,
 }
 
 /// One row of the pending-conflict projection (merge-engine design §4).
@@ -134,6 +136,8 @@ pub struct ProjectSkillDeploymentRecord {
     pub base_commit_oid: Option<String>,
     pub base_tree_oid: Option<String>,
     pub path_at_commit: Option<String>,
+    pub symlink_target: Option<String>,
+    pub symlink_identity: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1219,15 +1223,18 @@ impl SkillStore {
     // ── Project Copy filesystem operation journal ──
 
     pub fn insert_project_skill_operation(&self, op: &ProjectSkillOperationRecord) -> Result<()> {
-        if op.phase != "preparing" || !matches!(op.kind.as_str(), "deploy" | "update" | "delete") {
+        if op.phase != "preparing"
+            || !matches!(op.kind.as_str(), "deploy" | "update" | "delete" | "toggle")
+        {
             anyhow::bail!("invalid initial project Skill operation");
         }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO project_skill_operations (
                 id, project_id, skill_id, deployment_id, kind, phase, target_path,
-                recovery_root, base_tree_oid, new_tree_oid, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                recovery_root, base_tree_oid, new_tree_oid, created_at, updated_at,
+                destination_path, observed_identity
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 op.id,
                 op.project_id,
@@ -1240,7 +1247,9 @@ impl SkillStore {
                 op.base_tree_oid,
                 op.new_tree_oid,
                 op.created_at,
-                op.updated_at
+                op.updated_at,
+                op.destination_path,
+                op.observed_identity
             ],
         )?;
         Ok(())
@@ -1306,8 +1315,8 @@ impl SkillStore {
             "INSERT INTO project_skill_deployments (
                 id, project_id, skill_id, target_path, agent, mode, management_state,
                 management_origin, version_match, base_commit_oid, base_tree_oid,
-                path_at_commit, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                path_at_commit, created_at, updated_at, symlink_target, symlink_identity
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(target_path) DO UPDATE SET
                  agent=excluded.agent, mode=excluded.mode,
                  management_state=excluded.management_state,
@@ -1316,7 +1325,9 @@ impl SkillStore {
                  base_commit_oid=excluded.base_commit_oid,
                  base_tree_oid=excluded.base_tree_oid,
                  path_at_commit=excluded.path_at_commit,
-                 updated_at=excluded.updated_at
+                 updated_at=excluded.updated_at,
+                 symlink_target=excluded.symlink_target,
+                 symlink_identity=excluded.symlink_identity
              WHERE project_skill_deployments.project_id=excluded.project_id
                AND project_skill_deployments.skill_id=excluded.skill_id
                AND project_skill_deployments.mode='copy'
@@ -1335,7 +1346,9 @@ impl SkillStore {
                 row.base_tree_oid,
                 row.path_at_commit,
                 row.created_at,
-                row.updated_at
+                row.updated_at,
+                row.symlink_target,
+                row.symlink_identity
             ],
         )?;
         if modified != 1 {
@@ -1441,11 +1454,98 @@ impl SkillStore {
         Ok(())
     }
 
+    /// Complete a filesystem move and its deployment path change atomically.
+    /// The operation log is not management authority: for unmanaged entries,
+    /// no deployment record is ever created.
+    pub fn commit_project_skill_toggle(&self, operation_id: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (project_id, old_path, new_path, deployment_id): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT project_id, target_path, destination_path, deployment_id
+                 FROM project_skill_operations
+                 WHERE id=?1 AND kind='toggle' AND phase='publishing'",
+            params![operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let present_new: i64 = tx.query_row(
+            "SELECT count(*) FROM project_skill_deployments
+             WHERE target_path=?1",
+            params![new_path],
+            |r| r.get(0),
+        )?;
+        if present_new != 0 {
+            anyhow::bail!("toggle destination belongs to an existing deployment");
+        }
+        match deployment_id {
+            Some(id) => {
+                let moved = tx.execute(
+                    "UPDATE project_skill_deployments
+                     SET target_path=?4, updated_at=?5
+                     WHERE id=?1 AND project_id=?2 AND target_path=?3
+                       AND management_state='managed'",
+                    params![
+                        id,
+                        project_id,
+                        old_path,
+                        new_path,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+                if moved != 1 {
+                    anyhow::bail!("managed Skill path changed during toggle");
+                }
+            }
+            None => {
+                let occupied: i64 = tx.query_row(
+                    "SELECT count(*) FROM project_skill_deployments
+                     WHERE project_id=?1 AND target_path=?2",
+                    params![project_id, old_path],
+                    |r| r.get(0),
+                )?;
+                if occupied != 0 {
+                    anyhow::bail!("unmanaged toggle cannot move a managed deployment");
+                }
+            }
+        }
+        let count = tx.execute(
+            "UPDATE project_skill_operations
+             SET phase='complete', updated_at=?2
+             WHERE id=?1 AND kind='toggle' AND phase='publishing'",
+            params![operation_id, chrono::Utc::now().timestamp_millis()],
+        )?;
+        if count != 1 {
+            anyhow::bail!("toggle operation changed during commit");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_project_skill_symlink_managed(
+        &self,
+        row: &ProjectSkillDeploymentRecord,
+    ) -> Result<()> {
+        if row.mode != "symlink"
+            || row.symlink_target.is_none()
+            || row.symlink_identity.is_none()
+            || row.management_state != "managed"
+            || row.management_origin != "deployed_by_manager"
+        {
+            anyhow::bail!("invalid manager-created Symlink ownership record");
+        }
+        self.insert_project_skill_deployment(row)
+    }
+
     pub fn pending_project_skill_operations(&self) -> Result<Vec<ProjectSkillOperationRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, project_id, skill_id, deployment_id, kind, phase, target_path,
-                    recovery_root, base_tree_oid, new_tree_oid, created_at, updated_at
+                    recovery_root, base_tree_oid, new_tree_oid, created_at, updated_at,
+                    destination_path, observed_identity
              FROM project_skill_operations WHERE phase != 'complete'
              ORDER BY created_at, id",
         )?;
@@ -1463,6 +1563,8 @@ impl SkillStore {
                 new_tree_oid: r.get(9)?,
                 created_at: r.get(10)?,
                 updated_at: r.get(11)?,
+                destination_path: r.get(12)?,
+                observed_identity: r.get(13)?,
             })
         })?;
         entries
@@ -1481,8 +1583,8 @@ impl SkillStore {
             "INSERT INTO project_skill_deployments
                 (id, project_id, skill_id, target_path, agent, mode, management_state,
                  management_origin, version_match, base_commit_oid, base_tree_oid,
-                 path_at_commit, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 path_at_commit, created_at, updated_at, symlink_target, symlink_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(target_path) DO UPDATE SET
                  agent = excluded.agent,
                  mode = excluded.mode,
@@ -1492,7 +1594,9 @@ impl SkillStore {
                  base_commit_oid = excluded.base_commit_oid,
                  base_tree_oid = excluded.base_tree_oid,
                  path_at_commit = excluded.path_at_commit,
-                 updated_at = excluded.updated_at
+                 updated_at = excluded.updated_at,
+                 symlink_target = excluded.symlink_target,
+                 symlink_identity = excluded.symlink_identity
              WHERE project_skill_deployments.project_id = excluded.project_id
                AND project_skill_deployments.skill_id = excluded.skill_id
                AND project_skill_deployments.management_state = 'managed'
@@ -1511,7 +1615,9 @@ impl SkillStore {
                 row.base_tree_oid,
                 row.path_at_commit,
                 row.created_at,
-                row.updated_at
+                row.updated_at,
+                row.symlink_target,
+                row.symlink_identity
             ],
         )?;
         if affected != 1 {
@@ -1529,7 +1635,7 @@ impl SkillStore {
         conn.query_row(
             "SELECT id, project_id, skill_id, target_path, agent, mode, management_state,
                     management_origin, version_match, base_commit_oid, base_tree_oid,
-                    path_at_commit, created_at, updated_at
+                    path_at_commit, created_at, updated_at, symlink_target, symlink_identity
              FROM project_skill_deployments WHERE project_id = ?1 AND target_path = ?2",
             params![project_id, target_path],
             |row| {
@@ -1548,6 +1654,8 @@ impl SkillStore {
                     path_at_commit: row.get(11)?,
                     created_at: row.get(12)?,
                     updated_at: row.get(13)?,
+                    symlink_target: row.get(14)?,
+                    symlink_identity: row.get(15)?,
                 })
             },
         )

@@ -388,8 +388,11 @@ export function Sidebar() {
             alt="logo"
             className="w-[24px] h-[24px] shrink-0"
           />
-          <span className="text-[17px] font-semibold text-secondary tracking-tight truncate leading-[22px]">
-            {t("app.name")}
+          <span
+            className="min-w-0 text-[17px] font-semibold text-secondary tracking-tight truncate leading-[22px]"
+            title={t("app.name")}
+          >
+            Toolchain Manager
           </span>
         </div>
 

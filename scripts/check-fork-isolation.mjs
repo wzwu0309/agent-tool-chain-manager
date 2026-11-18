@@ -23,14 +23,20 @@ test("fork application identity is independent of upstream", () => {
   assert.match(read("src-tauri/Cargo.lock"), /name = "agent-toolchain-manager"/);
 });
 
-test("renamed fork retains GitHub and UI branding", () => {
+test("fork retains GitHub and UI branding", () => {
   assert.match(read("index.html"), /<title>Agent Toolchain Manager<\/title>/);
   for (const p of ["README.md", "README.zh-CN.md"]) {
     assert.match(read(p), /<h1 align="center">Agent Toolchain Manager<\/h1>/);
     assert.match(read(p), /wzwu0309\/agent-toolchain-manager/);
   }
-  const central = read("src-tauri/src/core/central_repo.rs");
-  assert.match(central, /fn prior_fork_needs_manual_migration/);
+});
+
+test("manage-skills can use PR ref during pre-merge verification", () => {
+  const ui = read("src/components/AgentControlSetupCard.tsx");
+  assert.match(ui, /VITE_MANAGE_SKILLS_REF/);
+  assert.match(ui, /\|\| "main"/);
+  assert.match(ui, /wzwu0309\/agent-toolchain-manager\/tree/);
+  assert.match(ui, /skills\/manage-skills/);
 });
 
 test("fork store, config, keyring and CLI bridge do not reuse upstream identities", () => {
@@ -39,6 +45,7 @@ test("fork store, config, keyring and CLI bridge do not reuse upstream identitie
   assert.match(central, /\.join\("\.agent-toolchain-manager"\)/);
   assert.match(central, /\.join\("agent-toolchain-manager"\)/);
   assert.doesNotMatch(central.split("mod tests {")[0], /\.join\("\.skills-manager"\)/);
+  assert.doesNotMatch(central.split("mod tests {")[0], /\.agent-skills/);
   assert.match(read("src-tauri/src/core/git_credentials.rs"), /KEYRING_SERVICE: &str = "agent-toolchain-manager-git-backup"/);
   const bridge = read("src-tauri/src/core/cli_bridge.rs");
   assert.match(bridge, /"agent-toolchain-manager-cli"/);

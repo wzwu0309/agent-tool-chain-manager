@@ -875,50 +875,15 @@ pub fn clear_repoint_from() -> Result<()> {
     Ok(())
 }
 
-/// Avoid silently replacing a pre-rename fork library with an empty one.
-/// The old store is from this fork, not the upstream Skills Manager.
-fn prior_fork_needs_manual_migration(
-    new_store: &Path,
-    previous_store: &Path,
-    new_config: &Path,
-    previous_config: &Path,
-) -> bool {
-    !new_store.exists()
-        && !new_config.exists()
-        && (previous_store.exists() || previous_config.is_file())
-}
-
 /// `allow_migration`: whether this process may carry out a pending move. Only
 /// the app at startup and an explicit CLI `repo set-path` do; everything else
 /// keeps running against the library where it is.
 pub fn ensure_central_repo(allow_migration: bool) -> Result<()> {
-    let config_state = load_config_state();
-    if matches!(&config_state, ConfigState::Missing) && !base_dir_override_active() {
-        let new_store = home_base_dir();
-        let previous_store = new_store.with_file_name(".agent-tool-chain-manager");
-        let new_config = config_file_path();
-        let previous_config = new_config
-            .parent()
-            .and_then(Path::parent)
-            .map(|root| root.join("agent-tool-chain-manager").join(CONFIG_FILE_NAME));
-        if previous_config.as_deref().is_some_and(|old| {
-            prior_fork_needs_manual_migration(&new_store, &previous_store, &new_config, old)
-        }) {
-            return Err(anyhow!(
-                concat!(
-                    "Previous Agent Tool Chain Manager data detected. ",
-                    "Quit the old app and manually move ",
-                    "~/.agent-tool-chain-manager to ~/.agent-toolchain-manager ",
-                    "before launching the renamed app. No user data was changed."
-                )
-            ));
-        }
-    }
     // A config file that exists but cannot be used means the app is about to
     // run against the default location even though the user configured (and
     // populated) another one. Never let that pass silently — it presents as
     // "the library was rebuilt empty, all skills lost" (#228 review).
-    let mut config = match config_state {
+    let mut config = match load_config_state() {
         ConfigState::Valid(config) => {
             if let Some(raw) = config.repo_path.as_deref() {
                 if let Err(err) = normalize_path(raw) {
@@ -968,29 +933,6 @@ pub fn ensure_central_repo(allow_migration: bool) -> Result<()> {
         }
         downgrade_library_lease();
     }
-    // Re-resolve: a completed move changed the base.
-    let current_base = base_dir();
-
-    // Legacy `.agent-skills` migration must run before create_dir_all below:
-    // it renames entries into `current_base` and skips ones that already
-    // exist, so pre-created empty dirs would silently swallow it (the old
-    // ordering made this branch dead code).
-    let legacy_path = dirs::home_dir().map(|home| home.join(".agent-skills"));
-    if let Some(old_path) = legacy_path {
-        if old_path.exists() && !current_base.join("skills").exists() {
-            log::info!("Migrating from old path {:?}", old_path);
-            fs::create_dir_all(&current_base)?;
-            if let Ok(entries) = fs::read_dir(&old_path) {
-                for entry in entries.flatten() {
-                    let dest = current_base.join(entry.file_name());
-                    if !dest.exists() {
-                        let _ = fs::rename(entry.path(), &dest);
-                    }
-                }
-            }
-        }
-    }
-
     let dirs = [skills_dir(), scenarios_dir(), cache_dir(), logs_dir()];
     for d in &dirs {
         fs::create_dir_all(d)?;
@@ -1011,38 +953,6 @@ mod tests {
         assert_eq!(home_base_dir(), tmp.path().join(".agent-toolchain-manager"));
         assert_ne!(home_base_dir(), tmp.path().join(".skills-manager"));
         set_test_home_dir_override(None);
-    }
-
-    #[test]
-    fn renamed_fork_blocks_implicit_empty_store_when_old_data_exists() {
-        let temp = tempfile::tempdir().unwrap();
-        let old_store = temp.path().join(".agent-tool-chain-manager");
-        let new_store = temp.path().join(".agent-toolchain-manager");
-        let old_config = temp.path().join("old/repo-config.json");
-        let new_config = temp.path().join("new/repo-config.json");
-        assert!(!prior_fork_needs_manual_migration(
-            &new_store, &old_store, &new_config, &old_config
-        ));
-        fs::create_dir_all(&old_store).unwrap();
-        assert!(prior_fork_needs_manual_migration(
-            &new_store, &old_store, &new_config, &old_config
-        ));
-        fs::create_dir_all(&new_store).unwrap();
-        assert!(!prior_fork_needs_manual_migration(
-            &new_store, &old_store, &new_config, &old_config
-        ));
-        fs::remove_dir_all(&old_store).unwrap();
-        fs::remove_dir_all(&new_store).unwrap();
-        fs::create_dir_all(old_config.parent().unwrap()).unwrap();
-        fs::write(&old_config, "{}").unwrap();
-        assert!(prior_fork_needs_manual_migration(
-            &new_store, &old_store, &new_config, &old_config
-        ));
-        fs::create_dir_all(new_config.parent().unwrap()).unwrap();
-        fs::write(&new_config, "{}").unwrap();
-        assert!(!prior_fork_needs_manual_migration(
-            &new_store, &old_store, &new_config, &old_config
-        ));
     }
 
     // ── migrate_repo_if_needed (#252) ──

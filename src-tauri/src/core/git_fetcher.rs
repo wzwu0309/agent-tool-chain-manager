@@ -2156,6 +2156,19 @@ mod tests {
     }
 
     #[test]
+    fn pr_branch_url_resolves_to_current_manage_skills_subdir() {
+        let refs = parse_remote_ref_names(
+            "aaaa\trefs/heads/main\nbbbb\trefs/heads/fix/issue-1-fork-release-isolation\n",
+        );
+        let (branch, subpath) = split_tree_path_with_known_refs(
+            "fix/issue-1-fork-release-isolation/skills/manage-skills",
+            &refs,
+        );
+        assert_eq!(branch, "fix/issue-1-fork-release-isolation");
+        assert_eq!(subpath.as_deref(), Some("skills/manage-skills"));
+    }
+
+    #[test]
     fn a_slash_tag_still_resolves_when_no_branch_matches() {
         let refs = parse_remote_ref_names(
             "aaaa\trefs/heads/master\nbbbb\trefs/tags/release/v0.8.0\n",

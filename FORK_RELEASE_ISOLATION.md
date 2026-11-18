@@ -29,61 +29,6 @@ to preserve format compatibility. Repository metadata paths and Git backup
 references are not the upstream application's *default* home directory and
 must not be renamed just for cosmetic branding.
 
-## Naming migration from the previous fork (Issue #8)
-
-The previous development fork was called **Agent Tool Chain Manager**, with
-the default library at `~/.agent-tool-chain-manager`, a CLI called
-`agent-tool-chain-manager-cli`, and OS configuration under
-`agent-tool-chain-manager/`. The renamed fork uses **Agent Toolchain Manager**,
-`~/.agent-toolchain-manager`, and `agent-toolchain-manager-cli`.
-
-The **Tauri bundle identifier is unchanged**:
-`com.wzwu0309.agenttoolchainmanager`. This is a naming migration within the
-fork, not a new installation of upstream Skills Manager.
-
-Do **not** run the old application and new one at the same time. The app will
-refuse to initialize a *new, empty* default library when it detects the previous
-fork's directory or configuration without the new paths. It does **not**
-silently copy, rename, remove or overwrite previous data.
-
-For an existing default-path installation:
-
-1. Quit the old App and any CLI process using the library. Back up the original
-   directory, including `skills-manager.db`, its WAL and SHM, and `.secret.key`.
-2. Verify `~/.agent-toolchain-manager` does **not** already exist; if it does,
-   investigate it before changing anything.
-3. On the same disk, rename the **whole** directory, not just the database:
-
-   ```sh
-   if [ -e "$HOME/.agent-toolchain-manager" ]; then
-     echo "Target already exists; inspect it before proceeding"
-   elif [ ! -d "$HOME/.agent-tool-chain-manager" ]; then
-     echo "Previous store not found; do not move anything"
-   else
-     mv "$HOME/.agent-tool-chain-manager" "$HOME/.agent-toolchain-manager"
-     sqlite3 "$HOME/.agent-toolchain-manager/skills-manager.db" 'PRAGMA quick_check;'
-   fi
-   ```
-
-   Do not execute the move while either app is open.
-
-4. Build and run the renamed app. It republishes the **new** CLI bridge
-   (`bin/agent-toolchain-manager-cli`). The old binary may remain in `bin/`;
-   **do not run it against the renamed store**. Review old agent instructions
-   or PATH entries that still reference the predecessor name.
-5. Review any project/symlink deployments or explicitly customized library
-   location. Absolute paths stored in a database or symlink may require
-   repointing through the existing library migration logic. A previous
-   `repo-config.json` with a custom library location needs separate review and
-   careful migration into the new OS config namespace.
-6. The keyring service has a new name. Existing Git backup credentials in
-   the old service are **not** copied or deleted automatically; re-enter backup
-   remote credentials through the renamed app if necessary.
-
-To roll back, quit the renamed app before restoring a verified backup or
-renaming the library back. Do not run the old app against the new data while
-its schema or contents may have evolved.
-
 ## Updates and release security
 
 Application update checking, download and installation are deliberately
@@ -101,7 +46,7 @@ Windows/Linux artifact verification, release permissions, and an install,
 side-by-side and rollback test. Do not reuse upstream updater public keys or
 upstream signing credentials.
 
-## CLI compatibility and migration
+## CLI identity and upstream compatibility
 
 New scripts and bundled manage-skills instructions use
 agent-toolchain-manager-cli. The old skills-manager-cli name is **not** an
@@ -112,6 +57,23 @@ Existing upstream data remains in place. No migration/cleanup of upstream
 data is performed by this patch, and this patch never clears original Agent
 global directories. To roll back, exit/remove the fork application and keep
 the upstream installation and its data as-is.
+
+## Pre-merge manage-skills verification
+
+The dashboard installs `manage-skills` from this repository. Before the PR is
+merged, `main` still contains the upstream-era CLI name, so a test of this
+PR must use the branch version of `skills/manage-skills` rather than `main`.
+The build supports a compile-time ref override:
+
+```sh
+VITE_MANAGE_SKILLS_REF=fix/issue-1-fork-release-isolation npm run tauri:build -- --bundles app
+```
+
+Install and deploy this PR's skill only in an isolated test profile. Verify
+that `SKILL.md` references `agent-toolchain-manager-cli` and the bridge under
+`~/.agent-toolchain-manager/bin`, not any upstream CLI. After merging, omit the
+override so releases load the skill from `main` as normal. The app does not
+silently install a skill, and the override does not change app storage paths.
 
 ## Verification before closing this issue
 

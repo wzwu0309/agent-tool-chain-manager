@@ -875,6 +875,33 @@ export interface GitSkillHistory {
 export const getProjectSkillGitHistory = (skillId: string, limit = 25) =>
   invoke<GitSkillHistory>("get_project_skill_git_history", { skillId, limit });
 
+/** Read-only, ownership-checked preview for exactly one managed Project Copy. */
+export interface ManagedCopyUpdatePlan {
+  projectId: string;
+  skillRelativePath: string;
+  deploymentId: string;
+  skillId: string;
+  agent: string;
+  targetPath: string;
+  baseCommitOid: string;
+  baseTreeOid: string;
+  targetCommitOid: string;
+  targetTreeOid: string;
+  willChangeContent: boolean;
+  willChangeVersion: boolean;
+  uncommittedCentralChangesExcluded: boolean;
+}
+
+export const planProjectSkillCopyUpdate = (
+  projectId: string, skillRelativePath: string, agent: string, commitOid?: string
+) => invoke<ManagedCopyUpdatePlan>("plan_project_skill_copy_update", {
+  projectId, skillRelativePath, agent, commitOid: commitOid ?? null,
+});
+
+/** Server revalidates all target, DeploymentId, Commit and Tree fields. */
+export const applyProjectSkillCopyUpdate = (preview: ManagedCopyUpdatePlan) =>
+  invoke<void>("apply_project_skill_copy_update", { preview });
+
 export interface ProjectSkillExportRecovery {
   operation_id: string;
   phase: string;

@@ -7,6 +7,7 @@ import {
   LayoutGrid,
   List,
   RefreshCw,
+  GitCommitHorizontal,
   FileText,
   Download,
   Upload,
@@ -47,6 +48,7 @@ import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { useRevealProjectFolder } from "../hooks/useRevealProjectFolder";
 import { AddSkillsSheet } from "../components/AddSkillsSheet";
+import { ProjectCopyVersionDialog } from "../components/ProjectCopyVersionDialog";
 const projectLastUsedAgentsKey = (projectId: string) =>
   `project_last_used_export_agents:${projectId}`;
 
@@ -146,6 +148,7 @@ export function ProjectDetail() {
   const [search, setSearch] = useState("");
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
   const [detailSkill, setDetailSkill] = useState<ProjectSkillGroup | null>(null);
+  const [copyVersionSkill, setCopyVersionSkill] = useState<ProjectSkillGroup | null>(null);
   const [docContent, setDocContent] = useState<string | null>(null);
   const [docLoading, setDocLoading] = useState(false);
   const [centerDocContent, setCenterDocContent] = useState<string | null>(null);
@@ -1462,6 +1465,17 @@ export function ProjectDetail() {
                             )}
                           </button>
                         )}
+                        {skill.centerSkillIds.length === 1 && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setCopyVersionSkill(skill); }}
+                            disabled={isUpdatingCenter || isUpdatingProject}
+                            className="rounded-md px-2 py-1 text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+                            title={t("project.gitUpdate.title")}
+                            aria-label={t("project.gitUpdate.title")}
+                          >
+                            <GitCommitHorizontal className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                         {canUpdateProject && (
                           <button
                             onClick={(e) => { e.stopPropagation(); handleUpdateProject(skill); }}
@@ -1616,6 +1630,17 @@ export function ProjectDetail() {
                           )}
                         </button>
                       )}
+                      {skill.centerSkillIds.length === 1 && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setCopyVersionSkill(skill); }}
+                          disabled={isUpdatingCenter || isUpdatingProject}
+                          className="rounded-md p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+                          title={t("project.gitUpdate.title")}
+                          aria-label={t("project.gitUpdate.title")}
+                        >
+                          <GitCommitHorizontal className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                       {canUpdateProject && (
                         <button
                           onClick={(e) => { e.stopPropagation(); handleUpdateProject(skill); }}
@@ -1680,6 +1705,18 @@ export function ProjectDetail() {
           centerDocContent={centerDocContent}
           centerDocLoading={centerDocLoading}
           onClose={() => setDetailSkill(null)}
+        />
+      )}
+
+      {copyVersionSkill && id && (
+        <ProjectCopyVersionDialog
+          projectId={id}
+          skillName={copyVersionSkill.name}
+          variants={copyVersionSkill.variants}
+          onClose={() => setCopyVersionSkill(null)}
+          onApplied={async () => {
+            await Promise.all([loadSkills(), refreshProjects(), loadRecoveries()]);
+          }}
         />
       )}
 

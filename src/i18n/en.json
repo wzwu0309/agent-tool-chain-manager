@@ -925,6 +925,26 @@
     }
   },
   "project": {
+    "gitUpdate": {
+      "title": "Update managed Copy version",
+      "scope": "Update one Agent's managed Copy. External files and locally modified copies are never overwritten.",
+      "agent": "Agent target",
+      "commit": "Target Git Commit",
+      "loading": "Loading committed versions…",
+      "latest": "Current Git HEAD (latest committed)",
+      "dirty": "Central Store has uncommitted changes. They are excluded from this update.",
+      "checking": "Checking ownership, saved baseline and local edits…",
+      "preview": "Read-only update preview",
+      "path": "Target",
+      "from": "Saved Commit",
+      "to": "Selected Commit",
+      "contentChanges": "Project Copy content will change. Existing content is retained in a recovery directory.",
+      "versionOnly": "Content is identical; only the saved Commit baseline will advance.",
+      "current": "The selected version is already recorded.",
+      "retainedBackup": "The previous Copy is retained for recovery; it is not automatically cleaned.",
+      "apply": "Apply checked update",
+      "success": "Managed Copy updated."
+    },
         "recovery": {
       "title": "Recovery records",
       "readOnly": "Read-only history. Recovery copies are never cleaned automatically; inspect contents before any manual action.",

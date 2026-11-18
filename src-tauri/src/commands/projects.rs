@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::core::audit_log::AuditDraft;
@@ -1759,10 +1759,11 @@ fn plan_gui_project_skill_deploy(
 /// Read-only Core preview for CLI updates. Both this preview and the
 /// mutating update below use the same Git Tree/DeploymentId authority.
 /// An update always revalidates under RepoLock: this preview is NOT a lease.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedCopyUpdatePlan {
     pub project_id: String,
+    pub skill_relative_path: String,
     pub deployment_id: String,
     pub skill_id: String,
     pub agent: String,
@@ -1848,6 +1849,7 @@ pub fn plan_managed_project_copy_update(
     let dirty = git_skill_versions::has_uncommitted_central_changes(&root).map_err(AppError::io)?;
     Ok(ManagedCopyUpdatePlan {
         project_id: project_id.to_owned(),
+        skill_relative_path: skill_relative_path.to_owned(),
         deployment_id: row.id,
         skill_id: row.skill_id,
         agent: agent.to_owned(),
@@ -1860,6 +1862,79 @@ pub fn plan_managed_project_copy_update(
         target_tree_oid: target.tree_oid,
         uncommitted_central_changes_excluded: dirty,
     })
+}
+
+/// UI applies only the precise version and target that were explicitly
+/// previewed. Caller-controlled preview fields are never an authority: replan
+/// against registered Project/Agent and validate all target and baseline IDs,
+/// then commit using the existing RepoLock-protected Core update.
+pub fn apply_managed_project_copy_update_plan(
+    store: &SkillStore,
+    preview: &ManagedCopyUpdatePlan,
+) -> Result<(), AppError> {
+    let actual = plan_managed_project_copy_update(
+        store,
+        &preview.project_id,
+        &preview.skill_relative_path,
+        &preview.agent,
+        Some(&preview.target_commit_oid),
+    )?;
+    if actual.deployment_id != preview.deployment_id
+        || actual.skill_id != preview.skill_id
+        || actual.target_path != preview.target_path
+        || actual.base_commit_oid != preview.base_commit_oid
+        || actual.base_tree_oid != preview.base_tree_oid
+        || actual.target_commit_oid != preview.target_commit_oid
+        || actual.target_tree_oid != preview.target_tree_oid
+    {
+        return Err(AppError::invalid_input(
+            "Managed Copy preview is stale or does not belong to the selected target",
+        ));
+    }
+    update_managed_project_copy_checked(
+        store,
+        &preview.project_id,
+        Path::new(&actual.target_path),
+        Some(&actual.target_commit_oid),
+        Some((
+            &actual.deployment_id,
+            &actual.base_tree_oid,
+            &actual.base_commit_oid,
+        )),
+    )
+}
+
+#[tauri::command]
+pub async fn plan_project_skill_copy_update(
+    store: State<'_, Arc<SkillStore>>,
+    project_id: String,
+    skill_relative_path: String,
+    agent: String,
+    commit_oid: Option<String>,
+) -> Result<ManagedCopyUpdatePlan, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_managed_project_copy_update(
+            &store,
+            &project_id,
+            &skill_relative_path,
+            &agent,
+            commit_oid.as_deref(),
+        )
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn apply_project_skill_copy_update(
+    store: State<'_, Arc<SkillStore>>,
+    preview: ManagedCopyUpdatePlan,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_managed_project_copy_update_plan(&store, &preview)
+    })
+    .await?
 }
 
 /// Update a manager-owned Copy using the *recorded Git subtree* as the
@@ -5766,6 +5841,210 @@ mod project_plan_tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.base_commit_oid, advanced.base_commit_oid);
+    }
+
+    #[test]
+    fn gui_copy_preview_applies_only_selected_historical_git_commit() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "V1");
+        commit_library(&fx);
+        let first =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &skill.id, None)
+                .unwrap();
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nV2 committed",
+        )
+        .unwrap();
+        commit_library(&fx);
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nUNCOMMITTED CENTRAL EDIT",
+        )
+        .unwrap();
+
+        let preview = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap();
+        assert!(preview.will_change_content);
+        assert!(preview.will_change_version);
+        assert!(preview.uncommitted_central_changes_excluded);
+        assert_eq!(preview.base_commit_oid, first.commit_oid);
+        assert_eq!(preview.skill_relative_path, "demo");
+
+        let target = Path::new(&preview.target_path);
+        let original = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        assert!(original.contains("V1"));
+        assert!(
+            apply_managed_project_copy_update_plan(
+                &fx.store,
+                &ManagedCopyUpdatePlan {
+                    target_path: fx
+                        .repo
+                        .join(".claude/skills/foreign")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..preview.clone()
+                }
+            )
+            .is_err(),
+            "client-supplied path cannot redirect a checked update"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            original
+        );
+
+        apply_managed_project_copy_update_plan(&fx.store, &preview).unwrap();
+        let new_bytes = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        assert!(new_bytes.contains("V2 committed"), "{new_bytes}");
+        assert!(!new_bytes.contains("UNCOMMITTED"));
+        let committed = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &preview.target_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.id, preview.deployment_id);
+        assert_eq!(
+            committed.base_commit_oid.as_deref(),
+            Some(preview.target_commit_oid.as_str())
+        );
+        assert_eq!(
+            committed.base_tree_oid.as_deref(),
+            Some(preview.target_tree_oid.as_str())
+        );
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &committed.id,
+            &preview.target_commit_oid,
+        )
+        .unwrap();
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.kind == "update"
+                && op.phase == "cleanup_pending"
+                && Path::new(&op.recovery_root)
+                    .join("previous/SKILL.md")
+                    .is_file()));
+    }
+
+    #[test]
+    fn gui_copy_preview_refuses_stale_baseline_and_local_project_edits() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "V1");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        fs::write(Path::new(&skill.central_path).join("SKILL.md"), "V2").unwrap();
+        commit_library(&fx);
+
+        let preview = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap();
+        // Another legitimately authorized update advances the baseline
+        // between the GUI's preview and its "Apply" button.
+        update_managed_project_copy(
+            &fx.store,
+            &fx.project_id,
+            Path::new(&preview.target_path),
+            None,
+        )
+        .unwrap();
+        let err = apply_managed_project_copy_update_plan(&fx.store, &preview).unwrap_err();
+        assert!(err.to_string().contains("stale"));
+
+        let target = Path::new(&preview.target_path);
+        fs::write(target.join("SKILL.md"), "PROJECT USER EDIT").unwrap();
+        let err = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("local edits"));
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "PROJECT USER EDIT"
+        );
+    }
+
+    #[test]
+    fn gui_copy_preview_refuses_unmanaged_copy_and_symlink() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "V1");
+        commit_library(&fx);
+        let target = fx.repo.join(".claude/skills/demo");
+        write_skill(&target, "demo", "UNMANAGED EXTERNAL");
+        assert!(plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not managed"));
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("UNMANAGED EXTERNAL"));
+
+        fs::remove_dir_all(&target).unwrap();
+        fx.store.set_setting("sync_mode", "symlink").unwrap();
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let err = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Only an explicitly managed Copy"));
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

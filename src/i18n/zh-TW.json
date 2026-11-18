@@ -914,6 +914,26 @@
     }
   },
   "project": {
+    "gitUpdate": {
+      "title": "更新受管 Copy 版本",
+      "scope": "僅更新單一 Agent 的受管 Copy；不會覆寫外部目錄或本機修改。",
+      "agent": "目標 Agent",
+      "commit": "目標 Git Commit",
+      "loading": "正在載入已提交版本…",
+      "latest": "目前 Git HEAD（最新提交）",
+      "dirty": "中央儲存庫有未提交修改，本次更新不包含這些內容。",
+      "checking": "正在檢查管理權、持久基線和本機修改…",
+      "preview": "唯讀更新預覽",
+      "path": "目標目錄",
+      "from": "原始 Commit",
+      "to": "目標 Commit",
+      "contentChanges": "專案 Copy 內容將改變。舊副本會保留在復原目錄。",
+      "versionOnly": "內容相同，僅推進持久化 Commit 基線。",
+      "current": "已是選取的版本。",
+      "retainedBackup": "舊 Copy 保留供復原，不會自動清理。",
+      "apply": "確認安全更新",
+      "success": "受管 Copy 已更新。"
+    },
         "recovery": {
       "title": "復原記錄",
       "readOnly": "僅供檢視。復原副本不會自動清理；手動操作前請先檢查內容。",

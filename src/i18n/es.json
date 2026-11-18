@@ -905,6 +905,26 @@
     }
   },
   "project": {
+    "gitUpdate": {
+      "title": "Actualizar versión del Copy administrado",
+      "scope": "Actualiza un solo Copy administrado por agente. No se sobrescribirán archivos externos o con ediciones locales.",
+      "agent": "Agente de destino",
+      "commit": "Commit Git de destino",
+      "loading": "Cargando versiones confirmadas…",
+      "latest": "HEAD actual de Git (último commit)",
+      "dirty": "Hay cambios sin confirmar en el almacén central; no se incluirán.",
+      "checking": "Comprobando autorización, versión guardada y cambios locales…",
+      "preview": "Vista previa de solo lectura",
+      "path": "Destino",
+      "from": "Commit guardado",
+      "to": "Commit elegido",
+      "contentChanges": "El contenido cambiará. La copia anterior se conservará para recuperación.",
+      "versionOnly": "El contenido no cambia: solo se actualizará el Commit registrado.",
+      "current": "Esta versión ya está registrada.",
+      "retainedBackup": "La copia anterior no se elimina automáticamente.",
+      "apply": "Confirmar actualización segura",
+      "success": "Copy administrado actualizado."
+    },
         "recovery": {
       "title": "Registros de recuperación",
       "readOnly": "Solo lectura. Las copias de recuperación no se eliminan automáticamente; revisa su contenido antes de actuar.",

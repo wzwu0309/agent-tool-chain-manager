@@ -1,0 +1,305 @@
+{
+  "title": "Issue #4 stage A isolated CLI validation",
+  "date": "2026-11-18T05:40:51.501Z",
+  "commit": "9e3f70dd4081f49fe9c7b428b8863188ea859f1a",
+  "worktree": "<worktree>",
+  "platform": "darwin arm64",
+  "node": "v24.21.0",
+  "binary": "<worktree>/src-tauri/target/debug/agent-toolchain-manager-cli",
+  "fixture": "<fixture> (ignored .npm-cache subdirectory)",
+  "baselineGitStatus": " M scripts/validation/issue-4-stage-a.mjs\n M validation/issue-4-stage-a.md\n",
+  "results": [
+    {
+      "id": "SM-01",
+      "status": "PASS",
+      "detail": "local import created central asset without deployment",
+      "evidence": {
+        "store": "<fixture>/home/.agent-toolchain-manager",
+        "central": "<fixture>/home/.agent-toolchain-manager/skills/issue4-fixture",
+        "originalSha256": "cf677759942c2662d244c98056e1fa4fa9a172d6e9f8f35f65574b0adbb18a4c",
+        "synced": false
+      }
+    },
+    {
+      "id": "SM-02",
+      "status": "PASS",
+      "detail": "A-only dry-run and two-agent deploy left project B untouched",
+      "evidence": {
+        "projectA": "<fixture>/project-a",
+        "projectB": "<fixture>/project-b",
+        "changedPairs": 2,
+        "projectADirs": [
+          ".",
+          ".claude",
+          ".claude/skills",
+          ".claude/skills/issue4-fixture",
+          ".codex",
+          ".codex/skills",
+          ".codex/skills/issue4-fixture"
+        ],
+        "projectBDirs": [
+          "."
+        ]
+      }
+    },
+    {
+      "id": "SM-03",
+      "status": "FAIL",
+      "detail": "documented project directory mismatch: codex actual=.codex/skills expected=.agents/skills",
+      "evidence": {
+        "criterion": "official product documentation plus actual CLI deployment paths; no Agent subprocess required",
+        "documentationCheckedAt": "2026-11-18",
+        "comparisons": [
+          {
+            "agent": "codex",
+            "relativeDir": ".agents/skills",
+            "doc": "https://learn.chatgpt.com/docs/build-skills#where-to-save-skills",
+            "actualRelativeDir": ".codex/skills",
+            "matches": false
+          },
+          {
+            "agent": "claude_code",
+            "relativeDir": ".claude/skills",
+            "doc": "https://code.claude.com/docs/en/skills#choose-where-skills-load",
+            "actualRelativeDir": ".claude/skills",
+            "matches": true
+          }
+        ],
+        "observed": [
+          {
+            "agent": "codex",
+            "relativeDir": ".codex/skills",
+            "path": "<fixture>/project-a/.codex/skills/issue4-fixture"
+          },
+          {
+            "agent": "claude_code",
+            "relativeDir": ".claude/skills",
+            "path": "<fixture>/project-a/.claude/skills/issue4-fixture"
+          }
+        ],
+        "detectedByManager": 2
+      }
+    },
+    {
+      "id": "SM-04",
+      "status": "PASS",
+      "detail": "both project symlinks resolve to the installed central Skill",
+      "evidence": {
+        "links": [
+          {
+            "path": "<fixture>/project-a/.codex/skills/issue4-fixture",
+            "target": "<fixture>/home/.agent-toolchain-manager/skills/issue4-fixture"
+          },
+          {
+            "path": "<fixture>/project-a/.claude/skills/issue4-fixture",
+            "target": "<fixture>/home/.agent-toolchain-manager/skills/issue4-fixture"
+          }
+        ]
+      }
+    },
+    {
+      "id": "SM-05",
+      "status": "PARTIAL",
+      "detail": "project symlink write changed central asset; no GUI warning confirmation in this CLI-only run",
+      "evidence": {
+        "originalSha256": "cf677759942c2662d244c98056e1fa4fa9a172d6e9f8f35f65574b0adbb18a4c",
+        "changedSha256": "0010a0eb733fd8501de21fe14c9bdd65bc83d7529fd40fcef03c74016d2cbaa0",
+        "sharedWithClaude": true
+      }
+    },
+    {
+      "id": "SM-10",
+      "status": "PASS",
+      "detail": "project workflow did not modify preexisting user-level Agent skill directories in the fake HOME",
+      "evidence": {
+        "agentRoots": [
+          ".codex",
+          ".claude",
+          ".agents"
+        ],
+        "unchanged": true,
+        "projectBEmpty": true
+      }
+    },
+    {
+      "id": "SM-06",
+      "status": "NOT TESTED",
+      "detail": "Issue #4 stage B: reserved for Issue #11 Git Commit/Tree and ownership implementation"
+    },
+    {
+      "id": "SM-07",
+      "status": "NOT TESTED",
+      "detail": "Issue #4 stage B: reserved for Issue #11 Git Commit/Tree and ownership implementation"
+    },
+    {
+      "id": "SM-08",
+      "status": "NOT TESTED",
+      "detail": "Issue #4 stage B: reserved for Issue #11 Git Commit/Tree and ownership implementation"
+    },
+    {
+      "id": "SM-09",
+      "status": "NOT TESTED",
+      "detail": "Issue #4 stage B: reserved for Issue #11 Git Commit/Tree and ownership implementation"
+    }
+  ],
+  "commands": [
+    {
+      "args": [
+        "repo",
+        "status"
+      ],
+      "code": 0,
+      "stdout": "{\"base_dir\":\"<fixture>/home/.agent-toolchain-manager\",\"skills_dir\":\"<fixture>/home/.agent-toolchain-manager/skills\",\"db_path\":\"<fixture>/home/.agent-toolchain-manager/skills-manager.db\",\"metadata_dir\":\"<fixture>/home/.agent-toolchain-manager/skills/.skills-manager\",\"skill_count\":0,\"preset_count\":1,\"active_preset_id\":\"793f5fe4-a59f-4cbf-92e4-e09c01a4bdd8\"}\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "skills",
+        "install",
+        "<fixture>/source/issue4-fixture",
+        "--local"
+      ],
+      "code": 0,
+      "stdout": "{\"ok\":true,\"skill_id\":\"13724d2a-4e5f-4368-a607-3a17cf697b0a\",\"name\":\"issue4-fixture\",\"central_path\":\"<fixture>/home/.agent-toolchain-manager/skills/issue4-fixture\",\"source_type\":\"local\",\"synced\":false,\"preset_id\":null}\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "projects",
+        "add",
+        "<fixture>/project-a"
+      ],
+      "code": 0,
+      "stdout": "{\"ok\":true,\"dry_run\":false,\"project_id\":\"e2571fb8-b0d4-4ce6-bab1-09c8f349218b\",\"name\":\"project-a\",\"path\":\"<fixture>/project-a\",\"created_dirs\":[]}\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "projects",
+        "add",
+        "<fixture>/project-b"
+      ],
+      "code": 0,
+      "stdout": "{\"ok\":true,\"dry_run\":false,\"project_id\":\"966bb56d-61a0-42b4-b10e-f337b1c654c1\",\"name\":\"project-b\",\"path\":\"<fixture>/project-b\",\"created_dirs\":[]}\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "projects",
+        "deploy",
+        "<fixture>/project-a",
+        "issue4-fixture",
+        "--agent",
+        "codex",
+        "--agent",
+        "claude_code",
+        "--dry-run"
+      ],
+      "code": 0,
+      "stdout": "{\"ok\":true,\"action\":\"deploy\",\"dry_run\":true,\"project_id\":\"e2571fb8-b0d4-4ce6-bab1-09c8f349218b\",\"project_path\":\"<fixture>/project-a\",\"agents\":[\"codex\",\"claude_code\"],\"preset\":null,\"skill_count\":1,\"pair_count\":2,\"changed_pairs\":2,\"skills\":[\"issue4-fixture\"],\"targets\":[{\"skill\":\"issue4-fixture\",\"agent\":\"codex\",\"shared_by\":[\"codex\"],\"path\":\"<fixture>/project-a/.codex/skills/issue4-fixture\",\"result\":\"would_create\"},{\"skill\":\"issue4-fixture\",\"agent\":\"claude_code\",\"shared_by\":[\"claude_code\"],\"path\":\"<fixture>/project-a/.claude/skills/issue4-fixture\",\"result\":\"would_create\"}]}\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "projects",
+        "deploy",
+        "<fixture>/project-a",
+        "issue4-fixture",
+        "--agent",
+        "codex",
+        "--agent",
+        "claude_code"
+      ],
+      "code": 0,
+      "stdout": "{\"ok\":true,\"action\":\"deploy\",\"dry_run\":false,\"project_id\":\"e2571fb8-b0d4-4ce6-bab1-09c8f349218b\",\"project_path\":\"<fixture>/project-a\",\"agents\":[\"codex\",\"claude_code\"],\"preset\":null,\"skill_count\":1,\"pair_count\":2,\"changed_pairs\":2,\"skills\":[\"issue4-fixture\"],\"targets\":[{\"skill\":\"issue4-fixture\",\"agent\":\"codex\",\"shared_by\":[\"codex\"],\"path\":\"<fixture>/project-a/.codex/skills/issue4-fixture\",\"result\":\"created\"},{\"skill\":\"issue4-fixture\",\"agent\":\"claude_code\",\"shared_by\":[\"claude_code\"],\"path\":\"<fixture>/project-a/.claude/skills/issue4-fixture\",\"result\":\"created\"}]}\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "projects",
+        "show",
+        "<fixture>/project-a"
+      ],
+      "code": 0,
+      "stdout": "{\"project\":{\"id\":\"e2571fb8-b0d4-4ce6-bab1-09c8f349218b\",\"name\":\"project-a\",\"path\":\"<fixture>/project-a\",\"workspace_type\":\"project\",\"linked_agent_name\":null,\"supports_skill_toggle\":true,\"sort_order\":0,\"skill_count\":1,\"sync_health\":{\"in_sync\":1,\"project_newer\":0,\"center_newer\":0,\"diverged\":0,\"project_only\":0},\"created_at\":1794980451398,\"updated_at\":1794980451398,\"path_exists\":true},\"agents\":[{\"key\":\"cursor\",\"display_name\":\"Cursor\",\"shared_by\":[\"cursor\"],\"skills_dir\":\"<fixture>/project-a/.cursor/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"claude_code\",\"display_name\":\"Claude Code\",\"shared_by\":[\"claude_code\"],\"skills_dir\":\"<fixture>/project-a/.claude/skills\",\"installed\":true,\"enabled\":true},{\"key\":\"omp_agent\",\"display_name\":\"OMP Agent\",\"shared_by\":[\"omp_agent\"],\"skills_dir\":\"<fixture>/project-a/.omp/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"codex\",\"display_name\":\"Codex\",\"shared_by\":[\"codex\"],\"skills_dir\":\"<fixture>/project-a/.codex/skills\",\"installed\":true,\"enabled\":true},{\"key\":\"grok\",\"display_name\":\"Grok\",\"shared_by\":[\"grok\"],\"skills_dir\":\"<fixture>/project-a/.grok/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"opencode\",\"display_name\":\"OpenCode\",\"shared_by\":[\"opencode\"],\"skills_dir\":\"<fixture>/project-a/.opencode/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"antigravity\",\"display_name\":\"Antigravity / Cline / Warp / GitLab Duo\",\"shared_by\":[\"antigravity\",\"cline\",\"warp\",\"gitlab_duo\"],\"skills_dir\":\"<fixture>/project-a/.agents/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"amp\",\"display_name\":\"Amp / Replit\",\"shared_by\":[\"amp\",\"replit\"],\"skills_dir\":\"<fixture>/project-a/.config/agents/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"kilo_code\",\"display_name\":\"Kilo Code\",\"shared_by\":[\"kilo_code\"],\"skills_dir\":\"<fixture>/project-a/.kilocode/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"roo_code\",\"display_name\":\"Roo Code\",\"shared_by\":[\"roo_code\"],\"skills_dir\":\"<fixture>/project-a/.roo/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"goose\",\"display_name\":\"Goose\",\"shared_by\":[\"goose\"],\"skills_dir\":\"<fixture>/project-a/.config/goose/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"gemini_cli\",\"display_name\":\"Gemini CLI\",\"shared_by\":[\"gemini_cli\"],\"skills_dir\":\"<fixture>/project-a/.gemini/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"github_copilot\",\"display_name\":\"GitHub Copilot\",\"shared_by\":[\"github_copilot\"],\"skills_dir\":\"<fixture>/project-a/.copilot/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"openclaw\",\"display_name\":\"OpenClaw\",\"shared_by\":[\"openclaw\"],\"skills_dir\":\"<fixture>/project-a/.openclaw/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"droid\",\"display_name\":\"Droid\",\"shared_by\":[\"droid\"],\"skills_dir\":\"<fixture>/project-a/.factory/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"windsurf\",\"display_name\":\"Windsurf\",\"shared_by\":[\"windsurf\"],\"skills_dir\":\"<fixture>/project-a/.codeium/windsurf/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"trae\",\"display_name\":\"TRAE IDE / TRAE CN\",\"shared_by\":[\"trae\",\"trae_cn\"],\"skills_dir\":\"<fixture>/project-a/.trae/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"deepagents\",\"display_name\":\"Deep Agents\",\"shared_by\":[\"deepagents\"],\"skills_dir\":\"<fixture>/project-a/.deepagents/agent/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"firebender\",\"display_name\":\"Firebender\",\"shared_by\":[\"firebender\"],\"skills_dir\":\"<fixture>/project-a/.firebender/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"kimi\",\"display_name\":\"Kimi Code CLI\",\"shared_by\":[\"kimi\"],\"skills_dir\":\"<fixture>/project-a/.kimi-code/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"augment\",\"display_name\":\"Augment\",\"shared_by\":[\"augment\"],\"skills_dir\":\"<fixture>/project-a/.augment/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"bob\",\"display_name\":\"IBM Bob\",\"shared_by\":[\"bob\"],\"skills_dir\":\"<fixture>/project-a/.bob/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"codebuddy\",\"display_name\":\"CodeBuddy\",\"shared_by\":[\"codebuddy\"],\"skills_dir\":\"<fixture>/project-a/.codebuddy/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"command_code\",\"display_name\":\"Command Code\",\"shared_by\":[\"command_code\"],\"skills_dir\":\"<fixture>/project-a/.commandcode/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"continue\",\"display_name\":\"Continue\",\"shared_by\":[\"continue\"],\"skills_dir\":\"<fixture>/project-a/.continue/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"cortex\",\"display_name\":\"Cortex Code\",\"shared_by\":[\"cortex\"],\"skills_dir\":\"<fixture>/project-a/.snowflake/cortex/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"crush\",\"display_name\":\"Crush\",\"shared_by\":[\"crush\"],\"skills_dir\":\"<fixture>/project-a/.config/crush/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"iflow\",\"display_name\":\"iFlow CLI\",\"shared_by\":[\"iflow\"],\"skills_dir\":\"<fixture>/project-a/.iflow/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"junie\",\"display_name\":\"Junie\",\"shared_by\":[\"junie\"],\"skills_dir\":\"<fixture>/project-a/.junie/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"kiro\",\"display_name\":\"Kiro CLI\",\"shared_by\":[\"kiro\"],\"skills_dir\":\"<fixture>/project-a/.kiro/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"kode\",\"display_name\":\"Kode\",\"shared_by\":[\"kode\"],\"skills_dir\":\"<fixture>/project-a/.kode/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"mcpjam\",\"display_name\":\"MCPJam\",\"shared_by\":[\"mcpjam\"],\"skills_dir\":\"<fixture>/project-a/.mcpjam/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"mistral_vibe\",\"display_name\":\"Mistral Vibe\",\"shared_by\":[\"mistral_vibe\"],\"skills_dir\":\"<fixture>/project-a/.vibe/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"mux\",\"display_name\":\"Mux\",\"shared_by\":[\"mux\"],\"skills_dir\":\"<fixture>/project-a/.mux/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"neovate\",\"display_name\":\"Neovate\",\"shared_by\":[\"neovate\"],\"skills_dir\":\"<fixture>/project-a/.neovate/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"openhands\",\"display_name\":\"OpenHands\",\"shared_by\":[\"openhands\"],\"skills_dir\":\"<fixture>/project-a/.openhands/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"pi\",\"display_name\":\"Pi\",\"shared_by\":[\"pi\"],\"skills_dir\":\"<fixture>/project-a/.pi/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"pochi\",\"display_name\":\"Pochi\",\"shared_by\":[\"pochi\"],\"skills_dir\":\"<fixture>/project-a/.pochi/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"qoder\",\"display_name\":\"Qoder\",\"shared_by\":[\"qoder\"],\"skills_dir\":\"<fixture>/project-a/.qoder/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"qwen_code\",\"display_name\":\"Qwen Code\",\"shared_by\":[\"qwen_code\"],\"skills_dir\":\"<fixture>/project-a/.qwen/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"zencoder\",\"display_name\":\"Zencoder\",\"shared_by\":[\"zencoder\"],\"skills_dir\":\"<fixture>/project-a/.zencoder/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"zcode\",\"display_name\":\"ZCode\",\"shared_by\":[\"zcode\"],\"skills_dir\":\"<fixture>/project-a/.zcode/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"adal\",\"display_name\":\"AdaL\",\"shared_by\":[\"adal\"],\"skills_dir\":\"<fixture>/project-a/.adal/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"hermes\",\"display_name\":\"Hermes Agent\",\"shared_by\":[\"hermes\"],\"skills_dir\":\"<fixture>/project-a/.hermes/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"qclaw\",\"display_name\":\"QClaw\",\"shared_by\":[\"qclaw\"],\"skills_dir\":\"<fixture>/project-a/.qclaw/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"easyclaw\",\"display_name\":\"EasyClaw\",\"shared_by\":[\"easyclaw\"],\"skills_dir\":\"<fixture>/project-a/.easyclaw/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"autoclaw\",\"display_name\":\"AutoClaw\",\"shared_by\":[\"autoclaw\"],\"skills_dir\":\"<fixture>/project-a/.openclaw-autoclaw/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"workbuddy\",\"display_name\":\"WorkBuddy\",\"shared_by\":[\"workbuddy\"],\"skills_dir\":\"<fixture>/project-a/.workbuddy/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"workbuddy_overseas\",\"display_name\":\"WorkBuddy AI\",\"shared_by\":[\"workbuddy_overseas\"],\"skills_dir\":\"<fixture>/project-a/.workbuddy-ai/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"deepseek_harness\",\"display_name\":\"DeepSeek Harness\",\"shared_by\":[\"deepseek_harness\"],\"skills_dir\":\"<fixture>/project-a/.dsh/skills\",\"installed\":false,\"enabled\":true},{\"key\":\"minimax_code\",\"display_name\":\"MiniMax Code\",\"shared_by\":[\"minimax_code\"],\"skills_dir\":\"<fixture>/project-a/.minimax/skills\",\"installed\":false,\"enabled\":true}],\"skills\":[{\"name\":\"issue4-fixture\",\"dir_name\":\"issue4-fixture\",\"relative_path\":\"issue4-fixture\",\"description\":\"Isolated validation fixture\",\"path\":\"<fixture>/project-a/.claude/skills/issue4-fixture\",\"files\":[\"SKILL.md\",\"note.txt\"],\"enabled\":true,\"agent\":\"claude_code\",\"agent_display_name\":\"Claude Code\",\"tags\":[],\"in_center\":true,\"sync_status\":\"in_sync\",\"center_skill_id\":\"13724d2a-4e5f-4368-a607-3a17cf697b0a\"},{\"name\":\"issue4-fixture\",\"dir_name\":\"issue4-fixture\",\"relative_path\":\"issue4-fixture\",\"description\":\"Isolated validation fixture\",\"path\":\"<fixture>/project-a/.codex/skills/issue4-fixture\",\"files\":[\"SKILL.md\",\"note.txt\"],\"enabled\":true,\"agent\":\"codex\",\"agent_display_name\":\"Codex\",\"tags\":[],\"in_center\":true,\"sync_status\":\"in_sync\",\"center_skill_id\":\"13724d2a-4e5f-4368-a607-3a17cf697b0a\"}]}\n",
+      "stderr": ""
+    }
+  ],
+  "projectASnapshot": {
+    ".": {
+      "kind": "directory"
+    },
+    ".claude": {
+      "kind": "directory"
+    },
+    ".claude/skills": {
+      "kind": "directory"
+    },
+    ".claude/skills/issue4-fixture": {
+      "kind": "symlink",
+      "target": "<fixture>/home/.agent-toolchain-manager/skills/issue4-fixture"
+    },
+    ".codex": {
+      "kind": "directory"
+    },
+    ".codex/skills": {
+      "kind": "directory"
+    },
+    ".codex/skills/issue4-fixture": {
+      "kind": "symlink",
+      "target": "<fixture>/home/.agent-toolchain-manager/skills/issue4-fixture"
+    }
+  },
+  "projectBSnapshot": {
+    ".": {
+      "kind": "directory"
+    }
+  },
+  "globalAgentSnapshots": {
+    ".codex": {
+      ".": {
+        "kind": "directory"
+      },
+      "skills": {
+        "kind": "directory"
+      },
+      "skills/user-fixture": {
+        "kind": "directory"
+      },
+      "skills/user-fixture/marker.txt": {
+        "kind": "file",
+        "sha256": "14c1747b766669c2a91ae50235b76733f2b9b15e927ff9e613a7ae0d021dd283"
+      }
+    },
+    ".claude": {
+      ".": {
+        "kind": "directory"
+      },
+      "skills": {
+        "kind": "directory"
+      },
+      "skills/user-fixture": {
+        "kind": "directory"
+      },
+      "skills/user-fixture/marker.txt": {
+        "kind": "file",
+        "sha256": "4792d58d32ec65f97a1225ced88d5e420e12c6aed51ecffdc48d42c6a92582a3"
+      }
+    },
+    ".agents": {
+      ".": {
+        "kind": "directory"
+      },
+      "skills": {
+        "kind": "directory"
+      },
+      "skills/user-fixture": {
+        "kind": "directory"
+      },
+      "skills/user-fixture/marker.txt": {
+        "kind": "file",
+        "sha256": "774c099cad02374ca67a73184b113f486b4b047c630929d4373f0d524fb4178b"
+      }
+    }
+  }
+}

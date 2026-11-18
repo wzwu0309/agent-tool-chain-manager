@@ -424,6 +424,8 @@ enum ProjectsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Inspect a project's persistent Copy operation recovery log (read-only).
+    Recoveries { project: String },
     /// Remove a library skill's copies from a project. Without --agent, from
     /// every agent directory of the project. Refuses copies that may hold
     /// content not in the library unless --force.
@@ -799,6 +801,9 @@ fn main() {
             eprintln!("{}", serde_json::to_string(&error_envelope(&err)).unwrap());
         } else {
             eprintln!("error: {err:#}");
+            if let Some(partial) = err.downcast_ref::<PartialProjectDeployFailure>() {
+                eprintln!("{}", serde_json::to_string_pretty(&partial.report).unwrap());
+            }
         }
         std::process::exit(1);
     }
@@ -3215,7 +3220,36 @@ struct ProjectTargetReport {
     result: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_status: Option<String>,
+    /// Error text for an attempted target that failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Relevant operation logs created during this target's attempt.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recovery: Vec<ProjectDeployRecoveryLocation>,
 }
+
+#[derive(Debug, Serialize)]
+struct ProjectDeployRecoveryLocation {
+    operation_id: String,
+    phase: String,
+    recovery_root: String,
+}
+
+#[derive(Debug)]
+struct PartialProjectDeployFailure {
+    report: ProjectDeploymentReport,
+    source: String,
+}
+impl std::fmt::Display for PartialProjectDeployFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Project deployment stopped after {} successful target(s): {}",
+            self.report.changed_pairs, self.source
+        )
+    }
+}
+impl std::error::Error for PartialProjectDeployFailure {}
 
 #[derive(Debug, Serialize)]
 struct ProjectDeploymentReport {
@@ -3333,6 +3367,19 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
             )?,
             json,
         ),
+        ProjectsCommand::Recoveries { project } => {
+            let record = resolve_project(store, &project)?;
+            print_json(
+                &serde_json::json!({
+                    "project_id": record.id,
+                    "path": record.path,
+                    "recoveries": project_cmd::get_project_skill_recoveries_internal(
+                        store, &record.id,
+                    ).map_err(map_app_err)?,
+                }),
+                json,
+            );
+        }
         ProjectsCommand::Undeploy {
             project,
             skills,
@@ -3542,11 +3589,12 @@ fn deploy_to_project(
     let (skills, preset_name) = project_skill_selection(store, references, preset)?;
     let skill_ids: Vec<String> = skills.iter().map(|skill| skill.id.clone()).collect();
     let agents = dedup_keys(agents);
-
     let plan = project_cmd::plan_project_deploy_with_commit(
         store, &record.id, &skill_ids, &agents, commit_oid,
     )
     .map_err(map_app_err)?;
+    // Keep the existing all-or-nothing *preflight*: an already occupied
+    // external destination blocks all writes before touching any target.
     if let Some(conflict) = project_cmd::project_deploy_conflicts(&plan) {
         return Err(map_app_err(conflict));
     }
@@ -3557,42 +3605,92 @@ fn deploy_to_project(
     } else {
         None
     };
-    if !dry_run {
-        project_cmd::apply_project_deploy(store, &plan).map_err(map_app_err)?;
-    }
 
-    let mut targets = Vec::new();
+    let mut targets = Vec::with_capacity(plan.len());
+    let mut failure: Option<String> = None;
+    let mut changed_pairs = 0usize;
     for target in &plan {
-        let created = target.state == project_cmd::ProjectDeployState::Create;
-        if created && !dry_run {
-            if std::fs::symlink_metadata(&target.path).is_err() {
-                bail!("deployment incomplete: {} was not written", target.path);
+        let create = target.state == project_cmd::ProjectDeployState::Create;
+        let mut result = if !create {
+            "already_deployed"
+        } else if dry_run {
+            "would_create"
+        } else if failure.is_some() {
+            "not_attempted"
+        } else {
+            "created"
+        };
+        let mut error = None;
+        let mut recovery = Vec::new();
+        if create && !dry_run && failure.is_none() {
+            // Execute each independent path through the existing Core
+            // transaction boundary. This makes committed earlier targets
+            // reportable when a later target fails. Do not roll them back:
+            // removing already published user-visible files is not safe.
+            let prior: std::collections::HashSet<String> = store
+                .pending_project_skill_operations()?
+                .into_iter()
+                .map(|op| op.id)
+                .collect();
+            let applied = project_cmd::apply_project_deploy(store, &[target.clone()])
+                .map_err(map_app_err)
+                .and_then(|_| {
+                    if std::fs::symlink_metadata(&target.path).is_err() {
+                        bail!("deployment incomplete: {} was not written", target.path);
+                    }
+                    Ok(())
+                });
+            match applied {
+                Ok(()) => {
+                    changed_pairs += 1;
+                    store.log_audit(
+                        AuditDraft::new("deploy")
+                            .skill(target.skill_id.clone(), target.skill.clone())
+                            .tool(target.agent.clone())
+                            .detail(format!("project {}", record.path))
+                            .ok(),
+                    );
+                }
+                Err(err) => {
+                    let reason = format!("{err:#}");
+                    failure = Some(reason.clone());
+                    error = Some(reason);
+                    result = "failed";
+                    // Only include journal IDs created by this attempt.
+                    // Existing recoveries must not be mistaken for data
+                    // generated by this failure.
+                    recovery = store
+                        .pending_project_skill_operations()?
+                        .into_iter()
+                        .filter(|op| {
+                            !prior.contains(&op.id)
+                                && op.project_id == record.id
+                                && op.target_path == target.path
+                        })
+                        .map(|op| ProjectDeployRecoveryLocation {
+                            operation_id: op.id,
+                            phase: op.phase,
+                            recovery_root: op.recovery_root,
+                        })
+                        .collect();
+                }
             }
-            store.log_audit(
-                AuditDraft::new("deploy")
-                    .skill(target.skill_id.clone(), target.skill.clone())
-                    .tool(target.agent.clone())
-                    .detail(format!("project {}", record.path))
-                    .ok(),
-            );
+        } else if create && dry_run {
+            changed_pairs += 1;
         }
         targets.push(ProjectTargetReport {
             skill: target.skill.clone(),
             agent: target.agent.clone(),
             shared_by: target.shared_by.clone(),
             path: target.path.clone(),
-            result: match (created, dry_run) {
-                (true, true) => "would_create",
-                (true, false) => "created",
-                (false, _) => "already_deployed",
-            }
-            .to_string(),
+            result: result.to_string(),
             sync_status: target.sync_status.clone(),
+            error,
+            recovery,
         });
     }
-
-    Ok(ProjectDeploymentReport {
-        ok: true,
+    let report = ProjectDeploymentReport {
+        ok: failure.is_none(),
         action: "deploy".to_string(),
         dry_run,
         project_id: record.id,
@@ -3601,10 +3699,7 @@ fn deploy_to_project(
         preset: preset_name,
         skill_count: skills.len(),
         pair_count: plan.len(),
-        changed_pairs: targets
-            .iter()
-            .filter(|t| t.result != "already_deployed")
-            .count(),
+        changed_pairs,
         skills: skills.into_iter().map(|skill| skill.name).collect(),
         targets,
         not_deployed: Vec::new(),
@@ -3612,7 +3707,14 @@ fn deploy_to_project(
         warning: dirty.filter(|dirty| *dirty).map(|_| {
             "Uncommitted central Skill Store changes are excluded; only selected Git Commit bytes are used"
         }),
-    })
+    };
+    if let Some(source) = failure {
+        return Err(anyhow::Error::new(PartialProjectDeployFailure {
+            report,
+            source,
+        }));
+    }
+    Ok(report)
 }
 
 /// CLI explicit update uses the very same guarded Core mutation as GUI.
@@ -3639,7 +3741,11 @@ fn update_project_copy(
             &project.id,
             Path::new(&plan.target_path),
             Some(&plan.target_commit_oid),
-            Some((&plan.deployment_id, &plan.base_tree_oid, &plan.base_commit_oid)),
+            Some((
+                &plan.deployment_id,
+                &plan.base_tree_oid,
+                &plan.base_commit_oid,
+            )),
         )
         .map_err(map_app_err)?;
         // Do not report success based solely on the read-only preview:
@@ -3729,6 +3835,8 @@ fn undeploy_from_project(
             path: target.path.clone(),
             result: if dry_run { "would_remove" } else { "removed" }.to_string(),
             sync_status: Some(target.sync_status.clone()),
+            error: None,
+            recovery: Vec::new(),
         });
     }
     let not_deployed = skills
@@ -3885,6 +3993,15 @@ fn run_git(
 /// an agent can say which directory is blocking and offer the way out (#363).
 fn error_envelope(err: &anyhow::Error) -> serde_json::Value {
     let message = format!("{err:#}");
+    if let Some(partial) = err.downcast_ref::<PartialProjectDeployFailure>() {
+        return serde_json::json!({
+            "ok": false,
+            "code": "PARTIAL_DEPLOYMENT",
+            "message": message,
+            "error": message,
+            "details": { "report": partial.report },
+        });
+    }
     match err.downcast_ref::<AppError>() {
         Some(app_err) if app_err.details.is_some() => {
             let mut value = serde_json::to_value(app_err).unwrap();
@@ -4606,6 +4723,53 @@ mod project_tests {
         }
     }
 
+    fn add_committed_center_skill(fx: &Fx, name: &str) {
+        let root = fx.tmp.path().join("central");
+        let skill_id = format!("skill-{name}");
+        write_skill(&root.join(name), name, &format!("# {name}"));
+        let mut row = fx.store.get_skill_by_id("skill-demo").unwrap().unwrap();
+        row.id = skill_id.clone();
+        row.name = name.to_string();
+        row.central_path = root.join(name).to_string_lossy().to_string();
+        fx.store.insert_skill(&row).unwrap();
+        let meta = root
+            .join(".skills-manager/skills")
+            .join(format!("{skill_id}.json"));
+        fs::write(
+            &meta,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "skill_id": skill_id,
+                "path": name,
+                "path_key": name,
+                "enabled": true,
+                "tags": [],
+                "source": { "type": "local", "ref": null, "subpath": null, "branch": null }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let git = git2::Repository::open(&root).unwrap();
+        let mut index = git.index().unwrap();
+        index
+            .add_path(Path::new(name).join("SKILL.md").as_path())
+            .unwrap();
+        index
+            .add_path(
+                Path::new(".skills-manager/skills")
+                    .join(format!("{skill_id}.json"))
+                    .as_path(),
+            )
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("CLI Fixture", "cli@example.invalid").unwrap();
+        let parent = git.head().unwrap().peel_to_commit().unwrap();
+        git.commit(Some("HEAD"), &sig, &sig, "add Skill", &tree, &[&parent])
+            .unwrap();
+    }
+
     fn commit_center_skill(fx: &Fx, body: &str) -> String {
         let root = fx.tmp.path().join("central");
         write_skill(&root.join("demo"), "demo", body);
@@ -4713,6 +4877,8 @@ mod project_tests {
             "1234567890abcdef1234567890abcdef12345678",
         ])
         .is_ok());
+        assert!(parse(&["projects", "recoveries", "."]).is_ok());
+        assert!(parse(&["projects", "recoveries"]).is_err());
         assert!(parse(&[
             "projects",
             "update",
@@ -5031,6 +5197,101 @@ mod project_tests {
         assert!(report.warning.is_some());
         let project_bytes = fs::read_to_string(fx.repo.join(".test/skills/demo/SKILL.md")).unwrap();
         assert!(!project_bytes.contains("UNCOMMITTED"));
+    }
+
+    #[test]
+    fn partial_copy_batch_reports_committed_failed_and_unattempted_targets() {
+        let fx = fixture();
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        add_committed_center_skill(&fx, "second");
+        add_committed_center_skill(&fx, "third");
+        let db = rusqlite::Connection::open(fx.tmp.path().join("skills.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_second_commit BEFORE INSERT
+             ON project_skill_deployments
+             WHEN NEW.skill_id = 'skill-second'
+             BEGIN SELECT RAISE(ABORT, 'injected second target failure'); END;",
+        )
+        .unwrap();
+
+        let project = repo_ref(&fx);
+        let failure = deploy_to_project(
+            &fx.store,
+            &project,
+            &["demo".into(), "second".into(), "third".into()],
+            None,
+            &["test_agent".into()],
+            false,
+            None,
+        )
+        .unwrap_err();
+        let envelope = error_envelope(&failure);
+        assert_eq!(envelope["code"], "PARTIAL_DEPLOYMENT");
+        assert_eq!(envelope["ok"], false);
+        let report = &envelope["details"]["report"];
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["pair_count"], 3);
+        assert_eq!(report["changed_pairs"], 1);
+        let targets = report["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0]["result"], "created");
+        assert_eq!(targets[1]["result"], "failed");
+        assert_eq!(targets[2]["result"], "not_attempted");
+        assert!(targets[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("database commit failed"));
+        let recovery = targets[1]["recovery"].as_array().unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0]["phase"], "recovery_available");
+        let location = recovery[0]["recovery_root"].as_str().unwrap();
+        assert!(Path::new(location).join("recovered/SKILL.md").is_file());
+
+        let id = fx.store.get_all_projects().unwrap()[0].id.clone();
+        let listed = project_cmd::get_project_skill_recoveries_internal(&fx.store, &id).unwrap();
+        assert!(
+            listed.iter().any(|op| op.kind == "deploy"
+                && op.phase == "recovery_available"
+                && op.recovery_root == location
+                && op.recovery_root_exists),
+            "journal is available read-only after the batch failure"
+        );
+        let first = fx.repo.join(".test/skills/demo");
+        let second = fx.repo.join(".test/skills/second");
+        let third = fx.repo.join(".test/skills/third");
+        assert!(first.join("SKILL.md").is_file());
+        assert!(!second.exists());
+        assert!(!third.exists());
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&id, &first.to_string_lossy(),)
+            .unwrap()
+            .is_some());
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&id, &second.to_string_lossy(),)
+            .unwrap()
+            .is_none());
+        assert_eq!(fx.store.list_audit(None).unwrap().len(), 1);
+
+        // An independently planned retry does not overwrite the old
+        // recovery snapshot and installs the remaining two targets.
+        db.execute_batch("DROP TRIGGER fail_second_commit").unwrap();
+        let retry = deploy_to_project(
+            &fx.store,
+            &project,
+            &["demo".into(), "second".into(), "third".into()],
+            None,
+            &["test_agent".into()],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(retry.changed_pairs, 2);
+        assert_eq!(retry.targets[0].result, "already_deployed");
+        assert!(second.join("SKILL.md").is_file());
+        assert!(third.join("SKILL.md").is_file());
+        assert!(Path::new(location).join("recovered/SKILL.md").is_file());
     }
 
     #[test]

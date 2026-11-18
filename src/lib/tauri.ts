@@ -824,6 +824,28 @@ export const getProjectAgentTargets = (projectId: string) =>
 export const getProjectSkills = (projectId: string) =>
   invoke<ProjectSkill[]>("get_project_skills", { projectId });
 
+export interface ProjectSkillRecovery {
+  operation_id: string;
+  project_id: string;
+  skill_id: string;
+  deployment_id: string | null;
+  kind: "deploy" | "update" | "delete" | "toggle";
+  phase: string;
+  target_path: string;
+  recovery_root: string;
+  destination_path: string | null;
+  target_exists: boolean;
+  recovery_root_exists: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+/** Read-only operation journal; no recovery or cleanup side effects. */
+export const getProjectSkillRecoveries = (projectId: string) =>
+  invoke<ProjectSkillRecovery[]>("get_project_skill_recoveries", { projectId });
+
+
+
 export const getProjectSkillDocument = (projectId: string, skillRelativePath: string, agent: string) =>
   invoke<ProjectSkillDocument>("get_project_skill_document", { projectId, skillRelativePath, agent });
 

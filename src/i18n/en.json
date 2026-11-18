@@ -908,6 +908,15 @@
     }
   },
   "project": {
+        "recovery": {
+      "title": "Recovery records",
+      "readOnly": "Read-only history. Recovery copies are never cleaned automatically; inspect contents before any manual action.",
+      "saved": "recovery location exists",
+      "notFound": "recovery location missing",
+      "target": "Project target",
+      "location": "Recovery directory",
+      "operation": "Operation ID"
+    },
     "title": "Project Skills",
     "path": "Project Path",
     "workspaceHint": "Manage local agent skills in this repository and sync them with the Skills Center.",

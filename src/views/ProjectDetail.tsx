@@ -42,7 +42,7 @@ import { getTagActiveColor, getTagColor, pruneStaleTagFilters, UNTAGGED_FILTER }
 import { enabledInstalledAgentKeys, getDefaultExportAgents } from "../lib/exportAgents";
 import { cn } from "../utils";
 import * as api from "../lib/tauri";
-import type { ProjectSkill, ManagedSkill, ProjectAgentTarget } from "../lib/tauri";
+import type { ProjectSkill, ManagedSkill, ProjectAgentTarget, ProjectSkillRecovery } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { useRevealProjectFolder } from "../hooks/useRevealProjectFolder";
@@ -135,6 +135,10 @@ export function ProjectDetail() {
   const { label: revealLabel, reveal: revealProjectFolder } = useRevealProjectFolder();
   const { projects, presets, managedSkills, refreshManagedSkills, refreshPresets, refreshProjects } = useApp();
   const [skills, setSkills] = useState<ProjectSkill[]>([]);
+  const [recoveries, setRecoveries] = useState<ProjectSkillRecovery[]>([]);
+  const [recoveryExpanded, setRecoveryExpanded] = useState(false);
+  const [recoveryLoading, setRecoveryLoading] = useState(false);
+  const recoveryRequestRef = useRef(0);
   const [projectAgentTargets, setProjectAgentTargets] = useState<ProjectAgentTarget[]>([]);
   const [loading, setLoading] = useState(true);
   const [viewMode, setViewMode] = useSkillViewMode();
@@ -206,6 +210,29 @@ export function ProjectDetail() {
   useEffect(() => {
     loadSkills();
   }, [loadSkills]);
+
+  const loadRecoveries = useCallback(async () => {
+    if (!id) return;
+    const requestId = ++recoveryRequestRef.current;
+    setRecoveryLoading(true);
+    try {
+      const records = await api.getProjectSkillRecoveries(id);
+      if (recoveryRequestRef.current === requestId) setRecoveries(records);
+    } catch (e) {
+      if (recoveryRequestRef.current === requestId) {
+        console.error("Failed to load project Skill recovery operations:", e);
+        toast.error(getErrorMessage(e, t("common.error")));
+      }
+    } finally {
+      if (recoveryRequestRef.current === requestId) setRecoveryLoading(false);
+    }
+  }, [id, t]);
+
+  useEffect(() => {
+    setRecoveries([]);
+    setRecoveryExpanded(false);
+    void loadRecoveries();
+  }, [loadRecoveries]);
 
   useEffect(() => {
     setSearch("");
@@ -1165,6 +1192,48 @@ export function ProjectDetail() {
           />
         )}
       </div>
+
+      {recoveries.length > 0 && (
+        <section className="mx-1 mb-3 rounded-md border border-border bg-surface p-3" aria-label={t("project.recovery.title")}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <button
+              type="button"
+              aria-expanded={recoveryExpanded}
+              onClick={() => setRecoveryExpanded((expanded) => !expanded)}
+              className="text-left text-[13px] font-medium text-secondary hover:text-primary"
+            >
+              {t("project.recovery.title")} ({recoveries.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => void loadRecoveries()}
+              disabled={recoveryLoading}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-muted hover:bg-surface-hover disabled:opacity-50"
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", recoveryLoading && "animate-spin")} />
+              {t("common.refresh")}
+            </button>
+          </div>
+          <p className="mt-1 text-[12px] text-muted">{t("project.recovery.readOnly")}</p>
+          {recoveryExpanded && (
+            <div className="mt-3 space-y-2">
+              {recoveries.map((recovery) => (
+                <div key={recovery.operation_id} className="rounded-md border border-border-subtle p-2 text-[12px]">
+                  <p className="font-medium text-secondary">
+                    {recovery.kind} · {recovery.phase}
+                    {recovery.recovery_root_exists
+                      ? " · " + t("project.recovery.saved")
+                      : " · " + t("project.recovery.notFound")}
+                  </p>
+                  <p className="mt-1 break-all text-muted">{t("project.recovery.target")}: {recovery.target_path}</p>
+                  <p className="mt-1 break-all text-muted">{t("project.recovery.location")}: {recovery.recovery_root}</p>
+                  <p className="mt-1 break-all text-muted">{t("project.recovery.operation")}: {recovery.operation_id}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {isMultiSelect && (
         <MultiSelectToolbar

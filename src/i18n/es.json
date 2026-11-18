@@ -888,6 +888,15 @@
     }
   },
   "project": {
+        "recovery": {
+      "title": "Registros de recuperación",
+      "readOnly": "Solo lectura. Las copias de recuperación no se eliminan automáticamente; revisa su contenido antes de actuar.",
+      "saved": "ubicación disponible",
+      "notFound": "ubicación no disponible",
+      "target": "Destino del proyecto",
+      "location": "Directorio de recuperación",
+      "operation": "ID de operación"
+    },
     "addCallout": "También puedes añadir varios skills a la vez: filtra por etiqueta en el diálogo de añadir skills.",
     "addLinkedHint": "Vincula una raíz de skills externa. Se gestionará solo como espacio de trabajo y no participará en la sincronización global de presets.",
     "addLinkedWorkspace": "Vincular espacio de trabajo",

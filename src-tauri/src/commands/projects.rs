@@ -847,6 +847,79 @@ pub(crate) fn classify_sync_status(
 
 static GET_PROJECTS_FIRST_CALL: AtomicBool = AtomicBool::new(true);
 
+/// Read-only view of persistent deployment/update/delete/toggle journal.
+/// This deliberately offers no cleanup/restore action: a retained backup may
+/// still be written by an uncooperative process holding an old file handle.
+#[derive(Debug, Serialize)]
+pub struct ProjectSkillRecoveryDto {
+    pub operation_id: String,
+    pub project_id: String,
+    pub skill_id: String,
+    pub deployment_id: Option<String>,
+    pub kind: String,
+    pub phase: String,
+    pub target_path: String,
+    pub recovery_root: String,
+    pub destination_path: Option<String>,
+    pub target_exists: bool,
+    pub recovery_root_exists: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub fn get_project_skill_recoveries_internal(
+    store: &SkillStore,
+    project_id: &str,
+) -> Result<Vec<ProjectSkillRecoveryDto>, AppError> {
+    if store
+        .get_project_by_id(project_id)
+        .map_err(AppError::db)?
+        .is_none()
+    {
+        return Err(AppError::not_found("Workspace not found"));
+    }
+    let mut rows = store
+        .pending_project_skill_operations()
+        .map_err(AppError::db)?
+        .into_iter()
+        .filter(|op| op.project_id == project_id)
+        .map(|op| ProjectSkillRecoveryDto {
+            operation_id: op.id,
+            project_id: op.project_id,
+            skill_id: op.skill_id,
+            deployment_id: op.deployment_id,
+            kind: op.kind,
+            phase: op.phase,
+            target_exists: std::fs::symlink_metadata(&op.target_path).is_ok(),
+            recovery_root_exists: std::fs::symlink_metadata(&op.recovery_root)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()),
+            target_path: op.target_path,
+            recovery_root: op.recovery_root,
+            destination_path: op.destination_path,
+            created_at: op.created_at,
+            updated_at: op.updated_at,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.operation_id.cmp(&b.operation_id))
+    });
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn get_project_skill_recoveries(
+    store: State<'_, Arc<SkillStore>>,
+    project_id: String,
+) -> Result<Vec<ProjectSkillRecoveryDto>, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        get_project_skill_recoveries_internal(&store, &project_id)
+    })
+    .await?
+}
+
 #[tauri::command]
 pub async fn get_projects(store: State<'_, Arc<SkillStore>>) -> Result<Vec<ProjectDto>, AppError> {
     let store = store.inner().clone();
@@ -4449,6 +4522,71 @@ mod project_plan_tests {
         assert!(ops
             .iter()
             .any(|op| op.kind == "delete" && op.phase == "recovery_available"));
+    }
+
+    #[test]
+    fn recovery_journal_visibility_is_project_scoped_and_does_not_change_files() {
+        let fx = fixture(&["claude_code"]);
+        let other_path = fx._tmp.path().join("other-project");
+        fs::create_dir_all(&other_path).unwrap();
+        let other_id = add_project_internal(&fx.store, other_path.to_string_lossy().to_string())
+            .unwrap()
+            .id;
+        let own_target = fx.repo.join(".claude/skills/demo");
+        fs::create_dir_all(own_target.parent().unwrap()).unwrap();
+        let own_id = uuid::Uuid::new_v4().to_string();
+        let other_op_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        let create = |id: String, project: String, target: PathBuf| {
+            let recovery_root = target.parent().unwrap().join(".atm-recovery").join(&id);
+            ProjectSkillOperationRecord {
+                id,
+                project_id: project,
+                skill_id: "s-demo".to_string(),
+                deployment_id: None,
+                kind: "deploy".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery_root.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: None,
+                created_at: now,
+                updated_at: now,
+                destination_path: None,
+                observed_identity: None,
+            }
+        };
+        fx.store
+            .insert_project_skill_operation(&create(
+                own_id.clone(),
+                fx.project_id.clone(),
+                own_target.clone(),
+            ))
+            .unwrap();
+        fx.store
+            .insert_project_skill_operation(&create(
+                other_op_id,
+                other_id.clone(),
+                other_path.join(".claude/skills/foreign"),
+            ))
+            .unwrap();
+        let before = fx.store.pending_project_skill_operations().unwrap();
+        let visible = get_project_skill_recoveries_internal(&fx.store, &fx.project_id).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].operation_id, own_id);
+        assert_eq!(visible[0].phase, "preparing");
+        assert!(!visible[0].target_exists);
+        assert!(!visible[0].recovery_root_exists);
+        assert!(get_project_skill_recoveries_internal(&fx.store, "unknown-project",).is_err());
+        let after = fx.store.pending_project_skill_operations().unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before[0].id, after[0].id);
+        assert_eq!(before[0].phase, after[0].phase);
+        assert!(!own_target.exists());
+        assert!(
+            !own_target.parent().unwrap().join(".atm-recovery").exists(),
+            "viewing recoveries must never create or clean directories"
+        );
     }
 
     #[test]

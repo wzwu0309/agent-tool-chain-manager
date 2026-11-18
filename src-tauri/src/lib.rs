@@ -1113,6 +1113,7 @@ pub fn run() {
             commands::git_backup::git_backup_sync,
             // Projects
             commands::projects::get_projects,
+            commands::projects::get_project_skill_recoveries,
             commands::projects::add_project,
             commands::projects::add_linked_workspace,
             commands::projects::remove_project,

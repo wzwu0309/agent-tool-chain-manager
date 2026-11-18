@@ -897,6 +897,15 @@
     }
   },
   "project": {
+        "recovery": {
+      "title": "復原記錄",
+      "readOnly": "僅供檢視。復原副本不會自動清理；手動操作前請先檢查內容。",
+      "saved": "復原目錄存在",
+      "notFound": "復原目錄不存在",
+      "target": "專案目標",
+      "location": "復原目錄",
+      "operation": "操作 ID"
+    },
     "title": "專案 Skills",
     "path": "專案路徑",
     "workspaceHint": "管理此倉庫中各 Agent 的本機 Skills，並與 Skills 中心雙向同步。",

@@ -908,6 +908,15 @@
     }
   },
   "project": {
+        "recovery": {
+      "title": "恢复记录",
+      "readOnly": "仅供查看。恢复副本不会被自动清理；手动操作前请先检查内容。",
+      "saved": "恢复目录存在",
+      "notFound": "恢复目录不存在",
+      "target": "项目目标",
+      "location": "恢复目录",
+      "operation": "操作 ID"
+    },
     "title": "项目 Skills",
     "path": "项目路径",
     "workspaceHint": "管理该仓库中各 Agent 的本地 Skills，并与 Skills 中心双向同步。",

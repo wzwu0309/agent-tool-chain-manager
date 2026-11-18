@@ -4360,6 +4360,7 @@ mod project_tests {
     impl Drop for Fx {
         fn drop(&mut self) {
             app_lib::core::central_repo::set_runtime_skills_dir_override(None);
+            app_lib::core::central_repo::set_runtime_base_dir_override(None);
         }
     }
 
@@ -4377,6 +4378,9 @@ mod project_tests {
     fn fixture() -> Fx {
         let guard = PROJECT_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
+        app_lib::core::central_repo::set_runtime_base_dir_override(
+            Some(tmp.path().to_path_buf()),
+        );
         app_lib::core::central_repo::set_runtime_skills_dir_override(Some(
             tmp.path().join("central"),
         ));

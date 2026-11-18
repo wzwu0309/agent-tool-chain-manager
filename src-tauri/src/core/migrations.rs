@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 10;
+const LATEST_VERSION: u32 = 11;
 
 /// Run all pending migrations on the database.
 ///
@@ -57,6 +57,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         7 => migrate_v7_to_v8(conn),
         8 => migrate_v8_to_v9(conn),
         9 => migrate_v9_to_v10(conn),
+        10 => migrate_v10_to_v11(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -363,6 +364,35 @@ fn migrate_v9_to_v10(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_project_skill_deployments_project
             ON project_skill_deployments(project_id, skill_id);
+        ",
+    )?;
+    Ok(())
+}
+
+/// v10 → v11: durable, operation-specific intent. The operation state is NOT
+/// management authority: notably preparing never grants ownership.
+fn migrate_v10_to_v11(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS project_skill_operations (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            deployment_id TEXT,
+            kind TEXT NOT NULL CHECK(kind IN ('deploy', 'update', 'delete')),
+            phase TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            recovery_root TEXT NOT NULL,
+            base_tree_oid TEXT,
+            new_tree_oid TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_project_skill_active_operation
+            ON project_skill_operations(target_path)
+            WHERE phase IN ('preparing', 'publishing', 'needs_attention');
+        CREATE INDEX IF NOT EXISTS idx_project_skill_operation_project
+            ON project_skill_operations(project_id, updated_at);
         ",
     )?;
     Ok(())

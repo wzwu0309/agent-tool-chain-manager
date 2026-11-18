@@ -870,6 +870,22 @@ pub fn run() {
                 log::error!("{detail}");
             }
 
+            // Restore only interrupted project Copy operations whose target
+            // is absent; ambiguous occupied targets require manual recovery.
+            let store_for_project_recovery = store_for_setup.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                match commands::projects::recover_incomplete_project_skill_operations(
+                    &store_for_project_recovery,
+                ) {
+                    Ok(notices) => {
+                        for notice in notices {
+                            log::warn!("project Skill recovery: {notice}");
+                        }
+                    }
+                    Err(err) => log::error!("project Skill recovery failed: {err}"),
+                }
+            });
+
             // One-time repair for skills uploaded before sync targets were
             // registered on import: they have a center record but no target,
             // leaving them button-less in the workspace. This scans and hashes

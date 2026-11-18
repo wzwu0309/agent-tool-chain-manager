@@ -55,6 +55,24 @@ pub struct SkillTargetRecord {
     pub source_hash: Option<String>,
 }
 
+/// Durable filesystem intent, independent of Skill management authority.
+/// Pending deploy never proves an occupied directory is manager-owned.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSkillOperationRecord {
+    pub id: String,
+    pub project_id: String,
+    pub skill_id: String,
+    pub deployment_id: Option<String>,
+    pub kind: String,
+    pub phase: String,
+    pub target_path: String,
+    pub recovery_root: String,
+    pub base_tree_oid: Option<String>,
+    pub new_tree_oid: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// One row of the pending-conflict projection (merge-engine design §4).
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingConflictRow {
@@ -1196,6 +1214,260 @@ impl SkillStore {
             params![scenario_id],
         )?;
         Ok(())
+    }
+
+    // ── Project Copy filesystem operation journal ──
+
+    pub fn insert_project_skill_operation(&self, op: &ProjectSkillOperationRecord) -> Result<()> {
+        if op.phase != "preparing" || !matches!(op.kind.as_str(), "deploy" | "update" | "delete") {
+            anyhow::bail!("invalid initial project Skill operation");
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO project_skill_operations (
+                id, project_id, skill_id, deployment_id, kind, phase, target_path,
+                recovery_root, base_tree_oid, new_tree_oid, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                op.id,
+                op.project_id,
+                op.skill_id,
+                op.deployment_id,
+                op.kind,
+                op.phase,
+                op.target_path,
+                op.recovery_root,
+                op.base_tree_oid,
+                op.new_tree_oid,
+                op.created_at,
+                op.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the step before its filesystem side effect. Failed or unknown
+    /// operations stay visible at startup; no content-match auto-adoption.
+    pub fn transition_project_skill_operation(
+        &self,
+        id: &str,
+        expected: &str,
+        next: &str,
+    ) -> Result<()> {
+        if !matches!(
+            next,
+            "publishing"
+                | "needs_attention"
+                | "recovery_available"
+                | "cleanup_pending"
+                | "complete"
+        ) {
+            anyhow::bail!("invalid project Skill operation phase");
+        }
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE project_skill_operations SET phase=?3, updated_at=?4
+             WHERE id=?1 AND phase=?2",
+            params![id, expected, next, chrono::Utc::now().timestamp_millis()],
+        )?;
+        if count != 1 {
+            anyhow::bail!("project Skill operation changed or is missing");
+        }
+        Ok(())
+    }
+
+    /// Atomic ownership grant and operation completion. Publishing a directory
+    /// is NOT ownership; this transaction is the only first-deploy grant.
+    pub fn commit_project_skill_deploy(
+        &self,
+        operation_id: &str,
+        row: &ProjectSkillDeploymentRecord,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let valid: i64 = tx.query_row(
+            "SELECT count(*) FROM project_skill_operations
+             WHERE id=?1 AND kind='deploy' AND phase='publishing'
+               AND project_id=?2 AND skill_id=?3 AND target_path=?4
+               AND new_tree_oid=?5",
+            params![
+                operation_id,
+                row.project_id,
+                row.skill_id,
+                row.target_path,
+                row.base_tree_oid
+            ],
+            |r| r.get(0),
+        )?;
+        if valid != 1 {
+            anyhow::bail!("deployment operation is not authorized to commit");
+        }
+        let modified = tx.execute(
+            "INSERT INTO project_skill_deployments (
+                id, project_id, skill_id, target_path, agent, mode, management_state,
+                management_origin, version_match, base_commit_oid, base_tree_oid,
+                path_at_commit, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(target_path) DO UPDATE SET
+                 agent=excluded.agent, mode=excluded.mode,
+                 management_state=excluded.management_state,
+                 management_origin=excluded.management_origin,
+                 version_match=excluded.version_match,
+                 base_commit_oid=excluded.base_commit_oid,
+                 base_tree_oid=excluded.base_tree_oid,
+                 path_at_commit=excluded.path_at_commit,
+                 updated_at=excluded.updated_at
+             WHERE project_skill_deployments.project_id=excluded.project_id
+               AND project_skill_deployments.skill_id=excluded.skill_id
+               AND project_skill_deployments.mode='copy'
+               AND project_skill_deployments.management_state='managed'",
+            params![
+                row.id,
+                row.project_id,
+                row.skill_id,
+                row.target_path,
+                row.agent,
+                row.mode,
+                row.management_state,
+                row.management_origin,
+                row.version_match,
+                row.base_commit_oid,
+                row.base_tree_oid,
+                row.path_at_commit,
+                row.created_at,
+                row.updated_at
+            ],
+        )?;
+        if modified != 1 {
+            anyhow::bail!("another Skill owns this project deployment path");
+        }
+        let count = tx.execute(
+            "UPDATE project_skill_operations SET phase='complete', updated_at=?2
+             WHERE id=?1 AND kind='deploy' AND phase='publishing'",
+            params![operation_id, chrono::Utc::now().timestamp_millis()],
+        )?;
+        if count != 1 {
+            anyhow::bail!("project Skill deployment operation lost its state");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically commit the new Git base and retain the previous directory
+    /// for recovery. A DB error leaves the old baseline authoritative.
+    pub fn commit_project_skill_update(
+        &self,
+        operation_id: &str,
+        deployment_id: &str,
+        old_tree: &str,
+        new_commit: &str,
+        new_tree: &str,
+        historical_path: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE project_skill_deployments
+             SET base_commit_oid=?3, base_tree_oid=?4, path_at_commit=?5,
+                 version_match='exact', updated_at=?6
+             WHERE id=?1 AND base_tree_oid=?2 AND mode='copy'
+               AND management_state='managed'
+               AND EXISTS (
+                 SELECT 1 FROM project_skill_operations op
+                 WHERE op.id=?7 AND op.kind='update'
+                   AND op.phase='publishing' AND op.deployment_id=?1
+                   AND op.base_tree_oid=?2 AND op.new_tree_oid=?4
+                   AND op.target_path=project_skill_deployments.target_path
+               )",
+            params![
+                deployment_id,
+                old_tree,
+                new_commit,
+                new_tree,
+                historical_path,
+                chrono::Utc::now().timestamp_millis(),
+                operation_id
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("managed Copy baseline or operation changed during update");
+        }
+        let updated = tx.execute(
+            "UPDATE project_skill_operations SET phase='cleanup_pending', updated_at=?2
+             WHERE id=?1 AND phase='publishing' AND kind='update'",
+            params![operation_id, chrono::Utc::now().timestamp_millis()],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("project Skill update operation lost its state");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Durable delete: database ownership changes only after the directory
+    /// has been isolated. The isolated bytes are kept in cleanup_pending.
+    pub fn commit_project_skill_delete(
+        &self,
+        operation_id: &str,
+        project_id: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let matched: i64 = tx.query_row(
+            "SELECT count(*) FROM project_skill_operations
+             WHERE id=?1 AND project_id=?2 AND target_path=?3
+               AND kind='delete' AND phase='publishing'",
+            params![operation_id, project_id, target_path],
+            |r| r.get(0),
+        )?;
+        if matched != 1 {
+            anyhow::bail!("delete operation was not authorized or has changed");
+        }
+        tx.execute(
+            "DELETE FROM project_skill_deployments
+             WHERE project_id=?1 AND target_path=?2",
+            params![project_id, target_path],
+        )?;
+        let done = tx.execute(
+            "UPDATE project_skill_operations SET phase='cleanup_pending', updated_at=?2
+             WHERE id=?1 AND kind='delete' AND phase='publishing'",
+            params![operation_id, chrono::Utc::now().timestamp_millis()],
+        )?;
+        if done != 1 {
+            anyhow::bail!("delete operation lost its phase");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_project_skill_operations(&self) -> Result<Vec<ProjectSkillOperationRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, skill_id, deployment_id, kind, phase, target_path,
+                    recovery_root, base_tree_oid, new_tree_oid, created_at, updated_at
+             FROM project_skill_operations WHERE phase != 'complete'
+             ORDER BY created_at, id",
+        )?;
+        let entries = stmt.query_map([], |r| {
+            Ok(ProjectSkillOperationRecord {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                skill_id: r.get(2)?,
+                deployment_id: r.get(3)?,
+                kind: r.get(4)?,
+                phase: r.get(5)?,
+                target_path: r.get(6)?,
+                recovery_root: r.get(7)?,
+                base_tree_oid: r.get(8)?,
+                new_tree_oid: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+            })
+        })?;
+        entries
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     // ── Project Skill deployments / immutable Git baselines ──

@@ -11,7 +11,8 @@ use crate::core::audit_log::AuditDraft;
 use crate::core::error::TargetConflictDetail;
 use crate::core::repo_lock::RepoLock;
 use crate::core::skill_store::{
-    ProjectRecord, ProjectSkillDeploymentRecord, SkillRecord, SkillStore,
+    ProjectRecord, ProjectSkillDeploymentRecord, ProjectSkillOperationRecord, SkillRecord,
+    SkillStore,
 };
 use crate::core::timing::should_log_first_or_slow;
 use crate::core::{
@@ -592,6 +593,140 @@ fn rename_directory_no_replace(source: &Path, target: &Path) -> Result<(), AppEr
         }
         std::fs::rename(source, target).map_err(AppError::io)
     }
+}
+
+/// Best-effort startup repair for a crash after the original Copy was moved
+/// but before the SQLite outcome was committed. Never adopt, delete or replace
+/// an occupied project target. Ambiguous states are reported for inspection.
+pub fn recover_incomplete_project_skill_operations(
+    store: &SkillStore,
+) -> Result<Vec<String>, AppError> {
+    let _lock = match RepoLock::acquire_foreground("project Skill operation recovery") {
+        Ok(lock) => lock,
+        Err(err) => {
+            return Ok(vec![format!(
+                "Recovery deferred while repository is busy: {err}"
+            )]);
+        }
+    };
+    let operations = store
+        .pending_project_skill_operations()
+        .map_err(AppError::db)?;
+    let mut notices = Vec::new();
+    for op in operations {
+        let target = PathBuf::from(&op.target_path);
+        let recovery_root = PathBuf::from(&op.recovery_root);
+        // Only recover paths that still belong to the registered project.
+        // A stale/malicious SQLite path must not move arbitrary directories.
+        let project_root = store
+            .get_project_by_id(&op.project_id)
+            .map_err(AppError::db)?
+            .and_then(|project| std::fs::canonicalize(project.path).ok());
+        let parent_root = target
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok());
+        if !matches!((&project_root, &parent_root),
+            (Some(project), Some(parent)) if parent.starts_with(project)
+        ) {
+            notices.push(format!(
+                "Recovery refused for operation {}: destination is outside project",
+                op.id,
+            ));
+            continue;
+        }
+        let expected = target
+            .parent()
+            .map(|p| p.join(".atm-recovery").join(&op.id));
+        // Do not trust database-stored paths alone to authorize a write.
+        if expected.as_deref() != Some(recovery_root.as_path()) {
+            notices.push(format!("Unsafe recovery path for operation {}", op.id));
+            continue;
+        }
+        if !matches!(op.phase.as_str(), "preparing" | "publishing") {
+            notices.push(format!(
+                "Project Skill operation {} ({}) requires follow-up at {} (phase {})",
+                op.id, op.kind, op.recovery_root, op.phase,
+            ));
+            continue;
+        }
+        if op.phase == "preparing" {
+            // No destructive filesystem action is permitted during preparing.
+            // End the active reservation only when the original still exists
+            // for update/delete or the deploy destination is still absent.
+            let unchanged_position = if op.kind == "deploy" {
+                std::fs::symlink_metadata(&target).is_err()
+            } else {
+                std::fs::symlink_metadata(&target).is_ok()
+            };
+            if unchanged_position {
+                let _ = store.transition_project_skill_operation(
+                    &op.id,
+                    "preparing",
+                    "recovery_available",
+                );
+                notices.push(format!(
+                    "Interrupted {} preparation {} retained at {}",
+                    op.kind,
+                    op.id,
+                    recovery_root.display(),
+                ));
+                continue;
+            }
+        }
+        if op.phase == "publishing"
+            && op.kind == "deploy"
+            && std::fs::symlink_metadata(&target).is_err()
+        {
+            let _ = store.transition_project_skill_operation(
+                &op.id,
+                "publishing",
+                "recovery_available",
+            );
+            notices.push(format!(
+                "Interrupted deploy {} staged content retained at {}",
+                op.id,
+                recovery_root.display(),
+            ));
+            continue;
+        }
+        if op.phase == "publishing" && matches!(op.kind.as_str(), "update" | "delete") {
+            let previous = recovery_root.join("previous");
+            if std::fs::symlink_metadata(&target).is_err()
+                && std::fs::symlink_metadata(&previous)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                && std::fs::symlink_metadata(&recovery_root)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                && std::fs::symlink_metadata(recovery_root.parent().unwrap())
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            {
+                if rename_directory_no_replace(&previous, &target).is_ok() {
+                    let _ = store.transition_project_skill_operation(
+                        &op.id,
+                        "publishing",
+                        "recovery_available",
+                    );
+                    notices.push(format!(
+                        "Restored interrupted {} operation {} to {}",
+                        op.kind,
+                        op.id,
+                        target.display(),
+                    ));
+                    continue;
+                }
+            }
+        }
+        // Deploy operations are especially conservative: a matching Tree
+        // might have been placed by an outsider during the interrupted run.
+        // Keep their journal and filesystem bytes; never auto-grant ownership.
+        notices.push(format!(
+            "Incomplete project Skill {} operation {}: target {}, recovery {}",
+            op.kind,
+            op.id,
+            target.display(),
+            recovery_root.display(),
+        ));
+    }
+    Ok(notices)
 }
 
 /// The only authoritative Copy classification uses its immutable deployment
@@ -1389,92 +1524,164 @@ pub fn update_managed_project_copy(
         return Ok(());
     }
 
-    let staging = tempfile::Builder::new()
-        .prefix(".atm-skill-update-")
-        .tempdir_in(
-            target_path
-                .parent()
-                .ok_or_else(|| AppError::invalid_input("Invalid managed Copy path"))?,
-        )
-        .map_err(AppError::io)?;
-    let staged = staging.path().join("new");
-    let backup = staging.path().join("previous");
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let recovery_home = target_path
+        .parent()
+        .ok_or_else(|| AppError::invalid_input("Invalid managed Copy path"))?
+        .join(".atm-recovery");
+    match std::fs::symlink_metadata(&recovery_home) {
+        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+            return Err(AppError::invalid_input("Unsafe Copy recovery directory"));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&recovery_home)?;
+        }
+        Err(err) => return Err(AppError::io(err)),
+    }
+    let operation_root = recovery_home.join(&operation_id);
+    let now = chrono::Utc::now().timestamp_millis();
+    store
+        .insert_project_skill_operation(&ProjectSkillOperationRecord {
+            id: operation_id.clone(),
+            project_id: project_id.to_owned(),
+            skill_id: deployment.skill_id.clone(),
+            deployment_id: Some(deployment.id.clone()),
+            kind: "update".to_owned(),
+            phase: "preparing".to_owned(),
+            target_path: target_string.to_string(),
+            recovery_root: operation_root.to_string_lossy().to_string(),
+            base_tree_oid: Some(base_tree.to_owned()),
+            new_tree_oid: Some(wanted.tree_oid.clone()),
+            created_at: now,
+            updated_at: now,
+        })
+        .map_err(AppError::db)?;
+    std::fs::create_dir(&operation_root)?;
+    let staged = operation_root.join("new");
+    let backup = operation_root.join("previous");
     git_skill_versions::materialize_skill_version(&root, &wanted, &staged).map_err(AppError::io)?;
+    store
+        .transition_project_skill_operation(&operation_id, "preparing", "publishing")
+        .map_err(AppError::db)?;
 
-    // Re-check at the destructive boundary, not only at the UI preflight.
+    // Verify immediately before moving the old Copy. An outsider may write
+    // through an already-open file handle even after the move; the previous
+    // directory is therefore retained persistently after success.
     if !git_skill_versions::matches_skill_tree(&root, base_tree, target_path)
         .map_err(AppError::io)?
     {
+        let _ = store.transition_project_skill_operation(
+            &operation_id,
+            "publishing",
+            "recovery_available",
+        );
         return Err(AppError::invalid_input(
-            "Project Skill changed during update; old Copy preserved",
+            "Project Skill changed during update; original Copy preserved",
         ));
     }
     rename_directory_no_replace(target_path, &backup)?;
-    let result: Result<(), AppError> = (|| {
-        // A foreign writer could occupy the target during the rename gap.
-        if std::fs::symlink_metadata(target_path).is_ok() {
-            return Err(AppError::invalid_input(
-                "Target occupied during managed Copy update",
-            ));
-        }
-        rename_directory_no_replace(&staged, target_path)?;
-        if !git_skill_versions::matches_skill_tree(&root, &wanted.tree_oid, target_path)
-            .map_err(AppError::io)?
-        {
-            return Err(AppError::invalid_input(
-                "Published Copy did not match selected Git Tree",
-            ));
-        }
-        store
-            .update_project_skill_deployment_version(
-                &deployment.id,
-                &wanted.commit_oid,
-                &wanted.tree_oid,
-                &wanted.path_at_commit,
-            )
-            .map_err(AppError::db)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        if std::fs::symlink_metadata(target_path).is_ok() {
-            // Once published, our *unchanged* new tree may be moved aside to
-            // restore the prior Copy after a database failure. If anyone has
-            // touched it (or inserted a foreign entry), never delete it.
-            let still_ours =
-                git_skill_versions::matches_skill_tree(&root, &wanted.tree_oid, target_path)
-                    .unwrap_or(false);
-            if still_ours {
-                if rename_directory_no_replace(target_path, &staging.path().join("failed-new"))
-                    .is_ok()
-                {
-                    if let Err(rollback) = rename_directory_no_replace(&backup, target_path) {
-                        let recovery = staging.keep();
-                        return Err(AppError::invalid_input(format!(
-                            "{error}; rollback failed ({rollback}); previous Copy at {}",
-                            recovery.join("previous").display(),
-                        )));
-                    }
-                    return Err(error);
-                }
-            }
-            // The foreign occupant is not ours to delete. Retain the original
-            // Copy in a persistent recovery directory instead.
-            let recovery = staging.keep();
-            return Err(AppError::invalid_input(format!(
-                "{error}; original Copy preserved at {}",
-                recovery.join("previous").display(),
-            )));
-        }
-        if let Err(rollback) = std::fs::rename(&backup, target_path) {
-            let recovery = staging.keep();
-            return Err(AppError::invalid_input(format!(
-                "{error}; rollback failed ({rollback}); original at {}",
-                recovery.join("previous").display(),
-            )));
-        }
-        return Err(error);
+    if !git_skill_versions::matches_skill_tree(&root, base_tree, &backup).unwrap_or(false) {
+        return Err(restore_failed_project_copy_update(
+            store,
+            &operation_id,
+            &root,
+            &wanted.tree_oid,
+            target_path,
+            &backup,
+            &operation_root,
+            "Project Copy changed while moving it to recovery",
+        ));
     }
+    // The previous directory is still available at operation_root/previous.
+    // Never remove this backup solely because a snapshot compared equal once.
+    if let Err(err) = rename_directory_no_replace(&staged, target_path) {
+        return Err(restore_failed_project_copy_update(
+            store,
+            &operation_id,
+            &root,
+            &wanted.tree_oid,
+            target_path,
+            &backup,
+            &operation_root,
+            &format!("Unable to publish the new Copy: {err}"),
+        ));
+    }
+    if !git_skill_versions::matches_skill_tree(&root, &wanted.tree_oid, target_path)
+        .unwrap_or(false)
+    {
+        return Err(restore_failed_project_copy_update(
+            store,
+            &operation_id,
+            &root,
+            &wanted.tree_oid,
+            target_path,
+            &backup,
+            &operation_root,
+            "Published Copy differs from selected Git version",
+        ));
+    }
+    if let Err(err) = store.commit_project_skill_update(
+        &operation_id,
+        &deployment.id,
+        base_tree,
+        &wanted.commit_oid,
+        &wanted.tree_oid,
+        &wanted.path_at_commit,
+    ) {
+        return Err(restore_failed_project_copy_update(
+            store,
+            &operation_id,
+            &root,
+            &wanted.tree_oid,
+            target_path,
+            &backup,
+            &operation_root,
+            &format!("Copy update database commit failed: {err}"),
+        ));
+    }
+    // Deliberately keep operation_root/previous in cleanup_pending:
+    // another process might still be writing to a descriptor of the old
+    // directory. Cleanup requires an explicit, separately authorized step.
     Ok(())
+}
+
+/// Never discard original or unexpectedly changed user data when an update
+/// fails. Restoring the old path uses no-replace rename, and an occupied path
+/// is never removed. The journal stays available for startup diagnostics.
+fn restore_failed_project_copy_update(
+    store: &SkillStore,
+    operation_id: &str,
+    root: &Path,
+    new_tree: &str,
+    target: &Path,
+    backup: &Path,
+    operation_root: &Path,
+    reason: &str,
+) -> AppError {
+    if std::fs::symlink_metadata(target).is_ok()
+        && git_skill_versions::matches_skill_tree(root, new_tree, target).unwrap_or(false)
+    {
+        let _ = rename_directory_no_replace(target, &operation_root.join("failed-new"));
+    }
+    let restored = std::fs::symlink_metadata(target).is_err()
+        && std::fs::symlink_metadata(backup).is_ok()
+        && rename_directory_no_replace(backup, target).is_ok();
+    let phase = if restored {
+        "recovery_available"
+    } else {
+        "needs_attention"
+    };
+    let _ = store.transition_project_skill_operation(operation_id, "publishing", phase);
+    AppError::invalid_input(format!(
+        "{reason}; old Copy {} and recovery directory {}",
+        if restored {
+            "restored"
+        } else {
+            "retained for recovery"
+        },
+        operation_root.display(),
+    ))
 }
 
 #[tauri::command]
@@ -1618,11 +1825,151 @@ pub async fn delete_project_skill(
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // The frontend has already asked before removing a copy that is not
-        // in sync (confirmUnsyncedRemoval), so the guard below is the CLI's.
-        delete_project_skill_internal(&store, project_id, skill_relative_path, agent, true)
+        // The GUI is a normal undeploy, not an unscoped destructive grant.
+        // Preflight UI sync_status is neither ownership nor authorization.
+        // An explicitly authorized external/modified deletion will require
+        // a separate Core operation carrying target-scoped consent.
+        delete_project_skill_internal(&store, project_id, skill_relative_path, agent, false)
     })
     .await?
+}
+
+/// Shared Core delete boundary. Ordinary removal requires a manager-owned,
+/// unchanged Copy (or a recognized manager Symlink); explicit force is a
+/// separately requested destructive CLI action, not inferred from in_sync.
+fn quarantine_project_skill_delete(
+    store: &SkillStore,
+    project_id: &str,
+    target: &Path,
+    explicit_force: bool,
+) -> Result<(), AppError> {
+    let _lock = RepoLock::acquire_foreground("project Skill delete").map_err(AppError::io)?;
+    let meta = std::fs::symlink_metadata(target)?;
+    if meta.file_type().is_symlink() {
+        // A Symlink contains no owned file bytes; removing it never follows
+        // the link into the source directory.
+        return remove_workspace_skill_target(target);
+    }
+    if !meta.is_dir() {
+        return Err(AppError::invalid_input(
+            "Skill deletion target is not a directory",
+        ));
+    }
+    let old = store
+        .get_project_skill_deployment(project_id, &target.to_string_lossy())
+        .map_err(AppError::db)?;
+    if !explicit_force {
+        let row = old.as_ref().ok_or_else(|| {
+            AppError::invalid_input(
+                "Cannot delete unowned external Skill without explicit target authorization",
+            )
+        })?;
+        if row.management_state != "managed" || row.mode != "copy" {
+            return Err(AppError::invalid_input("Not an authorized managed Copy"));
+        }
+        let tree = row
+            .base_tree_oid
+            .as_deref()
+            .ok_or_else(|| AppError::invalid_input("Missing trusted deletion baseline"))?;
+        if !git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, target)
+            .map_err(AppError::io)?
+        {
+            return Err(AppError::invalid_input(
+                "Project Skill differs from its managed baseline; explicit deletion required",
+            ));
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let recovery_home = target
+        .parent()
+        .ok_or_else(|| AppError::invalid_input("Skill target has no parent"))?
+        .join(".atm-recovery");
+    match std::fs::symlink_metadata(&recovery_home) {
+        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+            return Err(AppError::invalid_input(
+                "Unsafe Copy deletion recovery location",
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&recovery_home)?;
+        }
+        Err(err) => return Err(AppError::io(err)),
+    }
+    let recovery_root = recovery_home.join(&id);
+    let backup = recovery_root.join("previous");
+    let now = chrono::Utc::now().timestamp_millis();
+    store
+        .insert_project_skill_operation(&ProjectSkillOperationRecord {
+            id: id.clone(),
+            project_id: project_id.to_owned(),
+            skill_id: old
+                .as_ref()
+                .map(|o| o.skill_id.clone())
+                .unwrap_or_else(|| "external-unmanaged".to_owned()),
+            deployment_id: old.as_ref().map(|o| o.id.clone()),
+            kind: "delete".to_owned(),
+            phase: "preparing".to_owned(),
+            target_path: target.to_string_lossy().to_string(),
+            recovery_root: recovery_root.to_string_lossy().to_string(),
+            base_tree_oid: old.as_ref().and_then(|o| o.base_tree_oid.clone()),
+            new_tree_oid: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .map_err(AppError::db)?;
+    std::fs::create_dir(&recovery_root)?;
+    store
+        .transition_project_skill_operation(&id, "preparing", "publishing")
+        .map_err(AppError::db)?;
+    rename_directory_no_replace(target, &backup)?;
+    // Between the preflight and rename, an external writer may alter a Copy.
+    // In ordinary removal that is a conflict, not implicit permission.
+    let moved_is_clean = old
+        .as_ref()
+        .and_then(|o| o.base_tree_oid.as_deref())
+        .is_some_and(|tree| {
+            git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, &backup)
+                .unwrap_or(false)
+        });
+    if !explicit_force && !moved_is_clean {
+        let restored = rename_directory_no_replace(&backup, target).is_ok();
+        let _ = store.transition_project_skill_operation(
+            &id,
+            "publishing",
+            if restored {
+                "recovery_available"
+            } else {
+                "needs_attention"
+            },
+        );
+        return Err(AppError::invalid_input(format!(
+            "Copy changed while moving it; contents {} at {}",
+            if restored { "restored" } else { "preserved" },
+            if restored { target } else { backup.as_path() }.display(),
+        )));
+    }
+    if let Err(err) = store.commit_project_skill_delete(&id, project_id, &target.to_string_lossy())
+    {
+        let restored = rename_directory_no_replace(&backup, target).is_ok();
+        let _ = store.transition_project_skill_operation(
+            &id,
+            "publishing",
+            if restored {
+                "recovery_available"
+            } else {
+                "needs_attention"
+            },
+        );
+        return Err(AppError::invalid_input(format!(
+            "Skill deletion database commit failed ({err}); previous content {} at {}",
+            if restored { "restored" } else { "preserved" },
+            if restored { target } else { backup.as_path() }.display(),
+        )));
+    }
+    // Success is not permission to destroy old bytes. Keep the quarantine
+    // under cleanup_pending; another process may still hold a file handle.
+    Ok(())
 }
 
 /// Remove one skill directory from a project workspace: the enabled copy if
@@ -1665,11 +2012,7 @@ pub fn delete_project_skill_internal(
     if !force {
         ensure_removable(store, &record, &target)?;
     }
-    remove_workspace_skill_target(&target)?;
-    store
-        .delete_project_skill_deployment(&project_id, &target.to_string_lossy())
-        .map_err(AppError::db)?;
-    Ok(())
+    quarantine_project_skill_delete(store, &project_id, &target, force)
 }
 
 /// Remove exactly the copy a removal plan named. Without `force`, the copy is
@@ -1690,14 +2033,26 @@ pub fn remove_planned_project_copy(
         .find(|root| path.starts_with(root))
         .ok_or_else(|| AppError::invalid_input("Invalid skill directory path"))?;
     ensure_dir_within_root(&path, &root)?;
+    if target.expected_target_identity.is_none()
+        || target.expected_target_identity != project_target_identity(&path)
+    {
+        return Err(AppError::invalid_input(
+            "The planned Skill target was replaced; destructive authorization is stale",
+        ));
+    }
+    if let Some(existing) = store.get_project_skill_deployment(
+        project_id, &path.to_string_lossy(),
+    ).map_err(AppError::db)? {
+        if existing.skill_id != target.skill_id {
+            return Err(AppError::invalid_input(
+                "Planned SkillId differs from the registered deployment owner",
+            ));
+        }
+    }
     if !force {
         ensure_removable(store, &record, &path)?;
     }
-    remove_workspace_skill_target(&path)?;
-    store
-        .delete_project_skill_deployment(project_id, &path.to_string_lossy())
-        .map_err(AppError::db)?;
-    Ok(())
+    quarantine_project_skill_delete(store, project_id, &path, force)
 }
 
 /// Refuse unless what sits at `target` is a scanned project skill whose
@@ -2119,6 +2474,7 @@ pub fn apply_project_deploy(
     store: &SkillStore,
     plan: &[ProjectDeployTarget],
 ) -> Result<(), AppError> {
+    let _lock = RepoLock::acquire_foreground("project Skill deploy").map_err(AppError::io)?;
     let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
     // Two agents can resolve to the same project skills root; write it once.
     let mut written: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -2140,26 +2496,46 @@ pub fn apply_project_deploy(
                     "Deployment mode changed during Copy planning",
                 ));
             }
-            let staging = tempfile::Builder::new()
-                .prefix(".atm-skill-")
-                .tempdir_in(target_dir.parent().expect("project Skill has a parent"))
-                .map_err(AppError::io)?;
-            let staged = staging.path().join("content");
-            git_skill_versions::materialize_skill_version(
-                &central_repo::skills_dir(),
-                version,
-                &staged,
-            )
-            .map_err(AppError::io)?;
-            if std::fs::symlink_metadata(&target_dir).is_ok() {
+            // Keep an operation record before publishing any project bytes.
+            // A crash in the rename→SQLite gap is discoverable on restart.
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let recovery_home = target_dir
+                .parent()
+                .expect("project Skill has a parent")
+                .join(".atm-recovery");
+            match std::fs::symlink_metadata(&recovery_home) {
+                Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                    return Err(AppError::invalid_input(
+                        "Project Skill recovery location is unsafe",
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&recovery_home)?;
+                }
+                Err(err) => return Err(AppError::io(err)),
+            }
+            let operation_root = recovery_home.join(&operation_id);
+            let now = chrono::Utc::now().timestamp_millis();
+            // Re-install a deleted previously managed target with the same
+            // DeploymentId; never infer new ownership from identical files.
+            let prior = store
+                .get_project_skill_deployment(&target.project_id, &target.path)
+                .map_err(AppError::db)?;
+            if prior.as_ref().is_some_and(|row| {
+                row.skill_id != target.skill_id
+                    || row.management_state != "managed"
+                    || row.mode != "copy"
+            }) {
                 return Err(AppError::invalid_input(
-                    "Project Skill target became occupied",
+                    "Existing deployment is not owned by this Skill",
                 ));
             }
-            rename_directory_no_replace(&staged, &target_dir)?;
-            let now = chrono::Utc::now().timestamp_millis();
             let record = ProjectSkillDeploymentRecord {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: prior
+                    .as_ref()
+                    .map(|row| row.id.clone())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 project_id: target.project_id.clone(),
                 skill_id: target.skill_id.clone(),
                 target_path: target.path.clone(),
@@ -2175,8 +2551,77 @@ pub fn apply_project_deploy(
                 updated_at: now,
             };
             store
-                .insert_project_skill_deployment(&record)
+                .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                    id: operation_id.clone(),
+                    project_id: target.project_id.clone(),
+                    skill_id: target.skill_id.clone(),
+                    deployment_id: Some(record.id.clone()),
+                    kind: "deploy".to_owned(),
+                    phase: "preparing".to_owned(),
+                    target_path: target.path.clone(),
+                    recovery_root: operation_root.to_string_lossy().to_string(),
+                    base_tree_oid: None,
+                    new_tree_oid: Some(version.tree_oid.clone()),
+                    created_at: now,
+                    updated_at: now,
+                })
                 .map_err(AppError::db)?;
+            std::fs::create_dir(&operation_root)?;
+            let staged = operation_root.join("new");
+            git_skill_versions::materialize_skill_version(
+                &central_repo::skills_dir(),
+                version,
+                &staged,
+            )
+            .map_err(AppError::io)?;
+            store
+                .transition_project_skill_operation(&operation_id, "preparing", "publishing")
+                .map_err(AppError::db)?;
+            if std::fs::symlink_metadata(&target_dir).is_ok() {
+                return Err(AppError::invalid_input(
+                    "Project Skill target became occupied; operation preserved for recovery",
+                ));
+            }
+            rename_directory_no_replace(&staged, &target_dir)?;
+            match store.commit_project_skill_deploy(&operation_id, &record) {
+                Ok(()) => {
+                    // Safe cleanup: the staged directory was moved, and this
+                    // removes only an *empty* manager-owned operation directory.
+                    let _ = std::fs::remove_dir(&operation_root);
+                }
+                Err(err) => {
+                    // Never erase potentially edited bytes just to make an
+                    // aborted deployment look atomic. Save them at a stable
+                    // recovery path when the target is still the exact Tree.
+                    let saved = operation_root.join("recovered");
+                    let safe_to_move = git_skill_versions::matches_skill_tree(
+                        &central_repo::skills_dir(),
+                        &version.tree_oid,
+                        &target_dir,
+                    )
+                    .unwrap_or(false);
+                    if safe_to_move && rename_directory_no_replace(&target_dir, &saved).is_ok() {
+                        let _ = store.transition_project_skill_operation(
+                            &operation_id,
+                            "publishing",
+                            "recovery_available",
+                        );
+                        return Err(AppError::invalid_input(format!(
+                            "Copy deployment database commit failed ({err});                              unpublished content preserved at {}",
+                            saved.display(),
+                        )));
+                    }
+                    let _ = store.transition_project_skill_operation(
+                        &operation_id,
+                        "publishing",
+                        "needs_attention",
+                    );
+                    return Err(AppError::invalid_input(format!(
+                        "Copy deployment database commit failed ({err});                          target was not claimed or deleted, inspect {} and {}",
+                        target_dir.display(), operation_root.display(),
+                    )));
+                }
+            }
         } else {
             sync_engine::sync_skill(
                 &target.source,
@@ -2190,6 +2635,23 @@ pub fn apply_project_deploy(
     Ok(())
 }
 
+/// Bind a planned destructive action to the filesystem object that was
+/// observed during explicit CLI preflight, not just its editable pathname.
+#[cfg(unix)]
+fn project_target_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn project_target_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::time::UNIX_EPOCH;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    let time = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((m.len(), time.as_nanos() as u64))
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct ProjectRemovalTarget {
     pub skill_id: String,
@@ -2201,6 +2663,8 @@ pub struct ProjectRemovalTarget {
     pub sync_status: String,
     /// False when the copy may hold content the library does not have.
     pub safe: bool,
+    #[serde(skip)]
+    expected_target_identity: Option<(u64, u64)>,
 }
 
 /// Only a hash match proves a copy holds nothing of its own; `center_newer`
@@ -2350,6 +2814,7 @@ pub fn plan_project_undeploy(
             path: variant.path.clone(),
             safe: managed_removal_is_safe(store, project_id, variant, Some(matched), &sync_status)?,
             sync_status,
+            expected_target_identity: project_target_identity(Path::new(&variant.path)),
         });
     }
     Ok(plan)
@@ -3462,6 +3927,300 @@ mod project_plan_tests {
             .collect()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn late_writer_using_old_file_handle_updates_retained_backup_not_new_copy() {
+        use std::io::{Seek, SeekFrom, Write};
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "old");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let mut late_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(target.join("SKILL.md"))
+            .unwrap();
+
+        let central = Path::new(&skill.central_path).join("SKILL.md");
+        fs::write(&central, "---\nname: demo\n---\nnew committed copy\n").unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        late_writer.seek(SeekFrom::Start(0)).unwrap();
+        late_writer.write_all(b"AFTER-RENAME-WRITE").unwrap();
+        late_writer.flush().unwrap();
+
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("new committed copy"));
+        let ops = fx.store.pending_project_skill_operations().unwrap();
+        let retained = ops
+            .iter()
+            .find(|op| op.kind == "update" && op.phase == "cleanup_pending")
+            .unwrap();
+        let previous = Path::new(&retained.recovery_root).join("previous/SKILL.md");
+        assert!(fs::read_to_string(&previous)
+            .unwrap()
+            .contains("AFTER-RENAME-WRITE"));
+    }
+
+    #[test]
+    fn copy_delete_db_failure_restores_directory_and_ownership() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "old");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let original = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER deny_delete BEFORE DELETE ON project_skill_deployments
+             BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;",
+        )
+        .unwrap();
+        let result = delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            original
+        );
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .is_some());
+        let ops = fx.store.pending_project_skill_operations().unwrap();
+        assert!(ops
+            .iter()
+            .any(|op| op.kind == "delete" && op.phase == "recovery_available"));
+    }
+
+    #[test]
+    fn crash_recovery_restores_old_copy_when_update_was_interrupted_after_move() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let record = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let prior = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let recovery = target.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir(&recovery).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id.clone(),
+                deployment_id: Some(record.id.clone()),
+                kind: "update".into(),
+                phase: "preparing".into(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: record.base_tree_oid.clone(),
+                new_tree_oid: record.base_tree_oid.clone(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        rename_directory_no_replace(&target, &recovery.join("previous")).unwrap();
+        assert!(!target.exists());
+
+        let reopened = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(notices
+            .iter()
+            .any(|msg| msg.contains(&id) && msg.contains("Restored")));
+        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), prior);
+        assert_eq!(
+            reopened
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .base_tree_oid,
+            record.base_tree_oid
+        );
+        assert!(reopened
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == id && op.phase == "recovery_available"));
+        // Running startup recovery again has no destructive side effects.
+        let second = recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(second.iter().any(|msg| msg.contains(&id)));
+        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), prior);
+    }
+
+    #[test]
+    fn crash_after_copy_publish_keeps_intent_but_does_not_auto_claim_target() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let version =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &skill.id, None)
+                .unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let recovery = target
+            .parent()
+            .unwrap()
+            .join(".atm-recovery/simulated-crash");
+        fs::create_dir_all(&recovery).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id.clone(),
+                deployment_id: Some(uuid::Uuid::new_v4().to_string()),
+                kind: "deploy".into(),
+                phase: "preparing".into(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: Some(version.tree_oid.clone()),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        git_skill_versions::materialize_skill_version(
+            &central_repo::skills_dir(),
+            &version,
+            &recovery.join("new"),
+        )
+        .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        rename_directory_no_replace(&recovery.join("new"), &target).unwrap();
+        // Simulate a restarted database reader. Content equality and a
+        // pending intent must NOT grant management automatically.
+        let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        assert!(restarted
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == id && op.phase == "publishing"));
+        assert!(restarted
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .is_none());
+        let plan = plan_project_deploy(
+            &restarted,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(plan[0].state, ProjectDeployState::Conflict);
+        assert!(target.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn first_copy_deploy_database_failure_retains_recovery_and_does_not_grant_ownership() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        let db_path = fx._tmp.path().join("skills.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_first_deploy BEFORE INSERT ON project_skill_deployments
+             BEGIN SELECT RAISE(ABORT, 'injected deploy commit failure'); END;",
+        )
+        .unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let err = apply_project_deploy(&fx.store, &plan).unwrap_err();
+        assert!(err.to_string().contains("database commit failed"), "{err}");
+        assert!(
+            !target.exists(),
+            "unmanaged directory must not remain at target"
+        );
+        assert!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .is_none(),
+            "a failed DB transaction grants no ownership"
+        );
+        let pending = fx.store.pending_project_skill_operations().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "deploy");
+        assert_eq!(pending[0].phase, "recovery_available");
+        assert_eq!(pending[0].deployment_id.is_some(), true);
+        let recovered = Path::new(&pending[0].recovery_root).join("recovered");
+        assert!(recovered.join("SKILL.md").exists());
+        conn.execute_batch("DROP TRIGGER deny_first_deploy")
+            .unwrap();
+
+        // Retry can install a fresh committed Copy without claiming the old
+        // recovery data, which stays available for manual inspection.
+        let retry = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &retry).unwrap();
+        assert!(target.join("SKILL.md").is_file());
+        assert!(recovered.join("SKILL.md").is_file());
+        assert_eq!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .management_state,
+            "managed"
+        );
+    }
+
     #[test]
     fn git_copy_deploys_committed_bytes_and_tracks_exact_version() {
         let fx = fixture(&["claude_code"]);
@@ -4119,6 +4878,24 @@ mod project_plan_tests {
         remove_planned_project_copy(&fx.store, &fx.project_id, &plan[0], true).unwrap();
         assert!(!disabled.exists());
         assert!(junk.join("notes.txt").is_file());
+    }
+
+    #[test]
+    fn force_undeploy_refuses_a_target_replaced_after_the_plan() {
+        let fx = fixture(&["claude_code"]);
+        let skill = library_skill(&fx, "s-demo", "demo", "# Demo");
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "---\nname: demo\n---\n# Demo\n").unwrap();
+        let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&skill]), &[]).unwrap();
+        assert_eq!(plan.len(), 1);
+        let parked = target.with_file_name("original-parked");
+        fs::rename(&target, &parked).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("external"), "do not touch").unwrap();
+        assert!(remove_planned_project_copy(&fx.store, &fx.project_id, &plan[0], true,).is_err());
+        assert!(target.join("external").exists());
+        assert!(parked.join("SKILL.md").exists());
     }
 
     /// A link the user made to somewhere else is their configuration, even

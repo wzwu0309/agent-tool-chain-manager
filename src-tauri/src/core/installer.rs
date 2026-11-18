@@ -305,6 +305,22 @@ mod tests {
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
 
+    #[test]
+    fn current_manage_skills_is_installable_with_new_cli_name() {
+        // Install the exact skill in the PR checkout, without touching any
+        // user's central library, agent skills directories or keychain.
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../skills/manage-skills");
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("manage-skills");
+        let result = install_from_local_to_destination(&source, None, &dest).unwrap();
+        assert_eq!(result.name, "manage-skills");
+        let installed = std::fs::read_to_string(dest.join("SKILL.md")).unwrap();
+        assert!(installed.contains("agent-toolchain-manager-cli"));
+        assert!(installed.contains("~/.agent-toolchain-manager/bin"));
+        assert!(!installed.contains("skills-manager-cli"));
+    }
+
     fn make_skill_dir(parent: &Path, dir_name: &str, meta_name: Option<&str>) -> PathBuf {
         let dir = parent.join(dir_name);
         std::fs::create_dir_all(&dir).unwrap();

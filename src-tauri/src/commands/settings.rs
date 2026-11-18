@@ -1,14 +1,14 @@
-use semver::Version;
 use std::process::Command;
 use std::sync::Arc;
 use tauri::{Manager, State};
 
 use crate::core::{
-    central_repo, error::AppError, file_manager, log_sanitize, skill_store::SkillStore, skillssh_api,
+    central_repo, error::AppError, file_manager, log_sanitize, skill_store::SkillStore,
 };
 
 #[derive(serde::Serialize)]
 pub struct AppUpdateInfo {
+    pub updates_enabled: bool,
     pub has_update: bool,
     pub current_version: String,
     pub latest_version: String,
@@ -140,42 +140,18 @@ pub async fn open_central_repo_folder() -> Result<(), AppError> {
     .await?
 }
 
+/// Fork safety: app updates are disabled until this fork establishes its own
+/// signed release channel. Never query upstream release metadata.
 #[tauri::command]
-pub async fn check_app_update(
-    app: tauri::AppHandle,
-    store: State<'_, Arc<SkillStore>>,
-) -> Result<AppUpdateInfo, AppError> {
+pub async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateInfo, AppError> {
     let current_version = app.config().version.clone().unwrap_or_default();
-    let proxy_url = store.proxy_url();
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = skillssh_api::build_http_client(proxy_url.as_deref(), 15);
-
-        let resp: serde_json::Value = client
-            .get("https://api.github.com/repos/xingkongliang/skills-manager/releases/latest")
-            .send()
-            .map_err(|e| AppError::network(format!("Network error: {e}")))?
-            .json()
-            .map_err(|e| AppError::network(format!("Failed to parse response: {e}")))?;
-
-        let tag = resp["tag_name"]
-            .as_str()
-            .ok_or_else(|| AppError::network("No tag_name in response"))?;
-        let latest_version = tag.strip_prefix('v').unwrap_or(tag).to_string();
-        let release_url = resp["html_url"]
-            .as_str()
-            .unwrap_or("https://github.com/xingkongliang/skills-manager/releases")
-            .to_string();
-
-        let has_update = version_gt(&latest_version, &current_version);
-
-        Ok(AppUpdateInfo {
-            has_update,
-            current_version,
-            latest_version,
-            release_url,
-        })
+    Ok(AppUpdateInfo {
+        updates_enabled: false,
+        has_update: false,
+        latest_version: current_version.clone(),
+        current_version,
+        release_url: "https://github.com/wzwu0309/agent-toolchain-manager/releases".into(),
     })
-    .await?
 }
 
 #[derive(serde::Serialize)]
@@ -740,15 +716,4 @@ pub async fn hide_to_tray(
     #[cfg(not(target_os = "macos"))]
     let _ = app;
     Ok(())
-}
-
-fn version_gt(a: &str, b: &str) -> bool {
-    // Prefer strict SemVer comparison (supports pre-release/build metadata).
-    if let (Ok(a_ver), Ok(b_ver)) = (Version::parse(a), Version::parse(b)) {
-        return a_ver > b_ver;
-    }
-
-    // Fallback for non-SemVer tags.
-    let parse = |s: &str| -> Vec<u64> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
-    parse(a) > parse(b)
 }

@@ -1,12 +1,12 @@
 [package]
-name = "skills-manager"
+name = "agent-toolchain-manager"
 version = "1.45.0"
-description = "Skills Manager - AI Agent Skills Central Manager"
+description = "Agent Toolchain Manager - project-first agent capability manager"
 authors = ["tianliang"]
 license = "MIT"
 edition = "2021"
 rust-version = "1.77.2"
-default-run = "skills-manager"
+default-run = "agent-toolchain-manager"
 
 [lib]
 name = "app_lib"

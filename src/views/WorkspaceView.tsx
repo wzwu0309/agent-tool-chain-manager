@@ -298,7 +298,7 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
   }, [installedTools, managedSkills]);
 
   // Overview cards should reflect each agent's ACTUAL on-disk skill count —
-  // including skills installed outside Skills Manager — to match the per-agent
+  // including skills installed outside Agent Toolchain Manager — to match the per-agent
   // detail badge. The managed-only count above reads 0 for an agent whose
   // skills all live on disk but were never imported (#287). We fill this from a
   // per-agent scan and fall back to the managed count until it resolves.

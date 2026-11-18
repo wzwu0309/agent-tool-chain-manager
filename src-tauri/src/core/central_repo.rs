@@ -94,7 +94,7 @@ fn default_base_dir() -> PathBuf {
     home_base_dir()
 }
 
-/// `~/.skills-manager`, ignoring any configured relocation.
+/// `~/.agent-toolchain-manager`, ignoring any configured relocation.
 ///
 /// The library can be moved anywhere the user likes, but a few things must
 /// stay where another program can find them without being told — the CLI
@@ -106,11 +106,11 @@ pub fn home_base_dir() -> PathBuf {
         .unwrap()
         .clone()
     {
-        return path.join(".skills-manager");
+        return path.join(".agent-toolchain-manager");
     }
     dirs::home_dir()
         .expect("Cannot determine home directory")
-        .join(".skills-manager")
+        .join(".agent-toolchain-manager")
 }
 
 #[cfg(test)]
@@ -141,7 +141,7 @@ fn config_file_path() -> PathBuf {
     }
     dirs::config_dir()
         .unwrap_or_else(default_base_dir)
-        .join("skills-manager")
+        .join("agent-toolchain-manager")
         .join(CONFIG_FILE_NAME)
 }
 
@@ -933,29 +933,6 @@ pub fn ensure_central_repo(allow_migration: bool) -> Result<()> {
         }
         downgrade_library_lease();
     }
-    // Re-resolve: a completed move changed the base.
-    let current_base = base_dir();
-
-    // Legacy `.agent-skills` migration must run before create_dir_all below:
-    // it renames entries into `current_base` and skips ones that already
-    // exist, so pre-created empty dirs would silently swallow it (the old
-    // ordering made this branch dead code).
-    let legacy_path = dirs::home_dir().map(|home| home.join(".agent-skills"));
-    if let Some(old_path) = legacy_path {
-        if old_path.exists() && !current_base.join("skills").exists() {
-            log::info!("Migrating from old path {:?}", old_path);
-            fs::create_dir_all(&current_base)?;
-            if let Ok(entries) = fs::read_dir(&old_path) {
-                for entry in entries.flatten() {
-                    let dest = current_base.join(entry.file_name());
-                    if !dest.exists() {
-                        let _ = fs::rename(entry.path(), &dest);
-                    }
-                }
-            }
-        }
-    }
-
     let dirs = [skills_dir(), scenarios_dir(), cache_dir(), logs_dir()];
     for d in &dirs {
         fs::create_dir_all(d)?;
@@ -967,6 +944,16 @@ pub fn ensure_central_repo(allow_migration: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_home_store_and_cli_bridge_root_do_not_overlap_upstream() {
+        let _guard = test_base_dir_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_home_dir_override(Some(tmp.path().to_path_buf()));
+        assert_eq!(home_base_dir(), tmp.path().join(".agent-toolchain-manager"));
+        assert_ne!(home_base_dir(), tmp.path().join(".skills-manager"));
+        set_test_home_dir_override(None);
+    }
 
     // ── migrate_repo_if_needed (#252) ──
 
@@ -1233,13 +1220,13 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("a.txt"), b"src").unwrap();
         fs::create_dir_all(dst.path().join("bin")).unwrap();
-        fs::write(dst.path().join("bin/skills-manager-cli"), b"mine").unwrap();
+        fs::write(dst.path().join("bin/agent-toolchain-manager-cli"), b"mine").unwrap();
 
         let mut config = config_migrating(src.path(), dst.path());
         let outcome = migrate_repo_if_needed(&mut config, dst.path());
 
         assert!(matches!(outcome, MigrationOutcome::UseSource));
-        assert!(dst.path().join("bin/skills-manager-cli").exists());
+        assert!(dst.path().join("bin/agent-toolchain-manager-cli").exists());
     }
 
     #[test]

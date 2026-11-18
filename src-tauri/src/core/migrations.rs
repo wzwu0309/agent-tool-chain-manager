@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 12;
+const LATEST_VERSION: u32 = 13;
 
 /// Run all pending migrations on the database.
 ///
@@ -59,6 +59,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         9 => migrate_v9_to_v10(conn),
         10 => migrate_v10_to_v11(conn),
         11 => migrate_v11_to_v12(conn),
+        12 => migrate_v12_to_v13(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -456,6 +457,15 @@ fn migrate_v11_to_v12(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v12 → v13: bind manager-published Copy directories to their filesystem
+/// identity, in addition to their committed Git subtree. Existing Copy rows
+/// deliberately receive NULL: identical content is not proof of ownership
+/// continuity, and no migration may silently claim a pre-existing directory.
+fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "project_skill_deployments", "copy_identity", "TEXT")?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn add_column_if_missing(
@@ -524,6 +534,32 @@ mod tests {
         assert!(tables.contains(&"skill_tags".to_string()));
         assert!(tables.contains(&"scenario_skill_tools".to_string()));
         assert!(tables.contains(&"audit_log".to_string()));
+    }
+
+    #[test]
+    fn v13_copy_identity_has_no_implicit_legacy_adoption() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project_skill_deployments (
+                id TEXT PRIMARY KEY, mode TEXT, copy_identity_missing TEXT
+             );
+             INSERT INTO project_skill_deployments(id, mode) VALUES ('old-copy', 'copy');",
+        )
+        .unwrap();
+        migrate_v12_to_v13(&conn).unwrap();
+        migrate_v12_to_v13(&conn).unwrap();
+        assert!(has_column(&conn, "project_skill_deployments", "copy_identity").unwrap());
+        let old_identity: Option<String> = conn
+            .query_row(
+                "SELECT copy_identity FROM project_skill_deployments WHERE id='old-copy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            old_identity.is_none(),
+            "legacy Copy must not be silently re-owned"
+        );
     }
 
     #[test]

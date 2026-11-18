@@ -776,6 +776,9 @@ pub fn recover_incomplete_project_skill_operations(
 /// The only authoritative Copy classification uses its immutable deployment
 /// baseline; mtimes and the mutable central working tree play no role.
 fn managed_copy_status(deployment: &ProjectSkillDeploymentRecord, path: &Path) -> String {
+    if !managed_copy_identity_matches(deployment, path) {
+        return "diverged".to_string();
+    }
     let Some(base) = deployment.base_tree_oid.as_deref() else {
         return "diverged".to_string();
     };
@@ -1105,6 +1108,9 @@ pub async fn remove_project(store: State<'_, Arc<SkillStore>>, id: String) -> Re
 }
 
 pub fn remove_project_internal(store: &SkillStore, id: String) -> Result<(), AppError> {
+    // Other managed project file operations take this same lock. The SQLite
+    // operation check remains transactional even for callers bypassing Core.
+    let _lock = RepoLock::acquire_foreground("project unregister").map_err(AppError::io)?;
     store.delete_project(&id).map_err(AppError::db)
 }
 
@@ -1828,6 +1834,11 @@ pub fn plan_managed_project_copy_update(
             "Only an explicitly managed Copy can be updated",
         ));
     }
+    if !managed_copy_identity_matches(&row, &target_path) {
+        return Err(AppError::invalid_input(
+            "Managed Copy directory identity is missing or changed; explicit reauthorization required",
+        ));
+    }
     let base_tree = row
         .base_tree_oid
         .as_deref()
@@ -1972,6 +1983,12 @@ pub fn update_managed_project_copy_checked(
     if deployment.management_state != "managed" || deployment.mode != "copy" {
         return Err(AppError::invalid_input("This target is not a managed Copy"));
     }
+    if !managed_copy_identity_matches(&deployment, target_path) {
+        return Err(AppError::invalid_input(
+            "Managed Copy directory identity is missing or changed; refusing to replace external contents",
+        ));
+    }
+    let original_copy_identity = deployment.copy_identity.as_deref().unwrap();
     let base_tree = deployment
         .base_tree_oid
         .as_deref()
@@ -2005,6 +2022,7 @@ pub fn update_managed_project_copy_checked(
                 &wanted.commit_oid,
                 &wanted.tree_oid,
                 &wanted.path_at_commit,
+                original_copy_identity,
             )
             .map_err(AppError::db)?;
         return Ok(());
@@ -2049,10 +2067,24 @@ pub fn update_managed_project_copy_checked(
     let staged = operation_root.join("new");
     let backup = operation_root.join("previous");
     git_skill_versions::materialize_skill_version(&root, &wanted, &staged).map_err(AppError::io)?;
+    let staged_identity = project_copy_directory_identity(&staged)
+        .ok_or_else(|| AppError::invalid_input("Staged Copy has no stable directory identity"))?;
     store
         .transition_project_skill_operation(&operation_id, "preparing", "publishing")
         .map_err(AppError::db)?;
 
+    // Verify the exact directory identity as well as Git content before
+    // isolation. RepoLock does not serialize an unrelated external writer.
+    if !managed_copy_identity_matches(&deployment, target_path) {
+        let _ = store.transition_project_skill_operation(
+            &operation_id,
+            "publishing",
+            "needs_attention",
+        );
+        return Err(AppError::invalid_input(
+            "Managed Copy directory was replaced before update; nothing overwritten",
+        ));
+    }
     // Verify immediately before moving the old Copy. An outsider may write
     // through an already-open file handle even after the move; the previous
     // directory is therefore retained persistently after success.
@@ -2069,6 +2101,24 @@ pub fn update_managed_project_copy_checked(
         ));
     }
     rename_directory_no_replace(target_path, &backup)?;
+    if project_copy_directory_identity(&backup).as_deref() != Some(original_copy_identity) {
+        // We may have moved an external replacement. Restore it no-replace
+        // without declaring the object managed or deleting its contents.
+        let restored = std::fs::symlink_metadata(target_path).is_err()
+            && rename_directory_no_replace(&backup, target_path).is_ok();
+        let _ = store.transition_project_skill_operation(
+            &operation_id,
+            "publishing",
+            if restored {
+                "recovery_available"
+            } else {
+                "needs_attention"
+            },
+        );
+        return Err(AppError::invalid_input(
+            "Isolated Copy identity differed from authorized deployment; recovery retained",
+        ));
+    }
     if !git_skill_versions::matches_skill_tree(&root, base_tree, &backup).unwrap_or(false) {
         return Err(restore_failed_project_copy_update(
             store,
@@ -2078,6 +2128,7 @@ pub fn update_managed_project_copy_checked(
             target_path,
             &backup,
             &operation_root,
+            &staged_identity,
             "Project Copy changed while moving it to recovery",
         ));
     }
@@ -2092,7 +2143,21 @@ pub fn update_managed_project_copy_checked(
             target_path,
             &backup,
             &operation_root,
+            &staged_identity,
             &format!("Unable to publish the new Copy: {err}"),
+        ));
+    }
+    if project_copy_directory_identity(target_path).as_deref() != Some(staged_identity.as_str()) {
+        return Err(restore_failed_project_copy_update(
+            store,
+            &operation_id,
+            &root,
+            &wanted.tree_oid,
+            target_path,
+            &backup,
+            &operation_root,
+            &staged_identity,
+            "Published Copy was replaced before database commit",
         ));
     }
     if !git_skill_versions::matches_skill_tree(&root, &wanted.tree_oid, target_path)
@@ -2106,6 +2171,7 @@ pub fn update_managed_project_copy_checked(
             target_path,
             &backup,
             &operation_root,
+            &staged_identity,
             "Published Copy differs from selected Git version",
         ));
     }
@@ -2116,6 +2182,8 @@ pub fn update_managed_project_copy_checked(
         &wanted.commit_oid,
         &wanted.tree_oid,
         &wanted.path_at_commit,
+        original_copy_identity,
+        &staged_identity,
     ) {
         return Err(restore_failed_project_copy_update(
             store,
@@ -2125,6 +2193,7 @@ pub fn update_managed_project_copy_checked(
             target_path,
             &backup,
             &operation_root,
+            &staged_identity,
             &format!("Copy update database commit failed: {err}"),
         ));
     }
@@ -2145,9 +2214,12 @@ fn restore_failed_project_copy_update(
     target: &Path,
     backup: &Path,
     operation_root: &Path,
+    expected_new_identity: &str,
     reason: &str,
 ) -> AppError {
-    if std::fs::symlink_metadata(target).is_ok()
+    // Never move a new occupant solely because its content matches the
+    // selected Git Tree. It may be another process's equal-content directory.
+    if project_copy_directory_identity(target).as_deref() == Some(expected_new_identity)
         && git_skill_versions::matches_skill_tree(root, new_tree, target).unwrap_or(false)
     {
         let _ = rename_directory_no_replace(target, &operation_root.join("failed-new"));
@@ -2326,6 +2398,11 @@ pub fn toggle_project_skill_internal(
         if row.mode == "symlink" && !managed_symlink_matches(row, &source) {
             return Err(AppError::invalid_input("Manager Symlink identity changed"));
         }
+        if row.mode == "copy" && !managed_copy_identity_matches(row, &source) {
+            return Err(AppError::invalid_input(
+                "Managed Copy identity changed; refusing to move replacement",
+            ));
+        }
     }
     let id = uuid::Uuid::new_v4().to_string();
     let recovery_root = create_project_recovery_root(&source, &id)?;
@@ -2472,6 +2549,14 @@ fn quarantine_project_skill_delete(
     let old = store
         .get_project_skill_deployment(project_id, &target.to_string_lossy())
         .map_err(AppError::db)?;
+    if old
+        .as_ref()
+        .is_some_and(|row| row.mode == "copy" && !managed_copy_identity_matches(row, target))
+    {
+        return Err(AppError::invalid_input(
+            "Managed Copy identity changed; cannot delete a replaced directory, even with force",
+        ));
+    }
     if !explicit_force {
         let row = old.as_ref().ok_or_else(|| {
             AppError::invalid_input(
@@ -3198,7 +3283,7 @@ pub fn apply_project_deploy(
                     "Existing deployment is not owned by this Skill",
                 ));
             }
-            let record = ProjectSkillDeploymentRecord {
+            let mut record = ProjectSkillDeploymentRecord {
                 id: prior
                     .as_ref()
                     .map(|row| row.id.clone())
@@ -3219,6 +3304,7 @@ pub fn apply_project_deploy(
 
                 symlink_target: None,
                 symlink_identity: None,
+                copy_identity: None,
             };
             // Pin before the first filesystem publication, so a later HEAD
             // rewrite or GC cannot orphan this project's committed baseline.
@@ -3263,7 +3349,23 @@ pub fn apply_project_deploy(
                     "Project Skill target became occupied; operation preserved for recovery",
                 ));
             }
+            let staged_identity = project_copy_directory_identity(&staged).ok_or_else(|| {
+                AppError::invalid_input("Staged Copy has no stable directory identity")
+            })?;
             rename_directory_no_replace(&staged, &target_dir)?;
+            if project_copy_directory_identity(&target_dir).as_deref()
+                != Some(staged_identity.as_str())
+            {
+                let _ = store.transition_project_skill_operation(
+                    &operation_id,
+                    "publishing",
+                    "needs_attention",
+                );
+                return Err(AppError::invalid_input(
+                    "Published Copy directory identity changed; no management granted",
+                ));
+            }
+            record.copy_identity = Some(staged_identity);
             match store.commit_project_skill_deploy(&operation_id, &record) {
                 Ok(()) => {
                     // Safe cleanup: the staged directory was moved, and this
@@ -3333,6 +3435,7 @@ pub fn apply_project_deploy(
                         .ok()
                         .map(|link| link.to_string_lossy().to_string()),
                     symlink_identity: project_target_identity_string(&target_dir),
+                    copy_identity: None,
                     created_at: now,
                     updated_at: now,
                 };
@@ -3403,6 +3506,35 @@ fn project_target_identity_string(path: &Path) -> Option<String> {
     project_target_identity(path).map(|(dev, ino)| format!("{dev}:{ino}"))
 }
 
+/// A content-identical replacement is NOT the directory originally published
+/// by the manager. Pre-v13 records deliberately have no trusted identity.
+fn managed_copy_identity_matches(row: &ProjectSkillDeploymentRecord, path: &Path) -> bool {
+    row.mode == "copy"
+        && row.management_state == "managed"
+        && row.copy_identity.as_deref() == project_copy_directory_identity(path).as_deref()
+        && row.copy_identity.is_some()
+}
+
+fn project_copy_directory_identity(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return None;
+    }
+    // Use the *same* lstat result for type and identity. A separate second
+    // path lookup could observe another object after a concurrent rename.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::UNIX_EPOCH;
+        let time = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(format!("{}:{}", meta.len(), time.as_nanos() as u64))
+    }
+}
+
 /// A matching central path is never proof of management. Only a manager-owned
 /// deployment row and its exact link text/object identity confer authority.
 fn managed_symlink_matches(row: &ProjectSkillDeploymentRecord, path: &Path) -> bool {
@@ -3465,6 +3597,7 @@ fn managed_removal_is_safe(
     };
     if row.mode != "copy"
         || row.management_state != "managed"
+        || !managed_copy_identity_matches(&row, Path::new(&variant.path))
         || !matched.is_some_and(|m| m.id == row.skill_id)
     {
         return Ok(false);
@@ -4396,7 +4529,9 @@ mod add_project_tests {
 
     #[test]
     fn add_and_remove_project_preserve_existing_agent_directories() {
+        let _guard = crate::core::central_repo::test_base_dir_lock();
         let tmp = tempdir().unwrap();
+        crate::core::central_repo::set_test_base_dir_override(Some(tmp.path().join("central")));
         let project_dir = tmp.path().join("repo");
         let existing = project_dir.join(".claude/skills/custom/SKILL.md");
         fs::create_dir_all(existing.parent().unwrap()).unwrap();
@@ -4420,6 +4555,82 @@ mod add_project_tests {
         assert!(store.get_all_projects().unwrap().is_empty());
         assert_eq!(fs::read_to_string(&existing).unwrap(), "user-owned skill");
         assert!(!project_dir.join(".claude/skills-disabled").exists());
+        crate::core::central_repo::set_test_base_dir_override(None);
+    }
+
+    #[test]
+    fn unregister_preserves_project_with_outstanding_recovery_and_allows_clean_project() {
+        use crate::core::skill_store::ProjectSkillOperationRecord;
+        let _guard = crate::core::central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        crate::core::central_repo::set_test_base_dir_override(Some(tmp.path().join("central")));
+        let repo = tmp.path().join("repo");
+        let clean = tmp.path().join("clean");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&clean).unwrap();
+        let store = SkillStore::new(&tmp.path().join("skills.db")).unwrap();
+        let project = add_project_internal(&store, repo.to_string_lossy().to_string()).unwrap();
+        let clean_project =
+            add_project_internal(&store, clean.to_string_lossy().to_string()).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let target = repo.join(".claude/skills/demo");
+        let recovery = repo.join(".claude/skills/.atm-recovery").join(&id);
+        store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: project.id.clone(),
+                skill_id: "external".to_string(),
+                deployment_id: None,
+                kind: "delete".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: None,
+                created_at: 1,
+                updated_at: 1,
+                destination_path: None,
+                observed_identity: None,
+            })
+            .unwrap();
+
+        for phase in [
+            "preparing",
+            "publishing",
+            "needs_attention",
+            "recovery_available",
+            "cleanup_pending",
+        ] {
+            let error = super::remove_project_internal(&store, project.id.clone()).unwrap_err();
+            assert!(error.to_string().contains("retained recovery"), "{error}");
+            assert!(store.get_project_by_id(&project.id).unwrap().is_some());
+            assert_eq!(store.pending_project_skill_operations().unwrap().len(), 1);
+            if phase != "cleanup_pending" {
+                let next = match phase {
+                    "preparing" => "publishing",
+                    "publishing" => "needs_attention",
+                    "needs_attention" => "recovery_available",
+                    _ => "cleanup_pending",
+                };
+                store
+                    .transition_project_skill_operation(&id, phase, next)
+                    .unwrap();
+            }
+        }
+        super::remove_project_internal(&store, clean_project.id.clone()).unwrap();
+        assert!(store
+            .get_project_by_id(&clean_project.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.pending_project_skill_operations().unwrap().len(), 1);
+        assert!(store.get_project_by_id(&project.id).unwrap().is_some());
+        // A completed journal no longer blocks deregistration.
+        store
+            .transition_project_skill_operation(&id, "cleanup_pending", "complete")
+            .unwrap();
+        super::remove_project_internal(&store, project.id.clone()).unwrap();
+        assert!(store.get_project_by_id(&project.id).unwrap().is_none());
+        crate::core::central_repo::set_test_base_dir_override(None);
     }
 
     #[test]
@@ -6045,6 +6256,261 @@ mod project_plan_tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn equal_content_external_replacement_never_inherits_managed_copy_authority() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "ORIGINAL MANAGED");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+
+        let target = fx.repo.join(".claude/skills/demo");
+        let original = fx.repo.join("original-managed-parked");
+        let before = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let expected_identity = before.copy_identity.as_ref().unwrap().clone();
+        assert_eq!(
+            project_copy_directory_identity(&target).unwrap(),
+            expected_identity
+        );
+        rename_directory_no_replace(&target, &original).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::copy(original.join("SKILL.md"), target.join("SKILL.md")).unwrap();
+        let replacement_bytes = fs::read(target.join("SKILL.md")).unwrap();
+        assert_ne!(
+            project_copy_directory_identity(&target),
+            before.copy_identity
+        );
+        assert!(
+            git_skill_versions::matches_skill_tree(
+                &central_repo::skills_dir(),
+                before.base_tree_oid.as_deref().unwrap(),
+                &target,
+            )
+            .unwrap(),
+            "test premise: contents are exactly the same committed Git Tree"
+        );
+
+        let err = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("identity"), "{err}");
+        let err =
+            update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap_err();
+        assert!(err.to_string().contains("identity"), "{err}");
+        let err =
+            toggle_project_skill_internal(&fx.store, &fx.project_id, "demo", "claude_code", false)
+                .unwrap_err();
+        assert!(err.to_string().contains("identity"), "{err}");
+        let err = delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("identity"), "{err}");
+
+        let planned =
+            plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&skill]), &[]).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert!(!planned[0].safe);
+        let details = get_project_skills_internal(&fx.store, fx.project_id.clone()).unwrap();
+        assert_eq!(details[0].sync_status, "diverged");
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            replacement_bytes
+        );
+        assert_eq!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .copy_identity
+                .as_deref(),
+            Some(expected_identity.as_str())
+        );
+        assert!(original.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn pre_v13_copy_with_null_object_identity_refuses_implicit_rebinding() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE V13");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let original_bytes = fs::read(target.join("SKILL.md")).unwrap();
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert!(row.copy_identity.is_some());
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&row.id],
+        )
+        .unwrap();
+        let err = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("identity"));
+        let err =
+            update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap_err();
+        assert!(err.to_string().contains("identity"));
+        assert!(delete_project_skill_internal(
+            &fx.store,
+            fx.project_id.clone(),
+            "demo".into(),
+            "claude_code".into(),
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("identity"));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), original_bytes);
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
+    }
+
+    #[test]
+    fn content_changing_copy_update_rebinds_only_new_published_directory() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "VERSION ONE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let before = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nVERSION TWO",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let after = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.id, after.id);
+        assert_ne!(before.copy_identity, after.copy_identity);
+        assert_eq!(
+            after.copy_identity,
+            project_copy_directory_identity(&target)
+        );
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("VERSION TWO"));
+        let backups = fx.store.pending_project_skill_operations().unwrap();
+        let update = backups
+            .iter()
+            .find(|op| op.kind == "update" && op.phase == "cleanup_pending")
+            .unwrap();
+        let previous = Path::new(&update.recovery_root).join("previous");
+        assert_eq!(
+            project_copy_directory_identity(&previous),
+            before.copy_identity
+        );
+        assert!(fs::read_to_string(previous.join("SKILL.md"))
+            .unwrap()
+            .contains("VERSION ONE"));
+    }
+
+    #[test]
+    fn unregister_after_real_update_keeps_cleanup_pending_and_its_access_path() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE UPDATE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER UPDATE",
+        )
+        .unwrap();
+        commit_library(&fx);
+        let target = fx.repo.join(".claude/skills/demo");
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let records = get_project_skill_recoveries_internal(&fx.store, &fx.project_id).unwrap();
+        let cleanup = records
+            .iter()
+            .find(|r| r.kind == "update" && r.phase == "cleanup_pending")
+            .unwrap();
+        let retained = Path::new(&cleanup.recovery_root).join("previous/SKILL.md");
+        let retained_bytes = fs::read(&retained).unwrap();
+        let error = remove_project_internal(&fx.store, fx.project_id.clone()).unwrap_err();
+        assert!(error.to_string().contains("retained recovery"), "{error}");
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+        assert!(
+            get_project_skill_recoveries_internal(&fx.store, &fx.project_id,)
+                .unwrap()
+                .iter()
+                .any(|row| row.operation_id == cleanup.operation_id)
+        );
+        assert_eq!(fs::read(&retained).unwrap(), retained_bytes);
+        assert!(target.join("SKILL.md").is_file());
     }
 
     #[test]

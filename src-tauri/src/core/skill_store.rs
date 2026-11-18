@@ -138,6 +138,8 @@ pub struct ProjectSkillDeploymentRecord {
     pub path_at_commit: Option<String>,
     pub symlink_target: Option<String>,
     pub symlink_identity: Option<String>,
+    /// Manager-published Copy object identity; NULL on pre-v13 rows.
+    pub copy_identity: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1303,6 +1305,11 @@ impl SkillStore {
         operation_id: &str,
         row: &ProjectSkillDeploymentRecord,
     ) -> Result<()> {
+        if row.mode != "copy" || row.management_state != "managed" || row.copy_identity.is_none() {
+            anyhow::bail!(
+                "cannot grant Copy management without an observed published directory identity"
+            );
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let valid: i64 = tx.query_row(
@@ -1326,8 +1333,8 @@ impl SkillStore {
             "INSERT INTO project_skill_deployments (
                 id, project_id, skill_id, target_path, agent, mode, management_state,
                 management_origin, version_match, base_commit_oid, base_tree_oid,
-                path_at_commit, created_at, updated_at, symlink_target, symlink_identity
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                path_at_commit, created_at, updated_at, symlink_target, symlink_identity, copy_identity
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(target_path) DO UPDATE SET
                  agent=excluded.agent, mode=excluded.mode,
                  management_state=excluded.management_state,
@@ -1338,7 +1345,8 @@ impl SkillStore {
                  path_at_commit=excluded.path_at_commit,
                  updated_at=excluded.updated_at,
                  symlink_target=excluded.symlink_target,
-                 symlink_identity=excluded.symlink_identity
+                 symlink_identity=excluded.symlink_identity,
+                 copy_identity=excluded.copy_identity
              WHERE project_skill_deployments.project_id=excluded.project_id
                AND project_skill_deployments.skill_id=excluded.skill_id
                AND project_skill_deployments.mode='copy'
@@ -1359,7 +1367,8 @@ impl SkillStore {
                 row.created_at,
                 row.updated_at,
                 row.symlink_target,
-                row.symlink_identity
+                row.symlink_identity,
+                row.copy_identity
             ],
         )?;
         if modified != 1 {
@@ -1387,14 +1396,16 @@ impl SkillStore {
         new_commit: &str,
         new_tree: &str,
         historical_path: &str,
+        old_copy_identity: &str,
+        new_copy_identity: &str,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE project_skill_deployments
              SET base_commit_oid=?3, base_tree_oid=?4, path_at_commit=?5,
-                 version_match='exact', updated_at=?6
-             WHERE id=?1 AND base_tree_oid=?2 AND mode='copy'
+                 version_match='exact', updated_at=?6, copy_identity=?9
+             WHERE id=?1 AND base_tree_oid=?2 AND copy_identity=?8 AND mode='copy'
                AND management_state='managed'
                AND EXISTS (
                  SELECT 1 FROM project_skill_operations op
@@ -1410,11 +1421,13 @@ impl SkillStore {
                 new_tree,
                 historical_path,
                 chrono::Utc::now().timestamp_millis(),
-                operation_id
+                operation_id,
+                old_copy_identity,
+                new_copy_identity
             ],
         )?;
         if changed != 1 {
-            anyhow::bail!("managed Copy baseline or operation changed during update");
+            anyhow::bail!("managed Copy baseline, identity or operation changed during update");
         }
         let updated = tx.execute(
             "UPDATE project_skill_operations SET phase='cleanup_pending', updated_at=?2
@@ -1545,6 +1558,7 @@ impl SkillStore {
             || row.symlink_identity.is_none()
             || row.management_state != "managed"
             || row.management_origin != "deployed_by_manager"
+            || row.copy_identity.is_some()
         {
             anyhow::bail!("invalid manager-created Symlink ownership record");
         }
@@ -1594,8 +1608,8 @@ impl SkillStore {
             "INSERT INTO project_skill_deployments
                 (id, project_id, skill_id, target_path, agent, mode, management_state,
                  management_origin, version_match, base_commit_oid, base_tree_oid,
-                 path_at_commit, created_at, updated_at, symlink_target, symlink_identity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 path_at_commit, created_at, updated_at, symlink_target, symlink_identity, copy_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(target_path) DO UPDATE SET
                  agent = excluded.agent,
                  mode = excluded.mode,
@@ -1607,7 +1621,8 @@ impl SkillStore {
                  path_at_commit = excluded.path_at_commit,
                  updated_at = excluded.updated_at,
                  symlink_target = excluded.symlink_target,
-                 symlink_identity = excluded.symlink_identity
+                 symlink_identity = excluded.symlink_identity,
+                 copy_identity = excluded.copy_identity
              WHERE project_skill_deployments.project_id = excluded.project_id
                AND project_skill_deployments.skill_id = excluded.skill_id
                AND project_skill_deployments.management_state = 'managed'
@@ -1628,7 +1643,8 @@ impl SkillStore {
                 row.created_at,
                 row.updated_at,
                 row.symlink_target,
-                row.symlink_identity
+                row.symlink_identity,
+                row.copy_identity
             ],
         )?;
         if affected != 1 {
@@ -1671,7 +1687,7 @@ impl SkillStore {
         conn.query_row(
             "SELECT id, project_id, skill_id, target_path, agent, mode, management_state,
                     management_origin, version_match, base_commit_oid, base_tree_oid,
-                    path_at_commit, created_at, updated_at, symlink_target, symlink_identity
+                    path_at_commit, created_at, updated_at, symlink_target, symlink_identity, copy_identity
              FROM project_skill_deployments WHERE project_id = ?1 AND target_path = ?2",
             params![project_id, target_path],
             |row| {
@@ -1692,6 +1708,7 @@ impl SkillStore {
                     updated_at: row.get(13)?,
                     symlink_target: row.get(14)?,
                     symlink_identity: row.get(15)?,
+                    copy_identity: row.get(16)?,
                 })
             },
         )
@@ -1705,19 +1722,22 @@ impl SkillStore {
         commit_oid: &str,
         tree_oid: &str,
         path_at_commit: &str,
+        expected_copy_identity: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let affected = conn.execute(
             "UPDATE project_skill_deployments
              SET base_commit_oid = ?2, base_tree_oid = ?3, path_at_commit = ?4,
                  version_match = 'exact', updated_at = ?5
-             WHERE id = ?1 AND management_state = 'managed' AND mode = 'copy'",
+             WHERE id = ?1 AND management_state = 'managed' AND mode = 'copy'
+               AND copy_identity = ?6",
             params![
                 id,
                 commit_oid,
                 tree_oid,
                 path_at_commit,
-                chrono::Utc::now().timestamp_millis()
+                chrono::Utc::now().timestamp_millis(),
+                expected_copy_identity,
             ],
         )?;
         if affected != 1 {
@@ -1835,9 +1855,26 @@ impl SkillStore {
         Ok(rows.next().and_then(|r| r.ok()))
     }
 
+    /// Unregister the project only if no durable, non-complete filesystem
+    /// operation still needs its ProjectId and root path for safe recovery.
+    /// The check and DELETE belong to the same SQLite write transaction so
+    /// a concurrent writer cannot slip a recovery journal into the gap.
     pub fn delete_project(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let outstanding: i64 = tx.query_row(
+            "SELECT count(*) FROM project_skill_operations
+             WHERE project_id = ?1 AND phase != 'complete'",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if outstanding > 0 {
+            anyhow::bail!(
+                "Project has {outstanding} retained recovery operation(s); review and preserve their data before unregistering"
+            );
+        }
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 

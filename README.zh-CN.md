@@ -1,89 +1,51 @@
-> **Fork 说明 — Agent Toolchain Manager。** 这是独立安装的 Skills Manager Fork。
-> 本 Fork 的默认数据目录和 CLI 名称已隔离，在建立自己的签名发布渠道前禁用应用自动更新。
-> 本文的安装及 CLI 命令面向本 Fork；部分上游视频与徽章保留用于署名与溯源。
-> 构建前请阅读 [Fork 发布隔离说明](FORK_RELEASE_ISOLATION.md)。
-> 下方演示视频及上游热度徽章均属于原版项目，不代表本 Fork 的指标。
-
-<p align="center">
-  <img src="assets/icon.png" width="80" />
-</p>
-
 <h1 align="center">Agent Toolchain Manager</h1>
 
 <p align="center">
-  一个应用，统一管理所有 AI 编码工具的 Skills。
-</p>
-
-<p align="center">
-  <strong><a href="https://github.com/wzwu0309/agent-toolchain-manager">GitHub · Agent Toolchain Manager</a></strong>
-</p>
-
-<p align="center">
-  🎬 <a href="https://www.bilibili.com/video/BV1cdpc6PExG/">1.5 分钟介绍（Bilibili）</a>
-  &nbsp;·&nbsp;
-  <a href="https://www.bilibili.com/video/BV1845F6REUu/">完整功能演示（9 分钟）</a>
-  &nbsp;·&nbsp;
-  <a href="https://www.youtube.com/watch?v=DJ9RIX8nbow">Video intro (YouTube)</a>
+  以项目为中心，统一管理可复用的 AI Agent 能力。
 </p>
 
 <p align="center">
   <a href="./README.md">English</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/wzwu0309/agent-toolchain-manager/issues">问题与开发进展</a>
 </p>
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/23290?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-23290" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/23290" alt="xingkongliang%2Fskills-manager | Trendshift" width="250" height="55"/></a>
-</p>
+## 项目愿景
 
-<p align="center">
-  <a href="https://skills.sh/xingkongliang/skills-manager"><img src="https://skills.sh/b/xingkongliang/skills-manager" alt="skills.sh 上的 manage-skills" /></a>
-</p>
+我们希望不同 AI 编码 Agent 能够在不同项目中获得**恰好需要的能力**，而不必为每个工具、每个仓库反复维护互不关联的配置。
 
-<p align="center">
-  <img src="assets/demo/library.png" width="800" alt="上游 Skills Manager 界面参考" />
-</p>
+**Agent Toolchain Manager** 的长期定位是一个跨 Agent 的能力资产管理与配置入口：统一整理可复用能力，按项目和 Agent 选择需要的内容，并以可检查、可追踪、可恢复的方式部署与维护。
 
-<p align="center"><strong>安装 Skills</strong></p>
-<p align="center"><img src="assets/demo/install-skills.png" width="800" alt="安装 Skills" /></p>
+理想中的流程是：
 
-<p align="center"><strong>全局工作区</strong></p>
-<p align="center"><img src="assets/demo/global-workspace.png" width="800" alt="全局工作区" /></p>
+**发现能力 → 统一整理 → 选择项目与 Agent → 检查变更 → 部署 → 追踪与更新。**
 
-<p align="center"><strong>Agent 工作区</strong></p>
-<p align="center"><img src="assets/demo/agent-workspace.png" width="800" alt="Agent 工作区" /></p>
+目标不是让所有 Agent 拥有相同的配置，而是让每个项目的 Agent 工具链**明确、可复现、可审查且可安全调整**。
 
-<p align="center"><strong>项目工作区</strong></p>
-<p align="center"><img src="assets/demo/project-workspace.png" width="800" alt="项目工作区" /></p>
+## 当前已具备的能力
 
-<p align="center"><strong>备份与多设备同步</strong></p>
-<p align="center"><img src="assets/demo/backup.png" width="800" alt="备份与多设备同步" /></p>
+现阶段产品主要围绕 **Skills** 展开：
 
-<p align="center"><strong>设置</strong></p>
-<p align="center"><img src="assets/demo/settings.png" width="800" alt="设置" /></p>
+- **中央 Skill 库**：从 Git 仓库、本地目录、压缩包及 [skills.sh](https://skills.sh) 市场导入技能。默认存储目录为 `~/.agent-toolchain-manager`，也可自行调整。
+- **Agent 与项目工作区**：检查全局和项目级 Skills，面向所选 Agent 以复制或软链接方式部署。
+- **Preset 与组织能力**：用预设组合、标签和过滤器管理多个 Skill 及其部署。
+- **GUI 与 CLI**：人可以通过桌面应用操作，Codex 等 Agent 可以通过 `agent-toolchain-manager-cli` 和内置 [`manage-skills`](skills/manage-skills/SKILL.md) Skill 调用。
+- **历史与备份**：提供 Git 备份、快照、多设备同步及冲突处理功能。
+- **状态检查**：预览 Skill 文档、来源与部署状态，并导出应用日志。
 
-## 功能
+这些是**现有的 Skill 管理能力**；不代表通用 MCP、Plugin 或命令资产管理已经实现。
 
-<p align="center">
-  <img src="assets/diagram-concept-map.png" width="640" alt="概念图：技能库、Preset、全局工作区、项目工作区、Agent" />
-</p>
+## 后续希望实现的方向
 
-- **统一技能库** — 从 Git 仓库、本地目录、`.zip` / `.skill` 文件或 [skills.sh](https://skills.sh) 市场安装技能，统一存放在 `~/.agent-toolchain-manager`。
-- **技能市场** — 浏览市场上的热门 Skills，用关键词搜索找到需要的那个。
-- **让你的 Agent 管理 Skills** —— Claude Code、Codex、Cursor 等可以替你装一个 skill、部署到另一个 agent、或报告哪个 agent 有什么，走的是驱动 Agent Toolchain Manager 而不是绕过它直接写 agent 目录——来源、preset、更新追踪和各 agent 的状态都不会丢。Dashboard 上一键完成设置，详见[让你的 Agent 来管理 Skills](#让你的-agent-来管理-skills)。
-- **Preset（预设）** — 将技能分组为命名 Preset。在任意工作区点击 Preset 标签，即可一键为当前 Agent 范围激活或停用其全部技能，激活的 Preset 显示 ✓，部分安装显示数量。应用 Preset 是一次性复制，不是实时同步。
-- **全局工作区** — 每个 Agent 都有自己的页面，列出其全局目录里的所有 Skills（包括不是通过 Agent Toolchain Manager 安装的），始终反映 Agent 实际看到的内容。可按 Agent 添加或移除 Skills，也可通过「全部 Agents」总览跨所有已安装 Agent 统一管理。
-- **项目工作区** — 查看并管理任意项目的本地 Skills 目录，支持与中央库双向同步。支持嵌套 Skill 目录和导出时按 Agent 分配。
-- **关联工作区** — 将任意目录指定为 Skills 根目录，适合管理不在默认 Agent 路径下的 Skills。作为独立工作区管理，不参与全局 Preset 同步。
-- **多工具同步** — 一键将技能同步到任意支持的工具，支持软链接和复制两种模式。每张 Skill 卡片会为每个已启用 Agent 显示一个图标角标，点击角标即可直接在卡片上为该 Agent 安装或移除这个 Skill，角标会实时反映同步状态。
-- **「添加 Skills」弹层** — 任意工作区点击 **+ 添加 Skills** 即可打开统一的挑选弹层：搜索中央库，用始终可见的 Agent 标签切换目标（含一键全选/清空），一次提交批量添加多个 Skills。
-- **批量操作** — 多选技能后批量启用/禁用、导出或删除。项目工作区中的项目 Skills 也支持批量启用/禁用。
-- **技能标签** — 为技能添加标签，用于归类同类技能，并按来源或标签筛选；新增的 **未标签** 过滤项可快速定位漏打标签的 Skills。
-- **更新检查** — 为 Git 类技能检查远端更新；本地技能支持重新导入。
-- **文档预览** — 直接在应用内查看 `SKILL.md` / `README.md`。
-- **自定义工具** — 添加自定义 Agent/工具并指定 Skills 目录，也可覆盖内置工具的默认路径。
-- **备份与多设备同步** — 一次 GitHub 登录（或任意 Git 远端）接入私有备份仓库，之后自动备份、多台设备自动保持一致。合并以技能为单位——一台改名、另一台改内容会自动组合；真冲突不阻塞不覆盖，本机版本保留待你三选一处理。快照版本随时可恢复。
-- **活动日志 & 导出日志** — 应用会记录本地的安装/移除/更新/同步操作。在 **设置 → 导出日志** 可把最近日志和活动记录打包成压缩文件，方便提交 Issue 时附上。
-- **灵活的应用设置** — 在一个页面里配置仓库路径、同步模式、主题、字号、语言、托盘行为、代理、Git 远程、更新检查，以及 Agent 在全应用中的显示顺序。
-- **Fork 应用更新已禁用** — 建立独立签名发布渠道之前不执行应用更新；Skill 来源更新不受影响。
+以下均为**规划方向，不代表当前已交付或承诺具体完成时间**：
+
+1. **项目优先的能力配置**：为指定仓库选择 Agent 及所需能力，不影响无关项目或未选择的全局 Agent 目录。
+2. **可信版本追踪与安全更新**：明确部署内容、来源版本、项目本地修改及外部能力接管授权，避免无提示覆盖。
+3. **扩展能力资产类型**：在定义清楚权限、归属和生命周期后，探索将 MCP Server、命令、Prompt 等纳入统一管理。
+4. **GUI 与 Agent 自动化一致**：桌面端和 CLI 复用相同的验证、冲突判断与部署规则。
+5. **可复现的 Agent 工具链**：降低跨项目、跨设备复现 Agent 能力配置的成本。
+
+具体优先级、设计取舍及开发进展请参见 [GitHub Issues](https://github.com/wzwu0309/agent-toolchain-manager/issues)。
 
 ## 从源码构建本 Fork
 
@@ -259,18 +221,12 @@ npm run cli:build
 
 ## 常见问题
 
-**macOS 打不开应用。** 从 **v1.29.0** 起，发布版本都经过 Apple Developer ID 签名与公证，可以正常打开。如果看到「Apple 无法验证…」或「应用已损坏」，说明你用的是 v1.28.5 或更早的版本，升级即可解决。（升级会改变代码签名，macOS 可能会再问一次 `skills-manager-git-backup` 钥匙串权限，点「始终允许」。）
+**macOS 无法打开自行构建的 App。** 本 Fork 目前尚无独立签名、公证的正式安装包。请先确认应用来自可信的源码和构建过程，再根据 macOS **系统设置 → 隐私与安全性** 中的提示处理。上游应用历史版本的签名与公证信息不适用于本 Fork。
 
-其它问题——[提个 issue](https://github.com/wzwu0309/agent-toolchain-manager/issues)，并附上 **设置 → 导出日志** 打出来的压缩包。
+遇到其他问题，请在 [GitHub Issues](https://github.com/wzwu0309/agent-toolchain-manager/issues) 反馈，并附上 **设置 → 导出日志** 生成的文件。
 
-## Star 增长
+## 项目来源与许可
 
-<p align="center">
-  <a href="https://github.com/xingkongliang/star-history-svg">
-    <img src="assets/star-history.svg" width="800" alt="xingkongliang/skills-manager 的 Star History 图" />
-  </a>
-</p>
+Agent Toolchain Manager 基于开源项目 [Skills Manager](https://github.com/xingkongliang/skills-manager) Fork 开发。感谢原项目在 MIT 许可证下提供的基础实现；上游项目的宣传视频、热度统计与历史发布成就不应视为本项目的成果。
 
-## License
-
-MIT
+本仓库使用 **MIT License**，详见 [LICENSE](LICENSE)。

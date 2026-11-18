@@ -1,94 +1,49 @@
-> **Fork notice — Agent Toolchain Manager.** This is a separately installed fork of Skills Manager.
-> The default data root and CLI name differ, and app auto-updates are disabled
-> until this fork has its own signed releases. This fork has distinct install
-> and CLI instructions; any upstream media and badges remain for attribution.
-> Read [Fork release isolation](FORK_RELEASE_ISOLATION.md) before building.
-> Demo videos and upstream popularity badges below belong to the original project.
-
-<p align="center">
-  <img src="assets/icon.png" width="80" />
-</p>
-
 <h1 align="center">Agent Toolchain Manager</h1>
 
 <p align="center">
-  One app to manage AI agent skills across all your coding tools.
+  A project-first home for reusable AI agent capabilities.
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/wzwu0309/agent-toolchain-manager">GitHub · Agent Toolchain Manager</a></strong>
-</p>
-
-<p align="center">
-  🎬 <a href="https://www.youtube.com/watch?v=DJ9RIX8nbow">1.5-min intro (YouTube)</a>
+  <a href="./README.zh-CN.md">简体中文</a>
   &nbsp;·&nbsp;
-  <a href="https://www.youtube.com/watch?v=SNVD5ZN6QPE">Full walkthrough (9 min)</a>
-  &nbsp;·&nbsp;
-  <a href="https://www.bilibili.com/video/BV1cdpc6PExG/">视频介绍 (Bilibili)</a>
+  <a href="https://github.com/wzwu0309/agent-toolchain-manager/issues">Issues &amp; development</a>
 </p>
 
-<p align="center">
-  <a href="./README.zh-CN.md">中文说明</a>
-  &nbsp;·&nbsp;
-  <a href="https://x.com/JayTL00">@JayTL00 on X</a>
-  &nbsp;·&nbsp;
-  <a href="https://buymeacoffee.com/jaytl">Buy me a coffee</a>
-</p>
+## Vision
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/23290?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-23290" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/23290" alt="xingkongliang%2Fskills-manager | Trendshift" width="250" height="55"/></a>
-</p>
+AI coding agents should be able to use the right capabilities in the right project without every tool requiring a separate, manually maintained setup.
 
-<p align="center">
-  <a href="https://skills.sh/xingkongliang/skills-manager"><img src="https://skills.sh/b/xingkongliang/skills-manager" alt="manage-skills on skills.sh" /></a>
-</p>
+**Agent Toolchain Manager** aims to become a shared control plane for organizing, assigning and maintaining reusable agent capabilities across tools and projects. The intended workflow is:
 
-<p align="center">
-  <img src="assets/demo/library.png" width="800" alt="Upstream Skills Manager UI reference" />
-</p>
+**Discover → Curate → Choose agents/projects → Review changes → Deploy → Track and update.**
 
-<p align="center"><strong>Install Skills — Marketplace</strong></p>
-<p align="center"><img src="assets/demo/install-skills.png" width="800" alt="Install Skills Marketplace" /></p>
+The goal is not to make every agent identical. It is to make each project's setup explicit, repeatable, inspectable and safe to change.
 
-<p align="center"><strong>Global Workspace</strong></p>
-<p align="center"><img src="assets/demo/global-workspace.png" width="800" alt="Global Workspace" /></p>
+## What works today
 
-<p align="center"><strong>Agent Workspace</strong></p>
-<p align="center"><img src="assets/demo/agent-workspace.png" width="800" alt="Agent Workspace" /></p>
+The current application focuses on **Skills**:
 
-<p align="center"><strong>Project Workspace</strong></p>
-<p align="center"><img src="assets/demo/project-workspace.png" width="800" alt="Project Workspace" /></p>
+- **Central Skill library:** import from Git repositories, local directories, archives and the [skills.sh](https://skills.sh) marketplace. The fork defaults to `~/.agent-toolchain-manager` and supports a custom library path.
+- **Agent and project workspaces:** inspect global and project-local Skills, manage supported agents, and deploy by copy or symlink.
+- **Presets and organization:** assign groups of Skills, use tags and filters, and manage multiple deployments.
+- **GUI and CLI:** people can work in the desktop app; coding agents can use the `agent-toolchain-manager-cli` and the bundled [`manage-skills`](skills/manage-skills/SKILL.md) Skill.
+- **History and backup:** use Git-based backup, snapshots and multi-device synchronization, with conflict-handling controls.
+- **Inspection:** view Skill documentation, sources and deployment state, and export application logs.
 
-<p align="center"><strong>Backup & Multi-Device Sync</strong></p>
-<p align="center"><img src="assets/demo/backup.png" width="800" alt="Backup and multi-device sync" /></p>
+These are the current Skill-management capabilities; they do **not** mean generalized MCP/Plugin/command management is implemented.
 
-<p align="center"><strong>Settings</strong></p>
-<p align="center"><img src="assets/demo/settings.png" width="800" alt="Settings" /></p>
+## Where we want to go
 
-## Features
+These are **directions for future development, not shipped features or delivery promises**:
 
-<p align="center">
-  <img src="assets/diagram-concept-map.png" width="640" alt="Concept map: Library, Preset, Global Workspace, Project Workspace, Agent" />
-</p>
+1. **Project-first configuration:** select the agents and capabilities a particular repository needs, without changing unrelated projects or global agent folders.
+2. **Traceable versions and safer updates:** make deployed content, provenance, local edits and explicit takeover decisions visible before replacing files.
+3. **Broader capability assets:** explore managing MCP servers, commands, prompts and other reusable agent integrations alongside Skills, once their ownership and lifecycle contracts are clear.
+4. **Consistent automation:** have the GUI and agent-facing CLI use the same predictable validation, conflict and deployment rules.
+5. **Reproducible toolchains:** make it easier to understand and recreate a project's agent setup on another machine.
 
-- **Unified skill library** — Install skills from Git repos, local folders, `.zip` / `.skill` archives, or the [skills.sh](https://skills.sh) marketplace. Everything goes into one central repo, which defaults to `~/.agent-toolchain-manager` and can be customized in **Settings**.
-- **Marketplace** — Browse popular skills from the marketplace and find them with keyword search.
-- **Your agents can manage skills** — Claude Code, Codex, Cursor and the rest can install a skill, deploy it to another agent, or report what is where, by driving Agent Toolchain Manager instead of writing into an agent's folder behind its back — so sources, presets, update tracking and per-agent state stay intact. The Dashboard sets this up in one click; see [Let your agents manage skills](#let-your-agents-manage-skills).
-- **Presets** — Group skills into named presets. In any workspace, click a preset pill to instantly activate or deactivate all its skills for the current agent scope. Applying a preset is a one-time copy, not a live sync. The sidebar lists all presets for quick access.
-- **Global Workspace** — Each agent gets its own page listing every skill in its global folder — including ones installed outside Agent Toolchain Manager — so the view always reflects what the agent actually sees. Add or remove skills per agent, or use the All Agents overview to manage every installed agent at once.
-- **Project Workspaces** — View and manage project-local skill folders for supported agents, compare them with your central library, and sync changes in either direction. Supports nested skill directories and per-agent assignment when exporting.
-- **Linked Workspaces** — Point to any directory as a skills root — useful for skills that live outside the default agent paths. Managed as a standalone workspace without participating in global preset sync.
-- **Multi-tool sync** — Sync skills to any supported tool via symlink or copy with a single click. Every skill card shows an agent icon badge per enabled agent — click a badge to install or remove that skill for that agent right from the card, with the badge reflecting live sync state.
-- **Add from Library sheet** — In any workspace, click **+ Add Skills** to open a unified picker: search your central library, toggle target agents with always-visible chips (with select-all/clear), and batch-add multiple skills in one click.
-- **Batch operations** — Multi-select skills for bulk enable/disable, export, or delete. Project Workspaces also support bulk enable/disable for project-local skills.
-- **Skill tagging and filters** — Tag skills, use tags to group similar skills, and filter by source or tag — including an **Untagged** pill to quickly find skills missing labels.
-- **Update tracking** — Check for upstream updates on Git-based skills; re-import local ones.
-- **Skill preview and source inspection** — Read `SKILL.md` / `README.md`, inspect source metadata, and compare local content with the upstream version inside the app.
-- **Custom tools** — Add your own agents/tools with custom skills directories, or override the default path for any built-in tool.
-- **Backup & multi-device sync** — Connect a private GitHub repository with one sign-in (or any Git remote), and the app backs your library up automatically and keeps all connected devices in sync. Merges are skill-aware — a rename on one machine combines cleanly with an edit on another — and true conflicts never block: your local version stays put until you choose keep mine / use remote / keep both. Snapshot versions are restorable at any time.
-- **Activity log & Export Logs** — Install / remove / update / sync operations are recorded locally. Use **Settings → Export Logs** to bundle recent logs and activity history into a single zip for easier issue reports.
-- **Flexible app settings** — Configure repo path, sync mode, theme, text size, language, tray behavior, proxy, Git remote, update checks, and the order agents appear throughout the app — all in one place.
-- **Fork app updates are disabled** until there is an independent signed release channel. Skill source updates are unaffected.
+Implementation priorities and design decisions are tracked in [GitHub Issues](https://github.com/wzwu0309/agent-toolchain-manager/issues).
 
 ## Install this fork from source
 
@@ -270,18 +225,12 @@ npm run cli:build
 
 ## Troubleshooting
 
-**macOS refuses to open the app.** Releases from **v1.29.0** onward are signed with an Apple Developer ID certificate and notarized, so they open normally. If you see "Apple could not verify…" or "App is damaged", you are on v1.28.5 or older — upgrading is the fix. (Upgrading changes the code signature, so macOS may ask once more for the `skills-manager-git-backup` keychain entry; click **Always Allow**.)
+**macOS cannot open a locally built app.** This fork does not yet publish an independently signed and notarized installer. Verify that you built or obtained the app from a trusted source, and consult macOS **System Settings → Privacy & Security** for the applicable warning. Signing and notarization claims about the upstream application's historical releases do not apply to this fork.
 
-Anything else — [open an issue](https://github.com/wzwu0309/agent-toolchain-manager/issues), and attach the bundle from **Settings → Export Logs**.
+For other issues, [open an issue](https://github.com/wzwu0309/agent-toolchain-manager/issues) and attach logs exported from **Settings → Export Logs**.
 
-## Star History
+## Origins and license
 
-<p align="center">
-  <a href="https://github.com/xingkongliang/star-history-svg">
-    <img src="assets/star-history.svg" width="800" alt="Star History chart for xingkongliang/skills-manager" />
-  </a>
-</p>
+Agent Toolchain Manager is an independent fork of [Skills Manager](https://github.com/xingkongliang/skills-manager), originally released under the **MIT license**. We credit the upstream project for its original implementation; its promotional videos, popularity metrics and release history are not this project's claims.
 
-## License
-
-MIT
+This repository is licensed under MIT. See [LICENSE](LICENSE).

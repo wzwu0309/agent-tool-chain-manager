@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/icon.png" width="80" alt="Agent Toolchain Manager" />
-</p>
-
 <h1 align="center">Agent Toolchain Manager</h1>
 
 <p align="center">

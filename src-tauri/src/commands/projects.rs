@@ -1497,6 +1497,33 @@ pub fn slugify_skill_names(names: Vec<String>) -> Vec<String> {
     names.iter().map(|n| slugify_skill_dir_name(n)).collect()
 }
 
+#[tauri::command]
+pub async fn get_project_skill_git_history(
+    store: State<'_, Arc<SkillStore>>,
+    skill_id: String,
+    limit: Option<u32>,
+) -> Result<git_skill_versions::GitSkillHistory, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Do not make arbitrary filesystem history query a path read primitive:
+        // require a SkillId registered in this central Store.
+        if store
+            .get_skill_by_id(&skill_id)
+            .map_err(AppError::db)?
+            .is_none()
+        {
+            return Err(AppError::not_found("Skill not found"));
+        }
+        git_skill_versions::list_skill_history(
+            &central_repo::skills_dir(),
+            &skill_id,
+            limit.unwrap_or(25) as usize,
+        )
+        .map_err(AppError::io)
+    })
+    .await?
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProjectSkillExportRecovery {
     pub operation_id: String,
@@ -5132,6 +5159,263 @@ mod project_plan_tests {
             .is_some());
     }
 
+    /// Run by a separate Rust test subprocess. This worker performs a real
+    /// filesystem rename, records that it crossed the crash window, then
+    /// intentionally stays alive until the parent SIGKILLs it. Running without
+    /// the sentinel environment variable is a no-op.
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_rename_crash_window_worker() {
+        if std::env::var_os("ATM_ISSUE11_CRASH_TEST").is_none() {
+            return;
+        }
+        let source = PathBuf::from(std::env::var_os("ATM_CRASH_SOURCE").unwrap());
+        let destination = PathBuf::from(std::env::var_os("ATM_CRASH_DEST").unwrap());
+        let marker = PathBuf::from(std::env::var_os("ATM_CRASH_MARKER").unwrap());
+        rename_directory_no_replace(&source, &destination).unwrap();
+        fs::write(&marker, "rename complete, waiting for SIGKILL").unwrap();
+        std::thread::park();
+        panic!("subprocess must be terminated by SIGKILL");
+    }
+
+    #[cfg(unix)]
+    fn kill_child_after_rename(source: &Path, destination: &Path, tmp: &Path) {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let marker = tmp.join("child-renamed");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("commands::projects::project_plan_tests::subprocess_rename_crash_window_worker")
+            .arg("--nocapture")
+            .env("ATM_ISSUE11_CRASH_TEST", "1")
+            .env("ATM_CRASH_SOURCE", source)
+            .env("ATM_CRASH_DEST", destination)
+            .env("ATM_CRASH_MARKER", &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let reached = loop {
+            if marker.is_file() {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Always reap the spawned process, even if setup unexpectedly failed.
+        child
+            .kill()
+            .expect("SIGKILL child still running after rename");
+        let exit = child.wait().unwrap();
+        assert!(reached, "child did not reach the publishing crash window");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            exit.signal(),
+            Some(9),
+            "child must be terminated by actual SIGKILL"
+        );
+        assert!(std::fs::symlink_metadata(source).is_err());
+        assert!(std::fs::symlink_metadata(destination).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_interrupted_toggle_recovers_without_adopting_external_skill() {
+        let fx = fixture(&["claude_code"]);
+        let source = fx.repo.join(".claude/skills/demo");
+        let destination = fx.repo.join(".claude/skills-disabled/demo");
+        write_skill(&source, "demo", "external data before crash");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let identity = project_target_identity_string(&source).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let recovery = source.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir_all(&recovery).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: "external-unmanaged".to_string(),
+                deployment_id: None,
+                kind: "toggle".to_string(),
+                phase: "preparing".to_string(),
+                target_path: source.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: None,
+                created_at: now,
+                updated_at: now,
+                destination_path: Some(destination.to_string_lossy().to_string()),
+                observed_identity: Some(identity),
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+
+        kill_child_after_rename(&source, &destination, fx._tmp.path());
+        let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert!(notices
+            .iter()
+            .any(|notice| notice.contains(&id) && notice.contains("Restored")));
+        assert!(fs::read_to_string(source.join("SKILL.md"))
+            .unwrap()
+            .contains("external data before crash"));
+        assert!(!destination.exists());
+        assert!(
+            restarted
+                .get_project_skill_deployment(&fx.project_id, &source.to_string_lossy(),)
+                .unwrap()
+                .is_none(),
+            "external Copy must not become managed"
+        );
+        let ops = restarted.pending_project_skill_operations().unwrap();
+        assert!(ops
+            .iter()
+            .any(|op| op.id == id && op.phase == "recovery_available"));
+        recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert!(source.join("SKILL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_recovery_never_overwrites_new_external_occupant() {
+        let fx = fixture(&["claude_code"]);
+        let target = fx.repo.join(".claude/skills/demo");
+        write_skill(&target, "demo", "original to preserve");
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = target.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir_all(&root).unwrap();
+        let previous = root.join("previous");
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: "external-unmanaged".to_string(),
+                deployment_id: None,
+                kind: "delete".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: root.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: None,
+                created_at: now,
+                updated_at: now,
+                destination_path: None,
+                observed_identity: None,
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        kill_child_after_rename(&target, &previous, fx._tmp.path());
+        // A different process creates a directory at the original path while
+        // the publisher is dead. Recovery must keep BOTH copies intact.
+        write_skill(&target, "demo", "new user's independently owned contents");
+        let reopened = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|msg| msg.contains(&id) && msg.contains("Incomplete")),
+            "{notices:?}"
+        );
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("independently owned"));
+        assert!(fs::read_to_string(previous.join("SKILL.md"))
+            .unwrap()
+            .contains("original to preserve"));
+        let op = reopened
+            .pending_project_skill_operations()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap();
+        assert_eq!(op.phase, "publishing");
+        assert!(reopened
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_interrupted_delete_restores_managed_copy_and_db_record() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "managed original before crash");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let before = fs::read(target.join("SKILL.md")).unwrap();
+        let old_row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let recovery_root = target.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir_all(&recovery_root).unwrap();
+        let previous = recovery_root.join("previous");
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: demo.id.clone(),
+                deployment_id: Some(old_row.id.clone()),
+                kind: "delete".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery_root.to_string_lossy().to_string(),
+                base_tree_oid: old_row.base_tree_oid.clone(),
+                new_tree_oid: None,
+                created_at: now,
+                updated_at: now,
+                destination_path: None,
+                observed_identity: None,
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+
+        kill_child_after_rename(&target, &previous, fx._tmp.path());
+        let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert!(notices
+            .iter()
+            .any(|notice| notice.contains(&id) && notice.contains("Restored")));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), before);
+        assert!(!previous.exists());
+        assert_eq!(
+            restarted
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .id,
+            old_row.id
+        );
+        recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), before);
+    }
+
     #[test]
     fn interrupted_toggle_recovery_restores_original_without_claiming_management() {
         let fx = fixture(&["claude_code"]);
@@ -5687,6 +5971,75 @@ mod project_plan_tests {
         assert_eq!(plan[0].state, ProjectDeployState::Conflict);
         assert!(update_managed_project_copy(&fx.store, &fx.project_id, &external, None).is_err());
         assert!(external.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn gui_explicit_historical_commit_uses_exact_committed_bytes_not_dirty_center() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "FIRST COMMITTED");
+        commit_library(&fx);
+        let older =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &demo.id, None)
+                .unwrap();
+        fs::write(
+            Path::new(&demo.central_path).join("SKILL.md"),
+            "# SECOND COMMITTED",
+        )
+        .unwrap();
+        commit_library(&fx);
+        let head =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &demo.id, None)
+                .unwrap();
+        assert_ne!(older.commit_oid, head.commit_oid);
+        fs::write(
+            Path::new(&demo.central_path).join("SKILL.md"),
+            "# DIRTY UNCOMMITTED",
+        )
+        .unwrap();
+
+        let history =
+            git_skill_versions::list_skill_history(&central_repo::skills_dir(), &demo.id, 25)
+                .unwrap();
+        assert!(history.uncommitted_central_changes_excluded);
+        assert!(history
+            .versions
+            .iter()
+            .any(|v| v.commit_oid == older.commit_oid));
+
+        let result = export_skill_to_project_with_report_internal(
+            &fx.store,
+            demo.id.clone(),
+            fx.project_id.clone(),
+            Some(vec!["claude_code".into()]),
+            Some(&older.commit_oid),
+        )
+        .unwrap();
+        assert!(result.ok);
+        assert_eq!(result.targets[0].result, "created");
+        let target = fx.repo.join(".claude/skills/demo");
+        let bytes = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        assert!(bytes.contains("FIRST COMMITTED"), "{bytes}");
+        assert!(!bytes.contains("DIRTY"));
+        let owned = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owned.base_commit_oid.as_deref(),
+            Some(older.commit_oid.as_str())
+        );
+        assert_eq!(
+            owned.base_tree_oid.as_deref(),
+            Some(older.tree_oid.as_str())
+        );
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &owned.id,
+            &older.commit_oid,
+        )
+        .unwrap();
     }
 
     #[test]

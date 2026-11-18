@@ -111,6 +111,70 @@ fn resolve_skill_version_from_commit(
     })
 }
 
+/// Bounded, read-only Git history for one Skill, not a global snapshot list.
+/// Only the current HEAD ancestry is selectable by the standard deploy Core.
+/// A historical CommitId is always passed in full to the existing resolver.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSkillHistory {
+    pub versions: Vec<GitSkillHistoryItem>,
+    pub uncommitted_central_changes_excluded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSkillHistoryItem {
+    pub commit_oid: String,
+    pub tree_oid: String,
+    pub path_at_commit: String,
+    pub message: String,
+    pub committed_at: String,
+    pub is_head: bool,
+}
+
+pub fn list_skill_history(
+    skills_dir: &Path,
+    skill_id: &str,
+    limit: usize,
+) -> Result<GitSkillHistory> {
+    if !valid_name_component(skill_id) {
+        bail!("invalid SkillId for history query");
+    }
+    let repo = open_exact_store(skills_dir)?;
+    let head = repo.head()?.peel_to_commit()?.id();
+    let mut walk = repo.revwalk()?;
+    walk.push(head)?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+    let mut versions = Vec::new();
+    // Bound both returned results and traversal for large central stores.
+    for result in walk.take(1000) {
+        let oid = result?;
+        let commit = repo.find_commit(oid)?;
+        let version = match resolve_skill_version_from_commit(&repo, skill_id, &commit) {
+            Ok(version) => version,
+            Err(_) => continue,
+        };
+        let committed_at = chrono::DateTime::from_timestamp(commit.time().seconds(), 0)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_default();
+        versions.push(GitSkillHistoryItem {
+            commit_oid: version.commit_oid,
+            tree_oid: version.tree_oid,
+            path_at_commit: version.path_at_commit,
+            message: commit.summary().unwrap_or_default().to_string(),
+            committed_at,
+            is_head: oid == head,
+        });
+        if versions.len() >= limit.clamp(1, 50) {
+            break;
+        }
+    }
+    Ok(GitSkillHistory {
+        versions,
+        uncommitted_central_changes_excluded: has_uncommitted_central_changes(skills_dir)?,
+    })
+}
+
 /// Local immutable reachability anchor for each deployed Git commit.
 /// Each deployment can accumulate multiple commit pins during updates.
 /// Pins are never implicitly deleted while recovery data might be needed.
@@ -545,6 +609,62 @@ mod tests {
         fs::write(fx.dir.path().join("toolkit/demo/SKILL.md"), "uncommitted").unwrap();
         let default = resolve_skill_version(fx.dir.path(), "demo-skill", None).unwrap();
         assert_eq!(default, at_first);
+    }
+
+    #[test]
+    fn skill_history_only_lists_selectable_head_ancestors_and_excludes_uncommitted_bytes() {
+        let fx = Fixture::new();
+        fx.write_skill("toolkit/demo", "v1");
+        let oldest = fx.commit("initial Skill version");
+        fx.write_skill("toolkit/demo", "v2");
+        let latest = fx.commit("second Skill version");
+        fs::write(fx.dir.path().join("toolkit/demo/SKILL.md"), "uncommitted").unwrap();
+        let history = list_skill_history(fx.dir.path(), "demo-skill", 25).unwrap();
+        assert!(history.uncommitted_central_changes_excluded);
+        assert_eq!(history.versions.len(), 2);
+        assert_eq!(history.versions[0].commit_oid, latest.to_string());
+        assert!(history.versions[0].is_head);
+        assert_eq!(history.versions[1].commit_oid, oldest.to_string());
+        assert!(!history.versions[1].is_head);
+        for item in &history.versions {
+            assert_eq!(
+                resolve_skill_version(fx.dir.path(), "demo-skill", Some(&item.commit_oid))
+                    .unwrap()
+                    .tree_oid,
+                item.tree_oid,
+            );
+        }
+        assert_eq!(
+            list_skill_history(fx.dir.path(), "demo-skill", 1)
+                .unwrap()
+                .versions
+                .len(),
+            1
+        );
+        assert!(list_skill_history(fx.dir.path(), "../escape", 20).is_err());
+    }
+
+    #[test]
+    fn version_picker_never_offers_orphaned_commit_after_head_rewrite() {
+        let fx = Fixture::new();
+        fx.write_skill("toolkit/demo", "original");
+        let earlier = fx.commit("historical");
+        fx.write_skill("toolkit/demo", "orphaned");
+        let orphan = fx.commit("will be orphaned");
+        let head_name = fx.repo.head().unwrap().name().unwrap().to_string();
+        fx.repo
+            .reference(&head_name, earlier, true, "rewrite HEAD")
+            .unwrap();
+        let history = list_skill_history(fx.dir.path(), "demo-skill", 50).unwrap();
+        assert_eq!(history.versions.len(), 1);
+        assert_eq!(history.versions[0].commit_oid, earlier.to_string());
+        assert!(!history
+            .versions
+            .iter()
+            .any(|v| v.commit_oid == orphan.to_string()));
+        assert!(
+            resolve_skill_version(fx.dir.path(), "demo-skill", Some(&orphan.to_string())).is_err()
+        );
     }
 
     #[test]

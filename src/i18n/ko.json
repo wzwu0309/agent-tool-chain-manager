@@ -825,6 +825,15 @@
     "collapse": "접기"
   },
   "addFromLibrary": {
+    "gitCommit": {
+      "title": "배포할 Git 버전",
+      "loading": "Skill 커밋 기록을 불러오는 중…",
+      "unavailable": "Git 기록을 사용할 수 없습니다. 지원되는 경우 현재 버전으로 배포합니다.",
+      "latest": "현재 Git HEAD (최신 커밋)",
+      "dirty": "중앙 저장소에 미커밋 변경 사항이 있습니다. 배포에는 커밋된 파일만 포함됩니다.",
+      "multiple": "Skill 하나만 선택하면 과거 버전을 선택할 수 있습니다. 일괄 배포는 현재 HEAD를 사용합니다.",
+      "copyOnly": "과거 Commit 선택은 Copy 모드에서만 지원됩니다. Symlink는 변경 가능한 중앙 디렉터리를 가리킵니다."
+    },
     "deploymentResults": "에이전트별 배포 결과",
     "deployState": {
       "created": "생성됨",

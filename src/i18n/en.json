@@ -842,6 +842,15 @@
     "collapse": "Collapse"
   },
   "addFromLibrary": {
+    "gitCommit": {
+      "title": "Git version to deploy",
+      "loading": "Loading committed Skill versions…",
+      "unavailable": "Git history is unavailable; the current version will be used if supported.",
+      "latest": "Current Git HEAD (latest committed version)",
+      "dirty": "The central Store has uncommitted changes. Deployment excludes those files and uses committed bytes only.",
+      "multiple": "Historical selection is available when exactly one Skill is selected; this batch uses current Git HEAD.",
+      "copyOnly": "Selecting a historical Commit requires Copy mode; Symlinks follow the mutable central directory."
+    },
     "deploymentResults": "Deployment results by agent",
     "deployState": {
       "created": "Created",

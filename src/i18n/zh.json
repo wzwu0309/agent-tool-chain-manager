@@ -842,6 +842,15 @@
     "collapse": "收起"
   },
   "addFromLibrary": {
+    "gitCommit": {
+      "title": "部署的 Git 版本",
+      "loading": "正在加载 Skill 已提交版本…",
+      "unavailable": "Git 历史暂不可用；如支持，仍可使用当前版本部署。",
+      "latest": "当前 Git HEAD（最新已提交版本）",
+      "dirty": "中央存储存在未提交修改；部署不会包含这些内容，只使用已提交的 Git 版本。",
+      "multiple": "仅选择一个 Skill 时可选择历史版本；本次批量部署使用当前 Git HEAD。",
+      "copyOnly": "指定历史 Commit 仅支持 Copy 模式；Symlink 始终指向可变的中央目录。"
+    },
     "deploymentResults": "各 Agent 部署结果",
     "deployState": {
       "created": "已创建",

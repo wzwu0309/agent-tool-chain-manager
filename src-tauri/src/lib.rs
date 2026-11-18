@@ -1125,6 +1125,7 @@ pub fn run() {
             commands::projects::import_project_skill_to_center,
             commands::projects::export_skill_to_project,
             commands::projects::export_skill_to_project_with_report,
+            commands::projects::get_project_skill_git_history,
             commands::projects::update_project_skill_to_center,
             commands::projects::update_project_skill_from_center,
             commands::projects::toggle_project_skill,

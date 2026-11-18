@@ -858,6 +858,23 @@ export const exportSkillToProject = (
   skillId, projectId, agents: agents ?? null, commitOid: commitOid ?? null,
 });
 
+export interface GitSkillHistoryItem {
+  commitOid: string;
+  treeOid: string;
+  pathAtCommit: string;
+  message: string;
+  committedAt: string;
+  isHead: boolean;
+}
+
+export interface GitSkillHistory {
+  versions: GitSkillHistoryItem[];
+  uncommittedCentralChangesExcluded: boolean;
+}
+
+export const getProjectSkillGitHistory = (skillId: string, limit = 25) =>
+  invoke<GitSkillHistory>("get_project_skill_git_history", { skillId, limit });
+
 export interface ProjectSkillExportRecovery {
   operation_id: string;
   phase: string;

@@ -825,6 +825,15 @@
     "collapse": "Contraer"
   },
   "addFromLibrary": {
+    "gitCommit": {
+      "title": "Versión Git que se desplegará",
+      "loading": "Cargando versiones confirmadas del Skill…",
+      "unavailable": "El historial Git no está disponible; se usará la versión actual si es posible.",
+      "latest": "HEAD actual de Git (última versión confirmada)",
+      "dirty": "El almacén central contiene cambios sin confirmar; el despliegue solo utiliza archivos confirmados.",
+      "multiple": "Selecciona un solo Skill para elegir una versión histórica; el lote usa el HEAD actual.",
+      "copyOnly": "Elegir un Commit histórico requiere el modo Copy; los Symlink apuntan al directorio central mutable."
+    },
     "deploymentResults": "Resultados de despliegue por agente",
     "deployState": {
       "created": "Creado",

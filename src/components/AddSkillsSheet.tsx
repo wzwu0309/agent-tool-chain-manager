@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { cn } from "../utils";
 import * as api from "../lib/tauri";
-import type { ManagedSkill, ProjectAgentTarget, ProjectSkillExportTargetResult } from "../lib/tauri";
+import type { ManagedSkill, ProjectAgentTarget, ProjectSkillExportTargetResult, GitSkillHistory } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
 import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { countHiddenSelected } from "../lib/selectionVisibility";
@@ -84,6 +84,10 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
   const [installing, setInstalling] = useState(false);
   const [projectTargetResults, setProjectTargetResults] = useState<ProjectSkillExportTargetResult[]>([]);
   const [projectPreflightErrors, setProjectPreflightErrors] = useState<{ skill: string; error: string }[]>([]);
+  const [gitHistory, setGitHistory] = useState<GitSkillHistory | null>(null);
+  const [gitHistoryLoading, setGitHistoryLoading] = useState(false);
+  const [gitHistoryError, setGitHistoryError] = useState(false);
+  const [selectedCommitOid, setSelectedCommitOid] = useState("");
 
   const initialAgents = target.kind === "project" ? target.initialSelectedAgents : [];
   const [selectedAgents, setSelectedAgents] = useState<string[]>(initialAgents);
@@ -325,6 +329,29 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
     [selectedIds, managedSkills, ctx],
   );
 
+  const historySkillId = target.kind === "project" && selectableSelected.length === 1
+    ? selectableSelected[0] : null;
+
+  // Historical selection is intentionally single-Skill only. The backend
+  // returns just HEAD ancestors registered under this SkillId, and the
+  // selected full CommitOid is revalidated during deployment.
+  useEffect(() => {
+    setSelectedCommitOid("");
+    setGitHistory(null);
+    setGitHistoryError(false);
+    if (!historySkillId) return;
+    let cancelled = false;
+    setGitHistoryLoading(true);
+    void api.getProjectSkillGitHistory(historySkillId).then((history) => {
+      if (!cancelled) setGitHistory(history);
+    }).catch(() => {
+      if (!cancelled) setGitHistoryError(true);
+    }).finally(() => {
+      if (!cancelled) setGitHistoryLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [historySkillId]);
+
   const projectCtx = ctx.kind === "project" ? (ctx as ProjectPickerContext) : null;
   const projectNamesReady = target.kind !== "project" || dirNameMapError || !dirNameMapLoading;
   const enabledTargets = target.kind === "project"
@@ -420,7 +447,11 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
             if (!skill) continue;
             const agents = targetsToInstall(skill, projectCtx);
             if (agents.length === 0) continue;
-            const report = await api.exportSkillToProjectWithReport(id, target.projectId, agents);
+            const commitOid = historySkillId === id && selectedCommitOid
+              ? selectedCommitOid : undefined;
+            const report = await api.exportSkillToProjectWithReport(
+              id, target.projectId, agents, commitOid,
+            );
             completedProjectTargets.push(...report.targets);
             if (report.ok) {
               ok++;
@@ -715,6 +746,46 @@ function AddSkillsSheetBody({ onClose, target, managedSkills, onInstalled }: Pro
               ))}
             </div>
             <p className="mt-1 text-[11px] text-muted">{t("addFromLibrary.recoveryReadOnly")}</p>
+          </section>
+        )}
+
+        {target.kind === "project" && selectableSelected.length > 0 && (
+          <section className="shrink-0 border-t border-border-subtle px-5 py-2.5">
+            <p className="text-[12px] font-medium text-secondary">{t("addFromLibrary.gitCommit.title")}</p>
+            {historySkillId ? (
+              <>
+                {gitHistoryLoading ? (
+                  <p className="mt-1 text-[12px] text-muted">{t("addFromLibrary.gitCommit.loading")}</p>
+                ) : gitHistoryError ? (
+                  <p className="mt-1 text-[12px] text-muted">{t("addFromLibrary.gitCommit.unavailable")}</p>
+                ) : (
+                  <select
+                    value={selectedCommitOid}
+                    onChange={(e) => setSelectedCommitOid(e.target.value)}
+                    disabled={installing || !gitHistory?.versions.length}
+                    className="app-input mt-1 w-full text-[12px]"
+                    aria-label={t("addFromLibrary.gitCommit.title")}
+                  >
+                    <option value="">{t("addFromLibrary.gitCommit.latest")}</option>
+                    {gitHistory?.versions.filter((item) => !item.isHead).map((item) => (
+                      <option key={item.commitOid} value={item.commitOid}>
+                        {item.commitOid.slice(0, 10)} · {item.message || item.committedAt}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {gitHistory?.uncommittedCentralChangesExcluded && (
+                  <p className="mt-1 text-[12px] text-amber-600 dark:text-amber-400">
+                    {t("addFromLibrary.gitCommit.dirty")}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="mt-1 text-[12px] text-muted">
+                {t("addFromLibrary.gitCommit.multiple")}
+              </p>
+            )}
+            <p className="mt-1 text-[11px] text-muted">{t("addFromLibrary.gitCommit.copyOnly")}</p>
           </section>
         )}
 

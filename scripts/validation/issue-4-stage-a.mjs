@@ -127,11 +127,32 @@ if (!state.central) {
   });
   if (state.targets) {
     check('SM-03', () => {
-      const expected = [path.join(projectA, '.codex/skills', path.basename(state.central)), path.join(projectA, '.claude/skills', path.basename(state.central))];
-      for (const p of expected) assert(fs.lstatSync(p).isSymbolicLink(), `missing project-scoped target: ${p}`);
+      // Official, project-scoped discovery paths verified on 2026-11-18.
+      // This is a documentation-conformance check, not an Agent subprocess test.
+      const documented = [
+        { agent: 'codex', relativeDir: '.agents/skills', doc: 'https://learn.chatgpt.com/docs/build-skills#where-to-save-skills' },
+        { agent: 'claude_code', relativeDir: '.claude/skills', doc: 'https://code.claude.com/docs/en/skills#choose-where-skills-load' },
+      ];
+      const observed = state.targets.map(t => ({
+        agent: t.agent,
+        relativeDir: path.relative(projectA, path.dirname(t.path)),
+        path: sanitize(t.path),
+      }));
+      const comparisons = documented.map(expected => {
+        const match = observed.find(actual => actual.agent === expected.agent);
+        return { ...expected, actualRelativeDir: match?.relativeDir ?? null, matches: match?.relativeDir === expected.relativeDir };
+      });
       const report = run('projects', 'show', projectA);
       assert(report.skills?.length >= 2, 'CLI failed to discover deployed project skills');
-      return { status: 'PARTIAL', detail: 'project-native Codex/Claude paths and CLI discovery proven; actual Agent subprocess discovery not executed', evidence: { paths: expected.map(sanitize), detectedSkills: report.skills.length } };
+      for (const t of state.targets) assert(fs.lstatSync(t.path).isSymbolicLink(), `missing project skill link: ${t.path}`);
+      const bad = comparisons.filter(c => !c.matches);
+      return {
+        status: bad.length ? 'FAIL' : 'PASS',
+        detail: bad.length
+          ? `documented project directory mismatch: ${bad.map(c => `${c.agent} actual=${c.actualRelativeDir} expected=${c.relativeDir}`).join('; ')}`
+          : 'Codex and Claude project directories conform to their official Skill documentation',
+        evidence: { criterion: 'official product documentation plus actual CLI deployment paths; no Agent subprocess required', documentationCheckedAt: '2026-11-18', comparisons, observed, detectedByManager: report.skills.length },
+      };
     });
     check('SM-04', () => {
       const links = state.targets.map(t => t.path);

@@ -232,6 +232,19 @@ pub fn has_local_deployment_pins(skills_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Informational only: deployment still uses committed Git blobs, never
+/// uncommitted central working-tree bytes (including untracked files).
+pub fn has_uncommitted_central_changes(skills_dir: &Path) -> Result<bool> {
+    let repo = open_exact_store(skills_dir)?;
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo.statuses(Some(&mut options))?;
+    Ok(!statuses.is_empty())
+}
+
 fn open_exact_store(skills_dir: &Path) -> Result<Repository> {
     let repo = Repository::open(skills_dir).with_context(|| {
         format!(

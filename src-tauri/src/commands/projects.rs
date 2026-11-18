@@ -212,16 +212,17 @@ fn project_agent_targets_for_record(
 /// Convert a project record into its DTO, folding the copies of one logical
 /// skill across agents together by relative path.
 fn project_to_dto(
+    store: &SkillStore,
     rec: &ProjectRecord,
     all_managed: &[SkillRecord],
     configs: &[project_scanner::AgentSkillConfig],
-) -> ProjectDto {
+) -> Result<ProjectDto, AppError> {
     let skills = read_workspace_skills(rec, configs);
     let mut grouped_statuses: HashMap<String, String> = HashMap::new();
 
     for skill in &skills {
         let matched = find_best_center_match(skill, all_managed);
-        let status = classify_sync_status(skill, matched);
+        let status = project_skill_status(store, &rec.id, skill, matched)?;
         let key = skill.relative_path.to_lowercase();
         let existing = grouped_statuses
             .entry(key)
@@ -243,7 +244,7 @@ fn project_to_dto(
         }
     }
 
-    ProjectDto {
+    Ok(ProjectDto {
         id: rec.id.clone(),
         name: rec.name.clone(),
         path: rec.path.clone(),
@@ -255,6 +256,26 @@ fn project_to_dto(
         sync_health: health,
         created_at: rec.created_at,
         updated_at: rec.updated_at,
+    })
+}
+
+/// The same authoritative status selector for the project list/sidebar and
+/// the project details. A managed Copy is measured against its pinned Git
+/// subtree, never against mutable center contents or filesystem mtimes.
+fn project_skill_status(
+    store: &SkillStore,
+    project_id: &str,
+    skill: &project_scanner::ProjectSkillInfo,
+    matched: Option<&SkillRecord>,
+) -> Result<String, AppError> {
+    match store
+        .get_project_skill_deployment(project_id, &skill.path)
+        .map_err(AppError::db)?
+    {
+        Some(row) if row.mode == "copy" && row.management_state == "managed" => {
+            Ok(managed_copy_status(&row, Path::new(&skill.path)))
+        }
+        _ => Ok(classify_sync_status(skill, matched)),
     }
 }
 
@@ -840,8 +861,8 @@ pub fn get_projects_internal(store: &SkillStore) -> Result<Vec<ProjectDto>, AppE
     let count = records.len();
     let dtos: Vec<ProjectDto> = records
         .iter()
-        .map(|r| project_to_dto(r, &all_managed, &configs))
-        .collect();
+        .map(|r| project_to_dto(store, r, &all_managed, &configs))
+        .collect::<Result<Vec<_>, _>>()?;
     let elapsed_ms = start.elapsed().as_millis();
     if should_log_first_or_slow(&GET_PROJECTS_FIRST_CALL, elapsed_ms, 100) {
         log::info!("get_projects: {count} projects in {elapsed_ms} ms");
@@ -925,7 +946,7 @@ pub fn add_project_internal(store: &SkillStore, path: String) -> Result<ProjectD
     store.insert_project(&record).map_err(AppError::db)?;
     let all_managed = store.get_all_skills().map_err(AppError::db)?;
     let configs = agent_skill_configs(&store);
-    Ok(project_to_dto(&record, &all_managed, &configs))
+    project_to_dto(store, &record, &all_managed, &configs)
 }
 
 #[tauri::command]
@@ -999,7 +1020,7 @@ pub async fn add_linked_workspace(
         store.insert_project(&record).map_err(AppError::db)?;
         let all_managed = store.get_all_skills().map_err(AppError::db)?;
         let configs = agent_skill_configs(&store);
-        Ok(project_to_dto(&record, &all_managed, &configs))
+        project_to_dto(&store, &record, &all_managed, &configs)
     })
     .await?
 }
@@ -1139,7 +1160,7 @@ pub fn get_project_skills_internal(
             .as_ref()
             .and_then(|skill_id| tags_map.get(skill_id).cloned())
             .unwrap_or_default();
-        skill.sync_status = classify_sync_status(skill, matched);
+        skill.sync_status = project_skill_status(store, &project_id, skill, matched)?;
         if let Some(deployment) = store
             .get_project_skill_deployment(&project_id, &skill.path)
             .map_err(AppError::db)?
@@ -1151,7 +1172,6 @@ pub fn get_project_skills_internal(
                     .get(&deployment.skill_id)
                     .cloned()
                     .unwrap_or_default();
-                skill.sync_status = managed_copy_status(&deployment, Path::new(&skill.path));
             }
         }
     }
@@ -1500,6 +1520,112 @@ pub fn export_skill_to_project_internal_with_commit(
     apply_project_deploy(store, &plan)
 }
 
+/// Read-only Core preview for CLI updates. Both this preview and the
+/// mutating update below use the same Git Tree/DeploymentId authority.
+/// An update always revalidates under RepoLock: this preview is NOT a lease.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedCopyUpdatePlan {
+    pub project_id: String,
+    pub deployment_id: String,
+    pub skill_id: String,
+    pub agent: String,
+    pub target_path: String,
+    pub base_commit_oid: String,
+    pub base_tree_oid: String,
+    pub target_commit_oid: String,
+    pub target_tree_oid: String,
+    pub will_change_content: bool,
+    pub will_change_version: bool,
+    pub uncommitted_central_changes_excluded: bool,
+}
+
+/// Resolve exactly one enabled/disabled path. Do not infer management from
+/// matching contents and never choose one of two conflicting directories.
+pub fn plan_managed_project_copy_update(
+    store: &SkillStore,
+    project_id: &str,
+    skill_relative_path: &str,
+    agent: &str,
+    commit_oid: Option<&str>,
+) -> Result<ManagedCopyUpdatePlan, AppError> {
+    ensure_safe_skill_relative_path(skill_relative_path)?;
+    let project = get_project_record(store, project_id)?;
+    ensure_workspace_path_exists(&project)?;
+    let (enabled_root, disabled_root) = resolve_agent_skills_roots(store, &project, agent)
+        .ok_or_else(|| AppError::not_found(format!("Unknown project agent: {agent}")))?;
+    let enabled = enabled_root.join(skill_relative_path);
+    let disabled = disabled_root
+        .as_ref()
+        .map(|root| root.join(skill_relative_path));
+    let enabled_present = std::fs::symlink_metadata(&enabled).is_ok();
+    let disabled_present = disabled
+        .as_ref()
+        .is_some_and(|path| std::fs::symlink_metadata(path).is_ok());
+    if enabled_present && disabled_present {
+        return Err(AppError::invalid_input(
+            "Both enabled and disabled Skill entries exist; update is ambiguous",
+        ));
+    }
+    let (target_path, target_root) = if enabled_present {
+        (enabled, enabled_root)
+    } else if disabled_present {
+        (
+            disabled.expect("disabled path exists"),
+            disabled_root.expect("disabled root exists"),
+        )
+    } else {
+        return Err(AppError::not_found("Project Skill target not found"));
+    };
+    ensure_dir_within_root(&target_path, &target_root)?;
+    let row = store
+        .get_project_skill_deployment(project_id, &target_path.to_string_lossy())
+        .map_err(AppError::db)?
+        .ok_or_else(|| {
+            AppError::invalid_input(
+                "Project Copy is not managed; explicit adoption is required before update",
+            )
+        })?;
+    if row.mode != "copy" || row.management_state != "managed" {
+        return Err(AppError::invalid_input(
+            "Only an explicitly managed Copy can be updated",
+        ));
+    }
+    let base_tree = row
+        .base_tree_oid
+        .as_deref()
+        .ok_or_else(|| AppError::invalid_input("Managed Copy has no trusted Git Tree baseline"))?;
+    let base_commit = row.base_commit_oid.as_deref().ok_or_else(|| {
+        AppError::invalid_input("Managed Copy has no trusted Git Commit baseline")
+    })?;
+    let root = central_repo::skills_dir();
+    git_skill_versions::verify_deployment_pin(&root, &row.id, base_commit).map_err(AppError::io)?;
+    if !git_skill_versions::matches_skill_tree(&root, base_tree, &target_path)
+        .map_err(AppError::io)?
+    {
+        return Err(AppError::invalid_input(
+            "Project Skill contains local edits; Copy update refused to avoid losing user data",
+        ));
+    }
+    let target = git_skill_versions::resolve_skill_version(&root, &row.skill_id, commit_oid)
+        .map_err(AppError::io)?;
+    let dirty = git_skill_versions::has_uncommitted_central_changes(&root).map_err(AppError::io)?;
+    Ok(ManagedCopyUpdatePlan {
+        project_id: project_id.to_owned(),
+        deployment_id: row.id,
+        skill_id: row.skill_id,
+        agent: agent.to_owned(),
+        target_path: target_path.to_string_lossy().to_string(),
+        base_commit_oid: base_commit.to_owned(),
+        base_tree_oid: base_tree.to_owned(),
+        will_change_content: target.tree_oid != base_tree,
+        will_change_version: target.commit_oid != base_commit,
+        target_commit_oid: target.commit_oid,
+        target_tree_oid: target.tree_oid,
+        uncommitted_central_changes_excluded: dirty,
+    })
+}
+
 /// Update a manager-owned Copy using the *recorded Git subtree* as the
 /// conflict baseline. Files modified by the project are never overwritten.
 pub fn update_managed_project_copy(
@@ -1508,6 +1634,21 @@ pub fn update_managed_project_copy(
     target_path: &Path,
     commit_oid: Option<&str>,
 ) -> Result<(), AppError> {
+    update_managed_project_copy_checked(store, project_id, target_path, commit_oid, None)
+}
+
+/// Protects CLI preview→apply handoff against another managed operation
+/// changing the DeploymentId or Base Tree between the two calls.
+/// Both this check and any filesystem publication occur under RepoLock.
+pub fn update_managed_project_copy_checked(
+    store: &SkillStore,
+    project_id: &str,
+    target_path: &Path,
+    commit_oid: Option<&str>,
+    expected_baseline: Option<(&str, &str, &str)>,
+) -> Result<(), AppError> {
+    let root = central_repo::skills_dir();
+    let _lock = RepoLock::acquire_foreground("project Copy update").map_err(AppError::io)?;
     let target_string = target_path.to_string_lossy();
     let deployment = store
         .get_project_skill_deployment(project_id, &target_string)
@@ -1524,8 +1665,15 @@ pub fn update_managed_project_copy(
         .base_tree_oid
         .as_deref()
         .ok_or_else(|| AppError::invalid_input("Managed Copy has no trusted Git Tree baseline"))?;
-    let root = central_repo::skills_dir();
-    let _lock = RepoLock::acquire_foreground("project Copy update").map_err(AppError::io)?;
+    if expected_baseline.is_some_and(|(id, tree, commit)| {
+        deployment.id != id
+            || base_tree != tree
+            || deployment.base_commit_oid.as_deref() != Some(commit)
+    }) {
+        return Err(AppError::invalid_input(
+            "Managed Copy baseline changed since preview; re-run projects update",
+        ));
+    }
     if !git_skill_versions::matches_skill_tree(&root, base_tree, target_path)
         .map_err(AppError::io)?
     {
@@ -2436,6 +2584,12 @@ pub struct ProjectDeployTarget {
     project_id: String,
     #[serde(skip)]
     version: Option<git_skill_versions::GitSkillVersion>,
+}
+
+impl ProjectDeployTarget {
+    pub fn uses_git_copy(&self) -> bool {
+        self.version.is_some()
+    }
 }
 
 /// Decide, without writing, what deploying `skill_ids` to `agents` in a
@@ -3550,7 +3704,8 @@ mod tests {
             },
         ];
 
-        let dto = project_to_dto(&record, &[], &configs);
+        let store = SkillStore::new(&tmp.path().join("status.db")).unwrap();
+        let dto = project_to_dto(&store, &record, &[], &configs).unwrap();
 
         assert_eq!(dto.skill_count, 1);
         assert_eq!(dto.sync_health.project_only, 1);
@@ -4917,6 +5072,142 @@ mod project_plan_tests {
             &new_head.commit_oid,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn project_list_health_and_detail_use_same_authoritative_copy_status() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "VERSION ONE");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let center = Path::new(&demo.central_path).join("SKILL.md");
+
+        let check = |expected: &str| {
+            let details = get_project_skills_internal(&fx.store, fx.project_id.clone()).unwrap();
+            let detail = details.iter().find(|s| s.relative_path == "demo").unwrap();
+            assert_eq!(detail.sync_status, expected, "detail sync status");
+            let overview = get_projects_internal(&fx.store)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.id == fx.project_id)
+                .unwrap();
+            assert_eq!(overview.skill_count, 1);
+            let health = overview.sync_health;
+            let count = match expected {
+                "in_sync" => health.in_sync,
+                "center_newer" => health.center_newer,
+                "project_newer" => health.project_newer,
+                "diverged" => health.diverged,
+                other => panic!("unexpected status {other}"),
+            };
+            assert_eq!(count, 1, "overview disagrees with detail: {expected}");
+            assert_eq!(
+                health.in_sync
+                    + health.center_newer
+                    + health.project_newer
+                    + health.diverged
+                    + health.project_only,
+                1,
+            );
+        };
+        check("in_sync");
+
+        // Changing only central working-tree bytes does not change the
+        // committed HEAD baseline. Neither view may say "center newer".
+        fs::write(&center, "UNCOMMITTED CENTRAL MODIFICATION").unwrap();
+        check("in_sync");
+        commit_library(&fx);
+        check("center_newer");
+
+        fs::write(target.join("SKILL.md"), "LOCAL PROJECT CHANGE").unwrap();
+        check("diverged");
+
+        // HEAD returns to the *same committed Skill Tree* (new CommitId).
+        // A locally modified project is newer than its trusted Base, but
+        // the central Git tree now matches Base again.
+        write_skill(Path::new(&demo.central_path), "demo", "VERSION ONE");
+        commit_library(&fx);
+        check("project_newer");
+    }
+
+    #[test]
+    fn stale_cli_update_preview_cannot_mutate_an_advanced_base_commit() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "FIRST");
+        commit_library(&fx);
+        let targets = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &targets).unwrap();
+        let preview = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap();
+        assert!(!preview.will_change_content);
+        let target = Path::new(&preview.target_path);
+        let before_bytes = fs::read(target.join("SKILL.md")).unwrap();
+
+        // Another authorized operation advances just the CommitId, without
+        // changing the Skill subtree (unrelated repository commit).
+        fs::write(
+            central_repo::skills_dir().join("unrelated.txt"),
+            "unrelated",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, target, None).unwrap();
+        let advanced = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &preview.target_path)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            advanced.base_commit_oid.as_deref(),
+            Some(preview.base_commit_oid.as_str())
+        );
+        assert_eq!(
+            advanced.base_tree_oid.as_deref(),
+            Some(preview.base_tree_oid.as_str())
+        );
+
+        let error = update_managed_project_copy_checked(
+            &fx.store,
+            &fx.project_id,
+            target,
+            Some(&preview.target_commit_oid),
+            Some((
+                &preview.deployment_id,
+                &preview.base_tree_oid,
+                &preview.base_commit_oid,
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("baseline changed"));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), before_bytes);
+        let after = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &preview.target_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.base_commit_oid, advanced.base_commit_oid);
     }
 
     #[test]

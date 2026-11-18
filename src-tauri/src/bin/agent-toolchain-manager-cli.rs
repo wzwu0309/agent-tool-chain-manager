@@ -8,7 +8,7 @@ use app_lib::commands::{
 };
 use app_lib::core::{
     app_state, audit_log::AuditDraft, central_repo, error::AppError, git_backup, git_fetcher,
-    installer, merge, repo_lock::RepoLock, scenario_service, skill_metadata,
+    git_skill_versions, installer, merge, repo_lock::RepoLock, scenario_service, skill_metadata,
     skill_store::SkillStore, skillssh_api, sync_engine, sync_metadata, tool_adapters, tool_service,
     well_known,
 };
@@ -410,6 +410,19 @@ enum ProjectsCommand {
         /// Requires Copy mode rather than a mutable Symlink.
         #[arg(long, value_name = "OID")]
         commit: Option<String>,
+    },
+    /// Update one already managed Project Copy from a selected central Git
+    /// Commit (defaults to HEAD); never adopts or overwrites external edits.
+    Update {
+        project: String,
+        /// Skill directory relative to the agent's skills root.
+        relative_path: String,
+        #[arg(long = "agent", value_name = "AGENT", required = true)]
+        agent: String,
+        #[arg(long, value_name = "OID")]
+        commit: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove a library skill's copies from a project. Without --agent, from
     /// every agent directory of the project. Refuses copies that may hold
@@ -3221,6 +3234,32 @@ struct ProjectDeploymentReport {
     /// Undeploy only: requested skills with no copy in the selected directories.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     not_deployed: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncommitted_central_changes_excluded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectCopyUpdateReport {
+    ok: bool,
+    action: &'static str,
+    dry_run: bool,
+    project_id: String,
+    skill_id: String,
+    agent: String,
+    target_path: String,
+    deployment_id: String,
+    base_commit_oid: String,
+    base_tree_oid: String,
+    target_commit_oid: String,
+    target_tree_oid: String,
+    will_change_content: bool,
+    will_change_version: bool,
+    result: &'static str,
+    uncommitted_central_changes_excluded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3274,6 +3313,23 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
                 &agents,
                 dry_run,
                 commit.as_deref(),
+            )?,
+            json,
+        ),
+        ProjectsCommand::Update {
+            project,
+            relative_path,
+            agent,
+            commit,
+            dry_run,
+        } => print_json(
+            &update_project_copy(
+                store,
+                &project,
+                &relative_path,
+                &agent,
+                commit.as_deref(),
+                dry_run,
             )?,
             json,
         ),
@@ -3494,6 +3550,13 @@ fn deploy_to_project(
     if let Some(conflict) = project_cmd::project_deploy_conflicts(&plan) {
         return Err(map_app_err(conflict));
     }
+    let dirty = if plan.iter().any(|target| target.uses_git_copy()) {
+        Some(git_skill_versions::has_uncommitted_central_changes(
+            &central_repo::skills_dir(),
+        )?)
+    } else {
+        None
+    };
     if !dry_run {
         project_cmd::apply_project_deploy(store, &plan).map_err(map_app_err)?;
     }
@@ -3545,6 +3608,80 @@ fn deploy_to_project(
         skills: skills.into_iter().map(|skill| skill.name).collect(),
         targets,
         not_deployed: Vec::new(),
+        uncommitted_central_changes_excluded: dirty,
+        warning: dirty.filter(|dirty| *dirty).map(|_| {
+            "Uncommitted central Skill Store changes are excluded; only selected Git Commit bytes are used"
+        }),
+    })
+}
+
+/// CLI explicit update uses the very same guarded Core mutation as GUI.
+fn update_project_copy(
+    store: &SkillStore,
+    project: &str,
+    relative_path: &str,
+    agent: &str,
+    commit_oid: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<ProjectCopyUpdateReport> {
+    let project = resolve_project(store, project)?;
+    let plan = project_cmd::plan_managed_project_copy_update(
+        store,
+        &project.id,
+        relative_path,
+        agent,
+        commit_oid,
+    )
+    .map_err(map_app_err)?;
+    if !dry_run {
+        project_cmd::update_managed_project_copy_checked(
+            store,
+            &project.id,
+            Path::new(&plan.target_path),
+            Some(&plan.target_commit_oid),
+            Some((&plan.deployment_id, &plan.base_tree_oid, &plan.base_commit_oid)),
+        )
+        .map_err(map_app_err)?;
+        // Do not report success based solely on the read-only preview:
+        // verify the committed version is precisely the one requested.
+        let actual = store
+            .get_project_skill_deployment(&project.id, &plan.target_path)?
+            .ok_or_else(|| anyhow!("Project Copy disappeared after update"))?;
+        if actual.id != plan.deployment_id
+            || actual.base_commit_oid.as_deref() != Some(&plan.target_commit_oid)
+            || actual.base_tree_oid.as_deref() != Some(&plan.target_tree_oid)
+        {
+            bail!("Project Copy version did not commit to the selected Git baseline");
+        }
+    }
+    let result = match (dry_run, plan.will_change_content, plan.will_change_version) {
+        (true, true, _) => "would_update_content",
+        (true, false, true) => "would_advance_commit",
+        (true, false, false) => "already_current",
+        (false, true, _) => "updated_content",
+        (false, false, true) => "advanced_commit",
+        (false, false, false) => "already_current",
+    };
+    Ok(ProjectCopyUpdateReport {
+        ok: true,
+        action: "update",
+        dry_run,
+        project_id: project.id,
+        skill_id: plan.skill_id,
+        agent: plan.agent,
+        target_path: plan.target_path,
+        deployment_id: plan.deployment_id,
+        base_commit_oid: plan.base_commit_oid,
+        base_tree_oid: plan.base_tree_oid,
+        target_commit_oid: plan.target_commit_oid,
+        target_tree_oid: plan.target_tree_oid,
+        will_change_content: plan.will_change_content,
+        will_change_version: plan.will_change_version,
+        result,
+        uncommitted_central_changes_excluded: plan.uncommitted_central_changes_excluded,
+        warning: plan.uncommitted_central_changes_excluded.then_some(
+            "Uncommitted central Skill Store changes are excluded; only selected Git Commit bytes are used",
+        ),
     })
 }
 
@@ -3614,6 +3751,8 @@ fn undeploy_from_project(
         skills: skills.into_iter().map(|skill| skill.name).collect(),
         targets,
         not_deployed,
+        uncommitted_central_changes_excluded: None,
+        warning: None,
     })
 }
 
@@ -3668,7 +3807,9 @@ fn run_git(
             // GUI path and avoiding an unusable metadata-free first HEAD.
             let skills_dir = central_repo::skills_dir();
             git_backup::init_repo_with_skill_metadata(
-                &skills_dir, store, &git_backup::default_device_name(),
+                &skills_dir,
+                store,
+                &git_backup::default_device_name(),
             )?;
             print_json(&git_backup::get_status(&skills_dir)?, json);
         }
@@ -4465,6 +4606,29 @@ mod project_tests {
         }
     }
 
+    fn commit_center_skill(fx: &Fx, body: &str) -> String {
+        let root = fx.tmp.path().join("central");
+        write_skill(&root.join("demo"), "demo", body);
+        let git = git2::Repository::open(&root).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("demo/SKILL.md")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("CLI Fixture", "cli@example.invalid").unwrap();
+        let parent = git.head().unwrap().peel_to_commit().unwrap();
+        git.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "updated central Skill",
+            &tree,
+            &[&parent],
+        )
+        .unwrap()
+        .to_string()
+    }
+
     fn repo_ref(fx: &Fx) -> String {
         fx.repo.to_string_lossy().to_string()
     }
@@ -4549,6 +4713,31 @@ mod project_tests {
             "1234567890abcdef1234567890abcdef12345678",
         ])
         .is_ok());
+        assert!(parse(&[
+            "projects",
+            "update",
+            ".",
+            "demo",
+            "--agent",
+            "test_agent",
+            "--dry-run",
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "projects",
+            "update",
+            ".",
+            "demo",
+            "--agent",
+            "test_agent",
+            "--commit",
+            "1234567890abcdef1234567890abcdef12345678",
+        ])
+        .is_ok());
+        assert!(
+            parse(&["projects", "update", ".", "demo"]).is_err(),
+            "--agent required for explicit Copy update"
+        );
         assert!(
             parse(&["projects", "deploy", ".", "demo"]).is_err(),
             "--agent is required"
@@ -4630,6 +4819,218 @@ mod project_tests {
         assert!(real.created_dirs.is_empty());
         assert_eq!(fs::read_dir(&fresh).unwrap().count(), 0);
         assert_eq!(fx.store.get_all_projects().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cli_projects_update_dry_run_preserves_commits_and_refuses_local_edits() {
+        let fx = fixture();
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let project = repo_ref(&fx);
+        let original = deploy_to_project(
+            &fx.store,
+            &project,
+            &["demo".into()],
+            None,
+            &["test_agent".into()],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(original.targets[0].result, "created");
+        let copy = fx.repo.join(".test/skills/demo");
+        let initial_text = fs::read_to_string(copy.join("SKILL.md")).unwrap();
+        let base = fx
+            .store
+            .get_project_skill_deployment(
+                &fx.store.get_all_projects().unwrap()[0].id,
+                &copy.to_string_lossy(),
+            )
+            .unwrap()
+            .unwrap();
+
+        // Uncommitted center bytes are excluded from both deploy and update.
+        write_skill(&fx.tmp.path().join("central/demo"), "demo", "UNCOMMITTED");
+        let dry =
+            update_project_copy(&fx.store, &project, "demo", "test_agent", None, true).unwrap();
+        assert_eq!(dry.result, "already_current");
+        assert!(dry.uncommitted_central_changes_excluded);
+        assert!(dry.warning.is_some());
+        assert_eq!(
+            fs::read_to_string(copy.join("SKILL.md")).unwrap(),
+            initial_text
+        );
+
+        let new_oid = commit_center_skill(&fx, "COMMITTED V2");
+        let proposed = update_project_copy(
+            &fx.store,
+            &project,
+            "demo",
+            "test_agent",
+            Some(&new_oid),
+            true,
+        )
+        .unwrap();
+        assert_eq!(proposed.result, "would_update_content");
+        assert!(proposed.will_change_content);
+        assert!(!proposed.uncommitted_central_changes_excluded);
+        assert_eq!(
+            fs::read_to_string(copy.join("SKILL.md")).unwrap(),
+            initial_text
+        );
+        let after_preview = fx
+            .store
+            .get_project_skill_deployment(&base.project_id, &copy.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_preview.base_commit_oid, base.base_commit_oid);
+
+        let updated = update_project_copy(
+            &fx.store,
+            &project,
+            "demo",
+            "test_agent",
+            Some(&new_oid),
+            false,
+        )
+        .unwrap();
+        assert_eq!(updated.result, "updated_content");
+        assert!(fs::read_to_string(copy.join("SKILL.md"))
+            .unwrap()
+            .contains("COMMITTED V2"));
+        let current = fx
+            .store
+            .get_project_skill_deployment(&base.project_id, &copy.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, base.id);
+        assert_eq!(current.base_commit_oid.as_deref(), Some(new_oid.as_str()));
+        let already =
+            update_project_copy(&fx.store, &project, "demo", "test_agent", None, false).unwrap();
+        assert_eq!(already.result, "already_current");
+
+        fs::write(copy.join("SKILL.md"), "LOCAL PROJECT CUSTOMIZATION").unwrap();
+        commit_center_skill(&fx, "COMMITTED V3");
+        for dry_run in [true, false] {
+            let err = update_project_copy(&fx.store, &project, "demo", "test_agent", None, dry_run)
+                .unwrap_err();
+            assert!(err.to_string().contains("local edits"), "{err:#}");
+        }
+        assert_eq!(
+            fs::read_to_string(copy.join("SKILL.md")).unwrap(),
+            "LOCAL PROJECT CUSTOMIZATION"
+        );
+        assert_eq!(
+            fx.store
+                .get_project_skill_deployment(&base.project_id, &copy.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .base_commit_oid,
+            current.base_commit_oid
+        );
+    }
+
+    #[test]
+    fn cli_projects_update_rejects_foreign_copy_and_supports_disabled_copy() {
+        let fx = fixture();
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let project = repo_ref(&fx);
+        let target = fx.repo.join(".test/skills/demo");
+        write_skill(&target, "demo", "copied externally");
+        for dry in [true, false] {
+            let err = update_project_copy(&fx.store, &project, "demo", "test_agent", None, dry)
+                .unwrap_err();
+            assert!(err.to_string().contains("not managed"));
+        }
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("copied externally"));
+        fs::remove_dir_all(&target).unwrap();
+        deploy_to_project(
+            &fx.store,
+            &project,
+            &["demo".into()],
+            None,
+            &["test_agent".into()],
+            false,
+            None,
+        )
+        .unwrap();
+        let project_id = fx.store.get_all_projects().unwrap()[0].id.clone();
+        let before = fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let base = fx
+            .store
+            .get_project_skill_deployment(&project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let first_commit = base.base_commit_oid.unwrap();
+        project_cmd::toggle_project_skill_internal(
+            &fx.store,
+            &project_id,
+            "demo",
+            "test_agent",
+            false,
+        )
+        .unwrap();
+        let disabled = fx.repo.join(".test/skills-disabled/demo");
+        assert!(disabled.join("SKILL.md").is_file());
+        let latest = commit_center_skill(&fx, "DISABLED V2");
+        let report = update_project_copy(
+            &fx.store,
+            &project,
+            "demo",
+            "test_agent",
+            Some(&latest),
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.result, "updated_content");
+        assert_eq!(report.target_path, disabled.to_string_lossy());
+        assert!(fs::read_to_string(disabled.join("SKILL.md"))
+            .unwrap()
+            .contains("DISABLED V2"));
+        let restored = update_project_copy(
+            &fx.store,
+            &project,
+            "demo",
+            "test_agent",
+            Some(&first_commit),
+            false,
+        )
+        .unwrap();
+        assert_eq!(restored.result, "updated_content");
+        assert_eq!(
+            fs::read_to_string(disabled.join("SKILL.md")).unwrap(),
+            before
+        );
+
+        // The exact approved target cannot be ambiguous between two paths.
+        write_skill(&target, "demo", "foreign enabled path");
+        let err =
+            update_project_copy(&fx.store, &project, "demo", "test_agent", None, true).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+        assert!(target.join("SKILL.md").exists());
+        assert!(disabled.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn cli_copy_deploy_reports_uncommitted_central_bytes_as_excluded() {
+        let fx = fixture();
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        write_skill(&fx.tmp.path().join("central/demo"), "demo", "UNCOMMITTED");
+        let report = deploy_to_project(
+            &fx.store,
+            &repo_ref(&fx),
+            &["demo".into()],
+            None,
+            &["test_agent".into()],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.uncommitted_central_changes_excluded, Some(true));
+        assert!(report.warning.is_some());
+        let project_bytes = fs::read_to_string(fx.repo.join(".test/skills/demo/SKILL.md")).unwrap();
+        assert!(!project_bytes.contains("UNCOMMITTED"));
     }
 
     #[test]

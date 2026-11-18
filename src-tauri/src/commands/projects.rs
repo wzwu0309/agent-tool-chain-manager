@@ -3226,6 +3226,21 @@ pub fn apply_project_deploy(
     store: &SkillStore,
     plan: &[ProjectDeployTarget],
 ) -> Result<(), AppError> {
+    apply_project_deploy_inner(
+        store,
+        plan,
+        #[cfg(test)]
+        &mut |_| {},
+    )
+}
+
+/// Test builds can pause exactly after publishing the Copy but before the
+/// SQLite ownership transaction; normal callers never supply a callback.
+fn apply_project_deploy_inner(
+    store: &SkillStore,
+    plan: &[ProjectDeployTarget],
+    #[cfg(test)] before_copy_commit: &mut dyn FnMut(&Path),
+) -> Result<(), AppError> {
     let _lock = RepoLock::acquire_foreground("project Skill deploy").map_err(AppError::io)?;
     let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
     // Two agents can resolve to the same project skills root; write it once.
@@ -3365,7 +3380,9 @@ pub fn apply_project_deploy(
                     "Published Copy directory identity changed; no management granted",
                 ));
             }
-            record.copy_identity = Some(staged_identity);
+            record.copy_identity = Some(staged_identity.clone());
+            #[cfg(test)]
+            before_copy_commit(&target_dir);
             match store.commit_project_skill_deploy(&operation_id, &record) {
                 Ok(()) => {
                     // Safe cleanup: the staged directory was moved, and this
@@ -3373,36 +3390,15 @@ pub fn apply_project_deploy(
                     let _ = std::fs::remove_dir(&operation_root);
                 }
                 Err(err) => {
-                    // Never erase potentially edited bytes just to make an
-                    // aborted deployment look atomic. Save them at a stable
-                    // recovery path when the target is still the exact Tree.
-                    let saved = operation_root.join("recovered");
-                    let safe_to_move = git_skill_versions::matches_skill_tree(
-                        &central_repo::skills_dir(),
+                    return Err(recover_failed_first_project_copy_deploy(
+                        store,
+                        &operation_id,
                         &version.tree_oid,
                         &target_dir,
-                    )
-                    .unwrap_or(false);
-                    if safe_to_move && rename_directory_no_replace(&target_dir, &saved).is_ok() {
-                        let _ = store.transition_project_skill_operation(
-                            &operation_id,
-                            "publishing",
-                            "recovery_available",
-                        );
-                        return Err(AppError::invalid_input(format!(
-                            "Copy deployment database commit failed ({err});                              unpublished content preserved at {}",
-                            saved.display(),
-                        )));
-                    }
-                    let _ = store.transition_project_skill_operation(
-                        &operation_id,
-                        "publishing",
-                        "needs_attention",
-                    );
-                    return Err(AppError::invalid_input(format!(
-                        "Copy deployment database commit failed ({err});                          target was not claimed or deleted, inspect {} and {}",
-                        target_dir.display(), operation_root.display(),
-                    )));
+                        &operation_root,
+                        &staged_identity,
+                        &err.to_string(),
+                    ));
                 }
             }
         } else {
@@ -3451,6 +3447,62 @@ pub fn apply_project_deploy(
         }
     }
     Ok(())
+}
+
+/// A failed *first* Copy deployment never grants ownership. Recover only
+/// the exact directory published by this operation, not an external directory
+/// that happens to match the same Git Tree after a path replacement.
+///
+/// The second identity check after no-replace rename guards a replacement
+/// between the first check and the move. If that happens, best-effort restore
+/// the unrelated occupant without overwriting another writer's path. Any
+/// ambiguity stays in needs_attention with its recovery location exposed.
+fn recover_failed_first_project_copy_deploy(
+    store: &SkillStore,
+    operation_id: &str,
+    expected_tree_oid: &str,
+    target_dir: &Path,
+    operation_root: &Path,
+    expected_published_identity: &str,
+    commit_error: &str,
+) -> AppError {
+    let saved = operation_root.join("recovered");
+    let still_published_object =
+        project_copy_directory_identity(target_dir).as_deref() == Some(expected_published_identity);
+    let still_committed_bytes = still_published_object
+        && git_skill_versions::matches_skill_tree(
+            &central_repo::skills_dir(),
+            expected_tree_oid,
+            target_dir,
+        )
+        .unwrap_or(false);
+
+    if still_committed_bytes && rename_directory_no_replace(target_dir, &saved).is_ok() {
+        if project_copy_directory_identity(&saved).as_deref() == Some(expected_published_identity) {
+            let _ = store.transition_project_skill_operation(
+                operation_id,
+                "publishing",
+                "recovery_available",
+            );
+            return AppError::invalid_input(format!(
+                "Copy deployment database commit failed ({commit_error}); unpublished content preserved at {}",
+                saved.display(),
+            ));
+        }
+        // An external object was swapped in between check and rename. Do
+        // not claim or discard it. Restore no-replace if the original path is
+        // empty; otherwise leave it discoverable under the recovered slot.
+        if std::fs::symlink_metadata(target_dir).is_err() {
+            let _ = rename_directory_no_replace(&saved, target_dir);
+        }
+    }
+
+    let _ = store.transition_project_skill_operation(operation_id, "publishing", "needs_attention");
+    AppError::invalid_input(format!(
+        "Copy deployment database commit failed ({commit_error}); target identity or contents changed, or isolation failed; no ownership granted. Inspect {} and {}",
+        target_dir.display(),
+        operation_root.display(),
+    ))
 }
 
 /// Bind a planned destructive action to the filesystem object that was
@@ -5035,6 +5087,121 @@ mod project_plan_tests {
         assert!(
             !own_target.parent().unwrap().join(".atm-recovery").exists(),
             "viewing recoveries must never create or clean directories"
+        );
+    }
+
+    /// Fault injection: publication was ours, but the pathname now contains
+    /// an outsider's byte-identical directory before the SQLite commit fails.
+    /// Same Git Tree cannot authorize moving that outsider into 'recovered'.
+    #[test]
+    fn first_copy_deploy_db_failure_preserves_equal_content_replaced_directory() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "v1");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        let version =
+            git_skill_versions::resolve_skill_version(&central_repo::skills_dir(), &demo.id, None)
+                .unwrap();
+
+        let conn = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_first_deploy_swap BEFORE INSERT ON project_skill_deployments
+             BEGIN SELECT RAISE(ABORT, 'injected commit failure after external swap'); END;",
+        )
+        .unwrap();
+
+        let target = fx.repo.join(".claude/skills/demo");
+        let parked = fx.repo.join("actual-manager-published-copy");
+        let mut old_identity = String::new();
+        let mut replacement_identity = String::new();
+        let mut injected = false;
+        let err = apply_project_deploy_inner(&fx.store, &plan, &mut |published| {
+            assert_eq!(published, target.as_path());
+            injected = true;
+            old_identity = project_copy_directory_identity(published).unwrap();
+            assert!(git_skill_versions::matches_skill_tree(
+                &central_repo::skills_dir(),
+                &version.tree_oid,
+                published,
+            )
+            .unwrap());
+            rename_directory_no_replace(published, &parked).unwrap();
+            fs::create_dir(published).unwrap();
+            fs::copy(parked.join("SKILL.md"), published.join("SKILL.md")).unwrap();
+            replacement_identity = project_copy_directory_identity(published).unwrap();
+            assert_ne!(old_identity, replacement_identity);
+            assert!(
+                git_skill_versions::matches_skill_tree(
+                    &central_repo::skills_dir(),
+                    &version.tree_oid,
+                    published,
+                )
+                .unwrap(),
+                "precondition: the outside copy has the exact same committed Git Tree"
+            );
+        })
+        .unwrap_err();
+        assert!(injected, "post-publish/pre-commit hook must run");
+        assert!(err.to_string().contains("database commit failed"), "{err}");
+        assert!(
+            err.to_string().contains("identity or contents changed"),
+            "{err}"
+        );
+        assert_eq!(
+            project_copy_directory_identity(&target).as_deref(),
+            Some(replacement_identity.as_str()),
+            "unrelated equal-content directory must remain at its own path"
+        );
+        assert_eq!(
+            project_copy_directory_identity(&parked).as_deref(),
+            Some(old_identity.as_str()),
+            "original manager-published directory must remain untouched"
+        );
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            fs::read(parked.join("SKILL.md")).unwrap(),
+            "different object identities have equal bytes"
+        );
+        assert!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+                .unwrap()
+                .is_none(),
+            "failed SQLite commit must never grant management"
+        );
+        let pending = fx.store.pending_project_skill_operations().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "deploy");
+        assert_eq!(pending[0].phase, "needs_attention");
+        let operation_root = Path::new(&pending[0].recovery_root);
+        assert!(
+            !operation_root.join("recovered").exists(),
+            "foreign replacement may not be moved into manager recovery"
+        );
+        // Restart recovery must also respect the unresolved foreign occupant.
+        let reopened = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(notices
+            .iter()
+            .any(|notice| notice.contains("requires follow-up")));
+        assert_eq!(
+            project_copy_directory_identity(&target).as_deref(),
+            Some(replacement_identity.as_str())
+        );
+        assert_eq!(
+            project_copy_directory_identity(&parked).as_deref(),
+            Some(old_identity.as_str())
+        );
+        assert_eq!(
+            reopened.pending_project_skill_operations().unwrap()[0].phase,
+            "needs_attention"
         );
     }
 

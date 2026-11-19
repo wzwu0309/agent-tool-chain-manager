@@ -14,6 +14,7 @@ use app_lib::core::{
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
 #[command(name = "agent-toolchain-manager-cli")]
@@ -392,6 +393,16 @@ enum ProjectsCommand {
         project: String,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Remove an eligible project from active workspaces without deleting
+    /// any cleanup_pending recovery, deployment record or pinned Git history.
+    /// Requires confirming the exact SHA-256 of a previous dry-run preview.
+    Detach {
+        project: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long = "confirm-preview-sha256", value_name = "DIGEST")]
+        confirm_preview_sha256: Option<String>,
     },
     /// Deploy library skills (or a preset's current skills) into a project.
     /// Refuses the whole batch if any target holds something else.
@@ -3331,7 +3342,19 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
         }
         ProjectsCommand::Remove { project, dry_run } => {
             let record = resolve_project(store, &project)?;
-            if !dry_run {
+            if dry_run {
+                // Match the real remove guard without claiming that a
+                // dry-run is a lock or a future removal authorization.
+                if store
+                    .pending_project_skill_operations()?
+                    .iter()
+                    .any(|op| op.project_id == record.id)
+                {
+                    anyhow::bail!(
+                        "Project has retained recovery operations; ordinary removal is blocked. Inspect 'projects detach --dry-run' for explicit non-destructive detachment"
+                    );
+                }
+            } else {
                 project_cmd::remove_project_internal(store, record.id.clone())
                     .map_err(map_app_err)?;
             }
@@ -3344,6 +3367,35 @@ fn run_projects(args: ProjectsArgs, store: &SkillStore, json: bool) -> anyhow::R
                     path: record.path,
                     removed: !dry_run,
                 },
+                json,
+            );
+        }
+        ProjectsCommand::Detach {
+            project,
+            dry_run,
+            confirm_preview_sha256,
+        } => {
+            let record = resolve_project(store, &project)?;
+            let preview = project_cmd::preview_project_detach_internal(store, &record.id)
+                .map_err(map_app_err)?;
+            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&preview)?));
+            if !dry_run {
+                if confirm_preview_sha256.as_deref() != Some(digest.as_str()) {
+                    anyhow::bail!(
+                        "Project detach requires the exact --confirm-preview-sha256 from a prior --dry-run; no project state or recovery bytes changed"
+                    );
+                }
+                project_cmd::apply_project_detach_internal(store, &preview).map_err(map_app_err)?;
+            }
+            print_json(
+                &serde_json::json!({
+                    "ok": true,
+                    "dry_run": dry_run,
+                    "detached": !dry_run,
+                    "preview_digest_sha256": digest,
+                    "preview": preview,
+                    "note": "Only project visibility changed; recovery objects, deployments and Git pins remain retained",
+                }),
                 json,
             );
         }
@@ -4943,6 +4995,15 @@ mod project_tests {
             "1234567890abcdef1234567890abcdef12345678",
         ])
         .is_ok());
+        assert!(parse(&["projects", "detach", ".", "--dry-run"]).is_ok());
+        assert!(parse(&[
+            "projects",
+            "detach",
+            ".",
+            "--confirm-preview-sha256",
+            "aabbcc",
+        ])
+        .is_ok());
         assert!(parse(&["projects", "recoveries", "."]).is_ok());
         assert!(parse(&["projects", "orphaned-recoveries"]).is_ok());
         assert!(parse(&[
@@ -5182,6 +5243,109 @@ mod project_tests {
                 .base_commit_oid,
             current.base_commit_oid
         );
+    }
+
+    #[test]
+    fn cli_project_detach_requires_matching_preview_digest_and_retains_old_backup() {
+        let fx = fixture();
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let repo = repo_ref(&fx);
+        let id = fx.store.get_all_projects().unwrap()[0].id.clone();
+        deploy_to_project(
+            &fx.store,
+            &repo,
+            &["demo".into()],
+            None,
+            &["test_agent".into()],
+            false,
+            None,
+        )
+        .unwrap();
+        let new_oid = commit_center_skill(&fx, "COMMITTED SECOND");
+        update_project_copy(
+            &fx.store,
+            &repo,
+            "demo",
+            "test_agent",
+            Some(&new_oid),
+            false,
+        )
+        .unwrap();
+        let preview = project_cmd::preview_project_detach_internal(&fx.store, &id).unwrap();
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&preview).unwrap()));
+        let backup = Path::new(&preview.recoveries[0].recovery_root).join("previous/SKILL.md");
+        let old_bytes = fs::read(&backup).unwrap();
+
+        // The old dry-run must not lie about removal when there is retained
+        // recovery. Only the separate explicit detach command can proceed.
+        assert!(run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::Remove {
+                    project: repo.clone(),
+                    dry_run: true,
+                }
+            },
+            &fx.store,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ordinary removal is blocked"));
+
+        run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::Detach {
+                    project: repo.clone(),
+                    dry_run: true,
+                    confirm_preview_sha256: None,
+                },
+            },
+            &fx.store,
+            true,
+        )
+        .unwrap();
+        assert!(fx.store.get_project_by_id(&id).unwrap().is_some());
+        assert!(run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::Detach {
+                    project: repo.clone(),
+                    dry_run: false,
+                    confirm_preview_sha256: Some("wrong digest".to_string()),
+                }
+            },
+            &fx.store,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("confirm-preview-sha256"));
+        assert!(fx.store.get_project_by_id(&id).unwrap().is_some());
+        assert_eq!(fs::read(&backup).unwrap(), old_bytes);
+
+        run_projects(
+            ProjectsArgs {
+                command: ProjectsCommand::Detach {
+                    project: repo.clone(),
+                    dry_run: false,
+                    confirm_preview_sha256: Some(digest),
+                },
+            },
+            &fx.store,
+            true,
+        )
+        .unwrap();
+        assert!(fx.store.get_project_by_id(&id).unwrap().is_none());
+        assert!(fx.store.get_detached_project_by_id(&id).unwrap().is_some());
+        assert!(fx.store.get_all_projects().unwrap().is_empty());
+        assert_eq!(fs::read(&backup).unwrap(), old_bytes);
+        assert!(
+            project_cmd::get_unregistered_project_recoveries_internal(&fx.store)
+                .unwrap()
+                .iter()
+                .any(|r| r.operation_id == preview.recoveries[0].operation_id)
+        );
+        // Detached projects have no active mutation entry points, including CLI.
+        assert!(resolve_project(&fx.store, &repo).is_err());
     }
 
     #[test]

@@ -55,6 +55,7 @@ export function Sidebar() {
   const [renameTarget, setRenameTarget] = useState<{ id: string; name: string; icon?: string | null; description?: string | null } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [deleteProjectTarget, setDeleteProjectTarget] = useState<{ id: string; name: string } | null>(null);
+  const [detachPreview, setDetachPreview] = useState<api.ProjectDetachPreview | null>(null);
   const installedTools = useMemo(() => tools.filter((t) => t.installed && t.enabled), [tools]);
   const installedCodingTools = useMemo(
     () => installedTools.filter((t) => t.category === "coding"),
@@ -230,12 +231,35 @@ export function Sidebar() {
 
   const handleDeleteProject = async () => {
     if (!deleteProjectTarget) return;
-    await api.removeProject(deleteProjectTarget.id);
+    try {
+      await api.removeProject(deleteProjectTarget.id);
+    } catch (error) {
+      // Ordinary removal never silently discards recovery information.
+      // Offer a *second*, explicit consent only when Core confirms that
+      // every remaining recovery is safely retained cleanup_pending data.
+      try {
+        const preview = await api.previewProjectDetach(deleteProjectTarget.id);
+        setDetachPreview(preview);
+        return;
+      } catch {
+        throw error;
+      }
+    }
     await refreshProjects();
     if (location.pathname.startsWith("/project/")) {
       navigate("/");
     }
     toast.success(t("project.removed"));
+  };
+
+  const handleDetachProject = async () => {
+    if (!detachPreview) return;
+    await api.applyProjectDetach(detachPreview);
+    await refreshProjects();
+    if (location.pathname.startsWith("/project/")) {
+      navigate("/");
+    }
+    toast.success(t("project.detach.success"));
   };
 
   // Renders one workspace category section (Global Workspace for coding agents,
@@ -775,6 +799,32 @@ export function Sidebar() {
         message={t("project.removeConfirm", { name: deleteProjectTarget?.name || "" })}
         onClose={() => setDeleteProjectTarget(null)}
         onConfirm={handleDeleteProject}
+      />
+      <ConfirmDialog
+        open={detachPreview !== null}
+        title={t("project.detach.title")}
+        tone="warning"
+        confirmLabel={t("project.detach.confirm")}
+        lockWhileRunning
+        message={t("project.detach.explanation", {
+          name: detachPreview?.projectName || "",
+          count: detachPreview?.recoveries.length || 0,
+        })}
+        details={detachPreview
+          ? [
+            t("project.detach.projectPath") + ": " + detachPreview.projectPath,
+            t("project.detach.identity") + ": " + detachPreview.projectRootIdentity,
+            ...detachPreview.recoveries.map((record, index) =>
+              record.kind + " · " + record.phase + " · " + record.operationId
+              + " · SkillId " + record.skillId
+              + " · DeploymentId " + (record.deploymentId ?? "—")
+              + " · " + record.recoveryRoot
+              + " · " + (detachPreview.recoveryObjectIdentities[index]?.recoveryRootIdentity ?? ""),
+            ),
+          ]
+          : []}
+        onClose={() => setDetachPreview(null)}
+        onConfirm={handleDetachProject}
       />
     </>
   );

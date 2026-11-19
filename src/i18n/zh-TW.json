@@ -923,6 +923,14 @@
     }
   },
   "project": {
+    "detach": {
+      "title": "註銷專案並保留復原資料",
+      "explanation": "將「{name}」從日常專案列表移除，但完整保留 {count} 筆復原紀錄、既有受管部署資料、Git pins 和專案檔案。不會刪除備份；這不是永久清理。",
+      "projectPath": "原專案路徑",
+      "identity": "目前專案目錄身分",
+      "confirm": "確認註銷並保留復原資料",
+      "success": "專案已註銷，復原資料和 Git pins 均已保留。"
+    },
     "legacyCopyReauth": {
       "resolvedPath": "實際解析路徑",
       "title": "重新授權舊版受管 Copy",

@@ -844,6 +844,43 @@ export interface ProjectSkillRecovery {
 export const getProjectSkillRecoveries = (projectId: string) =>
   invoke<ProjectSkillRecovery[]>("get_project_skill_recoveries", { projectId });
 
+/** Exact retained recovery object identity for an explicit project detach. */
+export interface ProjectDetachRecoveryRef {
+  operationId: string;
+  kind: string;
+  phase: string;
+  skillId: string;
+  deploymentId: string | null;
+  baseTreeOid: string | null;
+  newTreeOid: string | null;
+  targetPath: string;
+  recoveryRoot: string;
+  updatedAt: number;
+}
+
+export interface ProjectDetachObjectIdentity {
+  operationId: string;
+  recoveryParentIdentity: string;
+  recoveryRootIdentity: string;
+}
+
+/** Non-destructive one-shot project detachment; backups and pins remain. */
+export interface ProjectDetachPreview {
+  projectId: string;
+  projectPath: string;
+  projectName: string;
+  projectRootIdentity: string;
+  recoveries: ProjectDetachRecoveryRef[];
+  recoveryObjectIdentities: ProjectDetachObjectIdentity[];
+}
+
+export const previewProjectDetach = (projectId: string) =>
+  invoke<ProjectDetachPreview>("preview_project_detach", { projectId });
+
+/** Core compares this preview with a fresh snapshot under RepoLock and SQLite CAS. */
+export const applyProjectDetach = (preview: ProjectDetachPreview) =>
+  invoke<void>("apply_project_detach", { preview });
+
 /** Read-only index for journal records orphaned by legacy project removal. */
 export const getUnregisteredProjectSkillRecoveries = () =>
   invoke<ProjectSkillRecovery[]>("get_unregistered_project_skill_recoveries");

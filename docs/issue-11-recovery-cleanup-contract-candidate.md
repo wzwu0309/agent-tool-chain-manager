@@ -186,11 +186,16 @@ accessible. It must hold the same RepoLock as managed operations and check
 the SQLite journal in the same transaction as removal. This applies to
 `cleanup_pending` as well as `needs_attention`/`recovery_available`.
 
-The stopgap intentionally cannot solve permanent project detachment while
-recoveries remain. A later release must provide an independent
-registered/detached recovery index and path-authorized read-only access,
-rather than requiring users to keep a project registered forever. Do not
-offer a "remove project and forget recoveries" bypass meanwhile.
+The ordinary project DELETE path retains this guard. An additional,
+**separately confirmed non-destructive detach** may hide a project only if
+all outstanding operations are completed-publish `cleanup_pending` backups.
+It retains the same ProjectId, deployment foreign-key rows, Git pins and
+recovery journals instead of deleting the projects row. Detached projects
+are no longer eligible for ordinary Skill operations, and their retained
+recoveries appear in an independent read-only index. Other operation
+phases (including `needs_attention` and `recovery_available`) continue
+to block detachment, and no "remove project and forget recoveries" bypass
+is provided. Re-activation is not implicit and needs a separate review.
 
 ### Copy ownership
 
@@ -243,15 +248,15 @@ recovery *archival* authorization policy above.
 
 - **Pre-v13 Copy identity reauthorization:** a separate, explicit read-only
   preview and one-shot confirmation are available for a previously
-  manager-deployed Copy whose \`copy_identity\` is \`NULL\`. Confirmation binds
+  manager-deployed Copy whose `copy_identity` is `NULL`. Confirmation binds
   only the exact observed directory identity to the existing DeploymentId
   and pinned Git Commit/Tree/path baseline after Core revalidation under
   RepoLock. SQLite consumes the consent through a guarded
-  \`copy_identity IS NULL\` compare-and-swap. It writes no Skill files,
+  `copy_identity IS NULL` compare-and-swap. It writes no Skill files,
   never accepts an unowned external Copy, rejects changed contents and
   same-content replacements after preview, and does not permit rebinding
   an already known (non-NULL) identity. CLI requires a preview followed by
-  the exact \`--confirm-identity\`; GUI requires a separate checked consent.
+  the exact `--confirm-identity`; GUI requires a separate checked consent.
   This remains a snapshot-based guard, **not** macOS handle-bound immunity
   from malicious external inode reuse or path swaps.
 - **Historically unregistered project recovery:** a separate read-only
@@ -269,3 +274,42 @@ recovery *archival* authorization policy above.
   independent macOS handle-relative file APIs, source-copy consistency
   under active writers, and power-loss durability barriers remain
   separate implementation admission gates.
+
+## 9. SQLite v14 · explicit project detach (implementation candidate)
+
+The first project lifecycle correction uses an **additive**
+`projects.lifecycle_state = active | detached` column. The default is
+`active` for all existing workspaces. Explicitly detached rows retain
+all original ProjectId/deployment foreign keys, including historical
+CommitId/TreeOid and Git pins; no cascade deletion is performed.
+
+- Only a project with one or more `cleanup_pending` operations of kind
+  `update` or `delete` is eligible. Any ambiguous, preparing, publishing,
+  needs_attention or recovery_available operation blocks this action.
+- The read-only preview binds the registered project path and filesystem
+  identity, each original operation's ID, kind, phase, SkillId, DeploymentId,
+  original/new Git Tree baseline, paths and journal timestamp, and the parent/root directory identities of each retained
+  recovery object. All paths are checked against the registered project.
+- GUI requires a **second explicit confirmation**, not a fallback from a
+  failed ordinary DELETE. The CLI has independent dry-run and
+  `--confirm-preview-sha256` modes. Core regenerates and compares the
+  preview under RepoLock and commits only if the active project, exact
+  outstanding operation snapshot and eligible phases match in one SQLite
+  transaction.
+- After commit, normal workspace enumeration and mutation APIs exclude the
+  detached ProjectId. The former recovery objects stay in place. The
+  existing read-only historical recovery index now also includes detached
+  projects. Startup recovery does not mutate a detached project path.
+- Re-registering the same path under a *new* ProjectId is refused to
+  prevent loss or duplication of the retained management authority.
+  **Explicit reactivation is not yet implemented**; it needs its own
+  verified path and deployment ownership contract.
+- No original recovery backup, user file, Git ref or deployment row is
+  removed, and this does **not** implement the V2 archive/disposal state
+  machine. Temporary old file handles and active external writers are not
+  addressed by project detachment.
+
+This is a narrow lifecycle operation, **not** proof of full malicious
+path-swap safety. The macOS parent-directory descriptor bound operations,
+power-loss persistence barriers and original recovery archive transaction
+remain separately reviewable requirements.

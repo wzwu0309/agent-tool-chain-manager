@@ -914,6 +914,14 @@
     }
   },
   "project": {
+    "detach": {
+      "title": "Desvincular proyecto y conservar la recuperación",
+      "explanation": "Quita {name} de la lista activa conservando las {count} operaciones de recuperación, los despliegues administrados, los Git pins y todos los archivos. No se borran las copias de seguridad.",
+      "projectPath": "Ruta registrada del proyecto",
+      "identity": "Identidad del directorio verificada",
+      "confirm": "Desvincular sin eliminar recuperaciones",
+      "success": "Proyecto desvinculado; datos de recuperación y Git pins conservados."
+    },
     "legacyCopyReauth": {
       "resolvedPath": "Ruta resuelta del sistema de archivos",
       "title": "Reautorizar una copia administrada anterior",

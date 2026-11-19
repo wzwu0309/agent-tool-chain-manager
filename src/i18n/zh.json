@@ -934,6 +934,14 @@
     }
   },
   "project": {
+    "detach": {
+      "title": "注销项目并保留恢复数据",
+      "explanation": "将「{name}」从日常项目列表中移除，但完整保留 {count} 条恢复记录、原受管部署信息、Git pins 和项目文件。不会删除任何备份；这不是永久清理操作。",
+      "projectPath": "原项目路径",
+      "identity": "当前项目目录身份",
+      "confirm": "确认注销并保留恢复数据",
+      "success": "项目已从列表注销；恢复数据和 Git pins 均已保留。"
+    },
     "legacyCopyReauth": {
       "resolvedPath": "实际解析路径",
       "title": "重新授权旧版受管 Copy",

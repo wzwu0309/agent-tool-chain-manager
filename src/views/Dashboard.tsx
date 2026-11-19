@@ -34,9 +34,11 @@ export function Dashboard() {
   }, []);
 
   useEffect(() => {
+    // A project detached from the Sidebar disappears from the active list,
+    // so refresh this independent read-only recovery index immediately.
     void loadOrphans();
     return () => { orphanRequestRef.current++; };
-  }, [loadOrphans]);
+  }, [loadOrphans, projects.length]);
 
   const enabledAgents = useMemo(
     () => tools.filter((tool) => tool.installed && tool.enabled),

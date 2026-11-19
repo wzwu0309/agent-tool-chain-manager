@@ -120,6 +120,23 @@ pub struct ProjectRecord {
     pub updated_at: i64,
 }
 
+/// Exact immutable journal snapshot for a requested project detach. All
+/// fields are compared in the same SQLite transaction as project hiding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDetachRecoveryRef {
+    pub operation_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub skill_id: String,
+    pub deployment_id: Option<String>,
+    pub base_tree_oid: Option<String>,
+    pub new_tree_oid: Option<String>,
+    pub target_path: String,
+    pub recovery_root: String,
+    pub updated_at: i64,
+}
+
 /// Stable ownership and Git content baseline for one project Skill directory.
 /// Unlike discovery, a row here asserts an explicit management relationship.
 #[derive(Debug, Clone, Serialize)]
@@ -1610,7 +1627,8 @@ impl SkillStore {
                     o.created_at, o.updated_at, o.destination_path, o.observed_identity
              FROM project_skill_operations o
              LEFT JOIN projects p ON p.id = o.project_id
-             WHERE o.phase != 'complete' AND p.id IS NULL
+             WHERE o.phase != 'complete'
+               AND (p.id IS NULL OR p.lifecycle_state = 'detached')
              ORDER BY o.updated_at DESC, o.id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1903,6 +1921,7 @@ impl SkillStore {
             "SELECT id, name, path, workspace_type, linked_agent_key, linked_agent_name, disabled_path,
                     sort_order, created_at, updated_at
              FROM projects
+             WHERE lifecycle_state='active'
              ORDER BY sort_order, created_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1928,7 +1947,7 @@ impl SkillStore {
             "SELECT id, name, path, workspace_type, linked_agent_key, linked_agent_name, disabled_path,
                     sort_order, created_at, updated_at
              FROM projects
-             WHERE id = ?1",
+             WHERE id = ?1 AND lifecycle_state='active'",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(ProjectRecord {
@@ -1945,6 +1964,112 @@ impl SkillStore {
             })
         })?;
         Ok(rows.next().and_then(|r| r.ok()))
+    }
+
+    /// Detached projects remain in SQLite, retaining their exact ProjectId,
+    /// deployment rows, Git pin references and original recovery journal.
+    /// They do not appear in ordinary active-project queries.
+    pub fn get_detached_project_by_id(&self, id: &str) -> Result<Option<ProjectRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, path, workspace_type, linked_agent_key, linked_agent_name,
+                    disabled_path, sort_order, created_at, updated_at
+             FROM projects WHERE id=?1 AND lifecycle_state='detached'",
+            params![id],
+            |r| {
+                Ok(ProjectRecord {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    path: r.get(2)?,
+                    workspace_type: r.get(3)?,
+                    linked_agent_key: r.get(4)?,
+                    linked_agent_name: r.get(5)?,
+                    disabled_path: r.get(6)?,
+                    sort_order: r.get(7)?,
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn get_detached_project_by_path(&self, path: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM projects WHERE path=?1 AND lifecycle_state='detached'",
+            params![path],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Move a project out of the ordinary active workspace list while keeping
+    /// the same registered row, deployment rows, Git pins and recovery log.
+    /// Only completed-publish cleanup_pending backup operations are eligible;
+    /// uncertain and in-flight operation phases cannot be detached.
+    ///
+    /// Caller must hold RepoLock. Operation identity/phase/path/version and
+    /// project identity are checked inside the same SQLite transaction as the
+    /// state change to prevent stale previews from detaching a new operation.
+    pub fn detach_project_with_recoveries(
+        &self,
+        project_id: &str,
+        expected_project_path: &str,
+        expected: &[ProjectDetachRecoveryRef],
+    ) -> Result<()> {
+        if expected.is_empty() {
+            anyhow::bail!(
+                "Project has no retained cleanup_pending recoveries; use ordinary unregister"
+            );
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT id, kind, phase, target_path, recovery_root, updated_at,
+                    skill_id, deployment_id, base_tree_oid, new_tree_oid
+             FROM project_skill_operations
+             WHERE project_id=?1 AND phase!='complete'
+             ORDER BY id",
+        )?;
+        let actual: Vec<ProjectDetachRecoveryRef> = stmt
+            .query_map(params![project_id], |r| {
+                Ok(ProjectDetachRecoveryRef {
+                    operation_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    phase: r.get(2)?,
+                    target_path: r.get(3)?,
+                    recovery_root: r.get(4)?,
+                    updated_at: r.get(5)?,
+                    skill_id: r.get(6)?,
+                    deployment_id: r.get(7)?,
+                    base_tree_oid: r.get(8)?,
+                    new_tree_oid: r.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if actual != expected || actual.iter().any(|op| op.phase != "cleanup_pending") {
+            anyhow::bail!(
+                "Project recovery state or operation identity changed; detach preview is stale"
+            );
+        }
+        let affected = tx.execute(
+            "UPDATE projects SET lifecycle_state='detached', updated_at=?3
+             WHERE id=?1 AND path=?2 AND lifecycle_state='active'",
+            params![
+                project_id,
+                expected_project_path,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        if affected != 1 {
+            anyhow::bail!("Project has been changed or detached already");
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Unregister the project only if no durable, non-complete filesystem
@@ -1965,7 +2090,13 @@ impl SkillStore {
                 "Project has {outstanding} retained recovery operation(s); review and preserve their data before unregistering"
             );
         }
-        tx.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        let removed = tx.execute(
+            "DELETE FROM projects WHERE id = ?1 AND lifecycle_state='active'",
+            params![id],
+        )?;
+        if removed != 1 {
+            anyhow::bail!("Project is not an active registered workspace");
+        }
         tx.commit()?;
         Ok(())
     }

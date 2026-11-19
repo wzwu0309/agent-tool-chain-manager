@@ -1118,6 +1118,8 @@ pub fn run() {
             commands::projects::add_project,
             commands::projects::add_linked_workspace,
             commands::projects::remove_project,
+            commands::projects::preview_project_detach,
+            commands::projects::apply_project_detach,
             commands::projects::reveal_project_folder,
             commands::projects::scan_projects,
             commands::projects::get_project_agent_targets,

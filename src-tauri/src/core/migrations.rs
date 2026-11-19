@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 13;
+const LATEST_VERSION: u32 = 14;
 
 /// Run all pending migrations on the database.
 ///
@@ -60,6 +60,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         10 => migrate_v10_to_v11(conn),
         11 => migrate_v11_to_v12(conn),
         12 => migrate_v12_to_v13(conn),
+        13 => migrate_v13_to_v14(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -466,6 +467,24 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v13 → v14: retain project / deployment / Git-pin authority after an
+/// explicit, non-destructive project detach. Unlike DELETE FROM projects,
+/// this preserves foreign-key-owned deployment rows and recovery journals.
+/// Older projects are always active until explicitly detached.
+fn migrate_v13_to_v14(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "projects",
+        "lifecycle_state",
+        "TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle_state IN ('active','detached'))",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_projects_lifecycle
+           ON projects(lifecycle_state);",
+    )?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn add_column_if_missing(
@@ -534,6 +553,32 @@ mod tests {
         assert!(tables.contains(&"skill_tags".to_string()));
         assert!(tables.contains(&"scenario_skill_tools".to_string()));
         assert!(tables.contains(&"audit_log".to_string()));
+    }
+
+    #[test]
+    fn v14_detached_project_migration_is_additive_and_defaults_active() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE projects(id TEXT PRIMARY KEY, path TEXT);
+             INSERT INTO projects VALUES ('old', '/tmp/old');",
+        )
+        .unwrap();
+        migrate_v13_to_v14(&db).unwrap();
+        migrate_v13_to_v14(&db).unwrap();
+        let value: String = db
+            .query_row(
+                "SELECT lifecycle_state FROM projects WHERE id='old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "active");
+        assert!(db
+            .execute(
+                "UPDATE projects SET lifecycle_state='unknown' WHERE id='old'",
+                [],
+            )
+            .is_err());
     }
 
     #[test]

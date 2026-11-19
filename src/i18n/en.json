@@ -934,6 +934,14 @@
     }
   },
   "project": {
+    "detach": {
+      "title": "Detach project and retain recovery data",
+      "explanation": "Remove {name} from active workspaces while retaining all {count} recorded recovery operations, existing managed deployments, Git pins and project files. No backup will be deleted. This is separate from permanent removal.",
+      "projectPath": "Registered project path",
+      "identity": "Verified project directory identity",
+      "confirm": "Detach without deleting recoveries",
+      "success": "Project detached; recovery data and Git pins retained."
+    },
     "legacyCopyReauth": {
       "resolvedPath": "Resolved filesystem path",
       "title": "Reauthorize an older managed Copy",

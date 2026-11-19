@@ -11,8 +11,8 @@ use crate::core::audit_log::AuditDraft;
 use crate::core::error::TargetConflictDetail;
 use crate::core::repo_lock::RepoLock;
 use crate::core::skill_store::{
-    ProjectRecord, ProjectSkillDeploymentRecord, ProjectSkillOperationRecord, SkillRecord,
-    SkillStore,
+    ProjectDetachRecoveryRef, ProjectRecord, ProjectSkillDeploymentRecord,
+    ProjectSkillOperationRecord, SkillRecord, SkillStore,
 };
 use crate::core::timing::should_log_first_or_slow;
 use crate::core::{
@@ -599,6 +599,20 @@ pub fn recover_incomplete_project_skill_operations(
     for op in operations {
         let target = PathBuf::from(&op.target_path);
         let recovery_root = PathBuf::from(&op.recovery_root);
+        // A detached project retains all historical authority but no longer
+        // permits automatic filesystem recovery. Keep the read-only index
+        // reachable without misreporting the path as a foreign project.
+        if store
+            .get_detached_project_by_id(&op.project_id)
+            .map_err(AppError::db)?
+            .is_some()
+        {
+            notices.push(format!(
+                "Detached project {}: recovery operation {} ({}) retained read-only at {}",
+                op.project_id, op.id, op.phase, op.recovery_root,
+            ));
+            continue;
+        }
         // Only recover paths that still belong to the registered project.
         // A stale/malicious SQLite path must not move arbitrary directories.
         let project_root = store
@@ -1012,6 +1026,14 @@ pub fn prepare_project_record(store: &SkillStore, path: &Path) -> Result<Project
     let canonical = dunce::canonicalize(path)?;
     let stored = stored_project_path(&canonical, &std::path::absolute(path)?);
     let canonical_string = stored.to_string_lossy().to_string();
+    if let Some(id) = store
+        .get_detached_project_by_path(&canonical_string)
+        .map_err(AppError::db)?
+    {
+        return Err(AppError::invalid_input(format!(
+            "Project is detached with retained recovery and deployment records (id: {id}); re-registration requires explicit reactivation, not a new ProjectId",
+        )));
+    }
     let existing = store.get_all_projects().map_err(AppError::db)?;
     if let Some(project) = existing.iter().find(|project| {
         project.path == canonical_string
@@ -1154,6 +1176,178 @@ pub fn remove_project_internal(store: &SkillStore, id: String) -> Result<(), App
     // operation check remains transactional even for callers bypassing Core.
     let _lock = RepoLock::acquire_foreground("project unregister").map_err(AppError::io)?;
     store.delete_project(&id).map_err(AppError::db)
+}
+
+/// Explicit, non-destructive removal from the active workspace list.
+/// Only cleanup_pending retained backups are eligible. The original
+/// ProjectId, deployments, Git pins and recovery locations survive in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDetachObjectIdentity {
+    pub operation_id: String,
+    pub recovery_parent_identity: String,
+    pub recovery_root_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDetachPreview {
+    pub project_id: String,
+    pub project_path: String,
+    pub project_name: String,
+    pub project_root_identity: String,
+    pub recoveries: Vec<ProjectDetachRecoveryRef>,
+    pub recovery_object_identities: Vec<ProjectDetachObjectIdentity>,
+}
+
+pub fn preview_project_detach_internal(
+    store: &SkillStore,
+    project_id: &str,
+) -> Result<ProjectDetachPreview, AppError> {
+    let project = store
+        .get_project_by_id(project_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::not_found("Active project not found"))?;
+    let project_root_identity = project_copy_directory_identity(Path::new(&project.path))
+        .ok_or_else(|| AppError::invalid_input("Project root is not an ordinary directory"))?;
+    let pending = store
+        .pending_project_skill_operations()
+        .map_err(AppError::db)?;
+    let mut refs = Vec::new();
+    let mut observed = Vec::new();
+    for op in pending.into_iter().filter(|o| o.project_id == project_id) {
+        if op.phase != "cleanup_pending" || !matches!(op.kind.as_str(), "update" | "delete") {
+            return Err(AppError::invalid_input(format!(
+                "Project has an unresolved {} operation {} in phase {}; detach is not allowed",
+                op.kind, op.id, op.phase,
+            )));
+        }
+        let target = Path::new(&op.target_path);
+        let parent = target.parent().ok_or_else(|| {
+            AppError::invalid_input("Recovery operation target has no parent directory")
+        })?;
+        let expected = parent.join(".atm-recovery").join(&op.id);
+        if Path::new(&op.recovery_root) != expected {
+            return Err(AppError::invalid_input(
+                "Recovery path differs from operation identity; detach refused",
+            ));
+        }
+        let root = std::fs::canonicalize(&project.path).map_err(AppError::io)?;
+        let parent_canonical = std::fs::canonicalize(parent).map_err(AppError::io)?;
+        if !parent_canonical.starts_with(&root)
+            || !std::fs::symlink_metadata(&op.recovery_root)
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            || !std::fs::symlink_metadata(expected.parent().unwrap())
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        {
+            return Err(AppError::invalid_input(
+                "Recovery root/parent is missing, substituted or outside the project",
+            ));
+        }
+        let parent_identity = project_copy_directory_identity(expected.parent().unwrap())
+            .ok_or_else(|| AppError::invalid_input("Recovery parent identity unavailable"))?;
+        let root_identity = project_copy_directory_identity(&expected)
+            .ok_or_else(|| AppError::invalid_input("Recovery directory identity unavailable"))?;
+        observed.push(ProjectDetachObjectIdentity {
+            operation_id: op.id.clone(),
+            recovery_parent_identity: parent_identity,
+            recovery_root_identity: root_identity,
+        });
+        refs.push(ProjectDetachRecoveryRef {
+            operation_id: op.id,
+            kind: op.kind,
+            phase: op.phase,
+            skill_id: op.skill_id,
+            deployment_id: op.deployment_id,
+            base_tree_oid: op.base_tree_oid,
+            new_tree_oid: op.new_tree_oid,
+            target_path: op.target_path,
+            recovery_root: op.recovery_root,
+            updated_at: op.updated_at,
+        });
+    }
+    refs.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    observed.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    if refs.is_empty() {
+        return Err(AppError::invalid_input(
+            "Project has no retained cleanup_pending backups; use ordinary remove",
+        ));
+    }
+    Ok(ProjectDetachPreview {
+        project_id: project.id,
+        project_path: project.path,
+        project_name: project.name,
+        project_root_identity,
+        recoveries: refs,
+        recovery_object_identities: observed,
+    })
+}
+
+/// A client-provided preview never grants authority. Under RepoLock, re-read
+/// both the actual filesystem locations and the current operation journal,
+/// then atomically move only the unchanged active project to detached.
+pub fn apply_project_detach_internal(
+    store: &SkillStore,
+    preview: &ProjectDetachPreview,
+) -> Result<(), AppError> {
+    let _lock = RepoLock::acquire_foreground("project detach retaining recoveries")
+        .map_err(AppError::io)?;
+    let actual = preview_project_detach_internal(store, &preview.project_id)?;
+    if actual.project_name != preview.project_name
+        || actual.project_path != preview.project_path
+        || actual.project_root_identity != preview.project_root_identity
+        || actual.recoveries != preview.recoveries
+        || actual.recovery_object_identities != preview.recovery_object_identities
+    {
+        return Err(AppError::invalid_input(
+            "Project detach preview is stale or has been changed; inspect the recoveries again",
+        ));
+    }
+    store
+        .detach_project_with_recoveries(
+            &actual.project_id,
+            &actual.project_path,
+            &actual.recoveries,
+        )
+        .map_err(AppError::db)?;
+    store.log_audit(
+        AuditDraft::new("detach_project")
+            .detail(format!(
+                "project {}, path {}, retained operations: {}",
+                actual.project_id,
+                actual.project_path,
+                actual
+                    .recoveries
+                    .iter()
+                    .map(|r| r.operation_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ))
+            .ok(),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn preview_project_detach(
+    store: State<'_, Arc<SkillStore>>,
+    project_id: String,
+) -> Result<ProjectDetachPreview, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_project_detach_internal(&store, &project_id)
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn apply_project_detach(
+    store: State<'_, Arc<SkillStore>>,
+    preview: ProjectDetachPreview,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || apply_project_detach_internal(&store, &preview))
+        .await?
 }
 
 /// Show a workspace's folder in the OS file manager, selected where the
@@ -7433,6 +7627,374 @@ mod project_plan_tests {
             .unwrap()
             .copy_identity
             .is_none());
+    }
+
+    #[test]
+    fn project_detach_retains_cleanup_pending_files_deployments_and_git_pins() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let active_deploy = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let commit = active_deploy.base_commit_oid.clone().unwrap();
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &active_deploy.id,
+            &commit,
+        )
+        .unwrap();
+        let preview = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        assert_eq!(preview.recoveries.len(), 1);
+        assert_eq!(preview.recoveries[0].phase, "cleanup_pending");
+        let previous = Path::new(&preview.recoveries[0].recovery_root).join("previous/SKILL.md");
+        let bytes_before = fs::read(&previous).unwrap();
+        let target_before = fs::read(target.join("SKILL.md")).unwrap();
+        assert!(remove_project_internal(&fx.store, fx.project_id.clone()).is_err());
+
+        apply_project_detach_internal(&fx.store, &preview).unwrap();
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_none());
+        assert!(fx
+            .store
+            .get_all_projects()
+            .unwrap()
+            .iter()
+            .all(|p| p.id != fx.project_id));
+        let detached = fx
+            .store
+            .get_detached_project_by_id(&fx.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detached.path, preview.project_path);
+        let after_deploy = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_deploy.id, active_deploy.id);
+        assert_eq!(after_deploy.copy_identity, active_deploy.copy_identity);
+        git_skill_versions::verify_deployment_pin(
+            &central_repo::skills_dir(),
+            &after_deploy.id,
+            &commit,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&previous).unwrap(), bytes_before);
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), target_before);
+        assert!(get_unregistered_project_recoveries_internal(&fx.store)
+            .unwrap()
+            .iter()
+            .any(|op| op.operation_id == preview.recoveries[0].operation_id));
+        assert!(
+            plan_managed_project_copy_update(
+                &fx.store,
+                &fx.project_id,
+                "demo",
+                "claude_code",
+                None,
+            )
+            .is_err(),
+            "detached projects cannot be mutated using old ProjectId"
+        );
+        assert!(prepare_project_record(&fx.store, &fx.repo)
+            .unwrap_err()
+            .to_string()
+            .contains("detached"));
+        assert!(
+            apply_project_detach_internal(&fx.store, &preview).is_err(),
+            "detachment is a one-shot transition, not reusable authorization"
+        );
+    }
+
+    #[test]
+    fn project_detach_refuses_stale_preview_and_unresolved_operation() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let old = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_operations SET updated_at=updated_at + 15 WHERE id=?1",
+            [&old.recoveries[0].operation_id],
+        )
+        .unwrap();
+        let error = apply_project_detach_internal(&fx.store, &old).unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+        let refreshed = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        assert_ne!(old.recoveries, refreshed.recoveries);
+        db.execute(
+            "UPDATE project_skill_operations SET phase='needs_attention' WHERE id=?1",
+            [&old.recoveries[0].operation_id],
+        )
+        .unwrap();
+        assert!(preview_project_detach_internal(&fx.store, &fx.project_id)
+            .unwrap_err()
+            .to_string()
+            .contains("detach is not allowed"));
+        assert!(apply_project_detach_internal(&fx.store, &refreshed).is_err());
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_detach_refuses_symlinked_retained_recovery_root() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let preview = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        let root = Path::new(&preview.recoveries[0].recovery_root);
+        let old = fx.repo.join("parked-retained-backup");
+        rename_directory_no_replace(root, &old).unwrap();
+        std::os::unix::fs::symlink(&old, root).unwrap();
+        let err = apply_project_detach_internal(&fx.store, &preview).unwrap_err();
+        assert!(err.to_string().contains("Recovery root"), "{err}");
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+        assert!(old.join("previous/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn project_detach_sqlite_failure_never_hides_project_or_changes_backups() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let preview = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        let previous = Path::new(&preview.recoveries[0].recovery_root).join("previous/SKILL.md");
+        let bytes = fs::read(&previous).unwrap();
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER block_project_detach BEFORE UPDATE OF lifecycle_state ON projects
+             BEGIN SELECT RAISE(ABORT, 'injected detach persistence failure'); END;",
+        )
+        .unwrap();
+        let error = apply_project_detach_internal(&fx.store, &preview).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected detach persistence failure"),
+            "{error}"
+        );
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+        assert!(fx
+            .store
+            .get_detached_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(&previous).unwrap(), bytes);
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == preview.recoveries[0].operation_id && r.phase == "cleanup_pending"));
+        db.execute_batch("DROP TRIGGER block_project_detach")
+            .unwrap();
+        apply_project_detach_internal(&fx.store, &preview).unwrap();
+        assert!(fx
+            .store
+            .get_detached_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn project_detach_rejects_equal_content_recovery_directory_replacement() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let preview = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        let recovery = Path::new(&preview.recoveries[0].recovery_root);
+        let backup_before = fs::read(recovery.join("previous/SKILL.md")).unwrap();
+        let moved = fx.repo.join("old-recovery-directory");
+        rename_directory_no_replace(recovery, &moved).unwrap();
+        fs::create_dir(recovery).unwrap();
+        fs::create_dir(recovery.join("previous")).unwrap();
+        fs::write(recovery.join("previous/SKILL.md"), &backup_before).unwrap();
+        assert_ne!(
+            project_copy_directory_identity(recovery),
+            Some(
+                preview.recovery_object_identities[0]
+                    .recovery_root_identity
+                    .clone()
+            ),
+        );
+        assert_eq!(
+            fs::read(recovery.join("previous/SKILL.md")).unwrap(),
+            backup_before
+        );
+        let error = apply_project_detach_internal(&fx.store, &preview).unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert!(fx
+            .store
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            fs::read(moved.join("previous/SKILL.md")).unwrap(),
+            backup_before
+        );
+        assert_eq!(
+            fs::read(recovery.join("previous/SKILL.md")).unwrap(),
+            backup_before
+        );
+    }
+
+    #[test]
+    fn detached_project_stays_read_only_during_restart_recovery() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        fs::write(
+            Path::new(&skill.central_path).join("SKILL.md"),
+            "---\nname: demo\n---\nAFTER",
+        )
+        .unwrap();
+        commit_library(&fx);
+        update_managed_project_copy(&fx.store, &fx.project_id, &target, None).unwrap();
+        let preview = preview_project_detach_internal(&fx.store, &fx.project_id).unwrap();
+        apply_project_detach_internal(&fx.store, &preview).unwrap();
+        let retained = Path::new(&preview.recoveries[0].recovery_root).join("previous/SKILL.md");
+        let bytes_before = fs::read(&retained).unwrap();
+        let target_before = fs::read(target.join("SKILL.md")).unwrap();
+        let reopened = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        assert!(reopened
+            .get_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .get_detached_project_by_id(&fx.project_id)
+            .unwrap()
+            .is_some());
+        let notices = recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("Detached project") && n.contains("retained read-only")),
+            "detached recovery must be identified as read-only: {notices:?}"
+        );
+        assert_eq!(fs::read(&retained).unwrap(), bytes_before);
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), target_before);
+        assert!(get_unregistered_project_recoveries_internal(&reopened)
+            .unwrap()
+            .iter()
+            .any(|r| r.operation_id == preview.recoveries[0].operation_id));
     }
 
     #[test]

@@ -377,10 +377,11 @@ The checked move is used for initial managed Copy publication, managed
 Copy update isolation/publication, failed-deploy isolation, managed
 Copy/symlink toggle, and protected delete quarantine and restoration.
 The update/delete operation journals now retain the trusted pre-isolation
-source identity. Startup recovery and failed-update rollback require this
-identity before moving retained data to another path. **Older incomplete
-journals with no observed identity remain available for manual review;
-they do not silently upgrade to auto-restore using a matching Git Tree.**
+source identity. Foreground failed-update rollback requires that identity
+before moving retained data. **Startup recovery no longer automatically
+moves retained objects at all** (see §12). Older incomplete journals with
+no observed identity remain available for manual review; they do not
+silently upgrade to auto-restore using a matching Git Tree.
 
 Tests cover same-content child substitution between opening parent handles
 and checking the source entry, final-component Symlink substitution,
@@ -399,3 +400,49 @@ operations also remain outside this limited proof. This batch is
 **hardening and negative-test evidence, not a full M1/M2 sign-off**,
 not permission to archive/delete recovery objects and not permission to
 release Git pins.
+
+## 12. Interruption safety policy · Source-entry race containment (implementation candidate)
+
+The OS rename interfaces in use can atomically refuse a *present target*,
+but cannot atomically require the source child inode to remain the one
+authorized earlier. In a hostile external-writer environment, combining
+`fstatat` with `renameat` does not prove that an unrelated source
+entry was never briefly moved. Consequently **startup may inspect and
+persist recovery metadata, but cannot take a new source-moving action
+on behalf of a dead foreground request**.
+
+| Operation / condition | Current first-stage action | Authority / limits |
+| --- | --- | --- |
+| Startup sees `preparing` with source still in original position | May record `recovery_available`; no file move | Journal state change only |
+| Startup sees incomplete first deploy with no published target | May record `recovery_available`; preserve staging | No implicit management adoption |
+| Startup sees interrupted `publishing` toggle; original missing, destination has recorded identity | **No auto-rename**; move to `needs_attention`, show both paths | Identity still useful for diagnostics, not independent permission |
+| Startup sees interrupted `publishing` Copy update/delete; original missing and `previous` exists | **No auto-rename**; move to `needs_attention`, report target, backup and identity-match status | Do not touch original or foreign replacement |
+| Startup sees missing/changed/unknown paths or an older unbound journal | No move; surface review required | Never claim a Git Tree match proves ownership |
+| Foreground user-authorized managed Copy update/delete/toggle | Retains existing identity-checked no-clobber moves | **Residual malicious source-child race still open** |
+| Failed foreground Copy update/first deploy | Continues bounded identity-checked best-effort rollback and retention | Still part of initiating foreground request, not an independent crash-recovery grant |
+| Symlink deployment SQLite registration fails | **No unlink rollback**; leave unowned entry and report inspection requirement | A check-then-`remove_file` cannot safely delete under hostile replacement |
+| Deployment preview finds matching Copy Tree or Symlink link text but no matching manager-created deployment identity | **Conflict**, never `AlreadyDeployed` | Candidate discovery is not management ownership |
+| Recovery archival/export or permanent deletion | Not implemented; permanent deletion prohibited | V2 separate authorization required for future non-destructive export |
+
+`needs_attention` is *not* a permission to restore, move, archive or delete
+a source. It is a durable indication that a new separately authorized
+workflow is needed. Repeated startup reads must not perform a hidden
+filesystem move. No GUI/CLI force-restore shortcut is introduced.
+
+The distinction between **manager-owned staging** and a **project user's
+original Copy** remains important: source-move operations that can touch
+the user's original still need an explicit final risk decision, for example
+a non-destructive snapshot-based deployment protocol, an environment trust
+assumption approved by the owner, or a hard refusal under strict adversarial
+concurrency. These are options for independent evaluation, not decisions
+or implementations in this batch. A second inode check cannot close
+the kernel atomic-CAS gap.
+
+Acceptance evidence for this bounded change includes real SIGKILL update,
+delete and toggle interruptions, verified retention of original Git
+baseline/DeploymentId and all file bytes at the observed paths, idempotent
+restart scans, an equal-content replaced `previous` backup, and deployment
+preview conflicts for unowned or replaced same-content Copy/Symlink entries. The
+macOS descriptor-based move remains separately covered by §10–11.
+No source recovery object, Git pin or project deployment record may be
+released or removed because of these startup status transitions.

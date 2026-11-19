@@ -602,9 +602,12 @@ fn rename_directory_no_replace_expected(
     }
 }
 
-/// Best-effort startup repair for a crash after the original Copy was moved
-/// but before the SQLite outcome was committed. Never adopt, delete or replace
-/// an occupied project target. Ambiguous states are reported for inspection.
+/// Conservative startup inspection of interrupted project Skill operations.
+/// An interrupted process does not grant a new destructive authorization:
+/// startup may advance journal phases but never move a Copy, Symlink or
+/// retained backup. Source-child identity checks cannot make a macOS
+/// renameat conditional on an expected inode; manual recovery must be
+/// separately authorized and designed before any such move is permitted.
 pub fn recover_incomplete_project_skill_operations(
     store: &SkillStore,
 ) -> Result<Vec<String>, AppError> {
@@ -702,22 +705,21 @@ pub fn recover_incomplete_project_skill_operations(
                 && original.is_none()
                 && moved.as_deref() == expected_identity
             {
-                if let Some(expected) = expected_identity {
-                    if rename_directory_no_replace_expected(destination, &target, expected).is_ok()
-                    {
-                        let _ = store.transition_project_skill_operation(
-                            &op.id,
-                            "publishing",
-                            "recovery_available",
-                        );
-                        notices.push(format!(
-                            "Restored interrupted toggle {} to {}",
-                            op.id,
-                            target.display(),
-                        ));
-                        continue;
-                    }
-                }
+                // Startup has no fresh user authorization to move a potentially
+                // replaced source child. macOS renameat cannot atomically
+                // compare the source inode with the journal's expected inode.
+                // Even a successful pre-rename stat cannot justify moving an
+                // unrelated object that was swapped in the remaining gap.
+                let _ = store.transition_project_skill_operation(
+                    &op.id,
+                    "publishing",
+                    "needs_attention",
+                );
+                notices.push(format!(
+                    "Manual restore required for interrupted toggle {}: original {}, retained destination {} (no filesystem move attempted)",
+                    op.id, target.display(), destination.display(),
+                ));
+                continue;
             }
             notices.push(format!(
                 "Toggle {} requires manual recovery: original {}, destination {}",
@@ -776,30 +778,32 @@ pub fn recover_incomplete_project_skill_operations(
         }
         if op.phase == "publishing" && matches!(op.kind.as_str(), "update" | "delete") {
             let previous = recovery_root.join("previous");
+            let previous_is_directory = std::fs::symlink_metadata(&previous)
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+            let backup_matches_journal = op.observed_identity.as_deref().is_some_and(|id| {
+                project_copy_directory_identity(&previous).as_deref() == Some(id)
+            });
             if std::fs::symlink_metadata(&target).is_err()
-                && std::fs::symlink_metadata(&previous)
-                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                && previous_is_directory
                 && std::fs::symlink_metadata(&recovery_root)
                     .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
                 && std::fs::symlink_metadata(recovery_root.parent().unwrap())
                     .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
             {
-                if let Some(expected) = op.observed_identity.as_deref() {
-                    if rename_directory_no_replace_expected(&previous, &target, expected).is_ok() {
-                        let _ = store.transition_project_skill_operation(
-                            &op.id,
-                            "publishing",
-                            "recovery_available",
-                        );
-                        notices.push(format!(
-                            "Restored interrupted {} operation {} to {}",
-                            op.kind,
-                            op.id,
-                            target.display(),
-                        ));
-                        continue;
-                    }
-                }
+                // Read-only startup recovery: never rename user-owned bytes
+                // after a prior process has died. The stored inode narrows
+                // races but cannot authorize an atomic conditional rename.
+                let _ = store.transition_project_skill_operation(
+                    &op.id,
+                    "publishing",
+                    "needs_attention",
+                );
+                notices.push(format!(
+                    "Manual restore required for interrupted {} {}: target {}, preserved backup {} (journal identity {}; no filesystem move attempted)",
+                    op.kind, op.id, target.display(), previous.display(),
+                    if backup_matches_journal { "matches" } else { "missing or changed" },
+                ));
+                continue;
             }
         }
         // Deploy operations are especially conservative: a matching Tree
@@ -3629,19 +3633,23 @@ pub fn plan_project_deploy_with_commit(
             let (state, sync_status, path) = match occupied {
                 None => (ProjectDeployState::Create, None, enabled_path),
                 Some(path) => {
-                    let variant = find_variant(&variants, &group.key, &dir_name);
-                    let matched = variant.and_then(|v| find_best_center_match(v, &all_managed));
+                    // Planning is not a backdoor to management adoption.
+                    // Matching current bytes, names or a Symlink destination
+                    // only identifies a candidate; the exact manager-created
+                    // deployment row AND current filesystem identity must
+                    // still match. Otherwise report a conflict, never
+                    // "AlreadyDeployed" (which silently skips the target).
+                    let ownership = store
+                        .get_project_skill_deployment(project_id, &path.to_string_lossy())
+                        .map_err(AppError::db)?;
                     if version.is_some() {
-                        // Content equality is not a managed ownership record.
-                        // An externally installed same-named Skill is a conflict.
-                        let ownership = store
-                            .get_project_skill_deployment(project_id, &path.to_string_lossy())
-                            .map_err(AppError::db)?;
                         match ownership {
                             Some(row)
                                 if row.skill_id == skill.id
                                     && row.mode == "copy"
-                                    && row.management_state == "managed" =>
+                                    && row.management_state == "managed"
+                                    && row.management_origin == "deployed_by_manager"
+                                    && managed_copy_identity_matches(&row, &path) =>
                             {
                                 (
                                     ProjectDeployState::AlreadyDeployed,
@@ -3652,12 +3660,23 @@ pub fn plan_project_deploy_with_commit(
                             _ => (ProjectDeployState::Conflict, None, path),
                         }
                     } else {
-                        match (variant, matched) {
-                            (Some(variant), Some(matched)) if matched.id == skill.id => (
-                                ProjectDeployState::AlreadyDeployed,
-                                Some(classify_sync_status(variant, Some(matched))),
-                                path,
-                            ),
+                        match ownership {
+                            Some(row)
+                                if row.skill_id == skill.id
+                                    && row.mode == "symlink"
+                                    && row.management_state == "managed"
+                                    && row.management_origin == "deployed_by_manager"
+                                    && managed_symlink_matches(&row, &path) =>
+                            {
+                                let variant = find_variant(&variants, &group.key, &dir_name);
+                                let matched =
+                                    variant.and_then(|v| find_best_center_match(v, &all_managed));
+                                (
+                                    ProjectDeployState::AlreadyDeployed,
+                                    variant.map(|v| classify_sync_status(v, matched)),
+                                    path,
+                                )
+                            }
                             _ => (ProjectDeployState::Conflict, None, path),
                         }
                     }
@@ -3958,12 +3977,15 @@ fn apply_project_deploy_inner(
                     updated_at: now,
                 };
                 if let Err(err) = store.mark_project_skill_symlink_managed(&record) {
-                    // A write failure does not grant management. Remove only
-                    // the exact manager-created link, never a replaced target.
-                    if managed_symlink_matches(&record, &target_dir) {
-                        let _ = std::fs::remove_file(&target_dir);
-                    }
-                    return Err(AppError::db(err));
+                    // Never unlink on rollback: a non-cooperating process can
+                    // replace the final Symlink between our last lstat and
+                    // remove_file(). macOS has no atomic unlink-if-inode-X.
+                    // No SQLite ownership is granted; preserve the link (or
+                    // foreign replacement) for explicit inspection instead.
+                    return Err(AppError::invalid_input(format!(
+                        "Symlink deployment registration failed ({err}); no management granted. The entry at {} was not removed; inspect it before retrying",
+                        target_dir.display(),
+                    )));
                 }
             }
         }
@@ -5848,6 +5870,94 @@ mod project_plan_tests {
     }
 
     #[test]
+    fn interrupted_managed_copy_recovery_rejects_equal_content_replaced_previous_without_move() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "EXACT ORIGINAL");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let original_identity = row.copy_identity.clone().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = target.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir_all(&root).unwrap();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id,
+                deployment_id: Some(row.id.clone()),
+                kind: "update".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: root.to_string_lossy().to_string(),
+                base_tree_oid: row.base_tree_oid.clone(),
+                new_tree_oid: row.base_tree_oid,
+                created_at: 1,
+                updated_at: 1,
+                destination_path: None,
+                observed_identity: Some(original_identity.clone()),
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        let previous = root.join("previous");
+        rename_directory_no_replace(&target, &previous).unwrap();
+        let external_parked = fx.repo.join("original-managed-copy-held-outside");
+        rename_directory_no_replace(&previous, &external_parked).unwrap();
+        fs::create_dir(&previous).unwrap();
+        fs::copy(external_parked.join("SKILL.md"), previous.join("SKILL.md")).unwrap();
+        assert_ne!(
+            project_copy_directory_identity(&previous),
+            Some(original_identity.clone())
+        );
+        assert_eq!(
+            fs::read(previous.join("SKILL.md")).unwrap(),
+            fs::read(external_parked.join("SKILL.md")).unwrap(),
+        );
+        let foreign_identity = project_copy_directory_identity(&previous).unwrap();
+        let reopened = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(
+            notices.iter().any(|n| n.contains(&id)
+                && n.contains("journal identity missing or changed")
+                && n.contains("no filesystem move attempted")),
+            "{notices:?}"
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            project_copy_directory_identity(&previous).as_deref(),
+            Some(foreign_identity.as_str())
+        );
+        assert_eq!(
+            project_copy_directory_identity(&external_parked).as_deref(),
+            Some(original_identity.as_str())
+        );
+        assert!(reopened
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == id && op.phase == "needs_attention"));
+        recover_incomplete_project_skill_operations(&reopened).unwrap();
+        assert!(!target.exists());
+        assert!(previous.join("SKILL.md").is_file());
+        assert!(external_parked.join("SKILL.md").is_file());
+    }
+
+    #[test]
     fn legacy_interrupted_copy_without_trusted_identity_is_not_auto_restored() {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
@@ -5906,15 +6016,18 @@ mod project_plan_tests {
         );
         assert!(!target.exists());
         assert_eq!(fs::read(previous.join("SKILL.md")).unwrap(), bytes);
+        assert!(notices
+            .iter()
+            .any(|n| n.contains(&id) && n.contains("Manual restore required")));
         assert!(restarted
             .pending_project_skill_operations()
             .unwrap()
             .iter()
-            .any(|op| op.id == id && op.phase == "publishing"));
+            .any(|op| op.id == id && op.phase == "needs_attention"));
     }
 
     #[test]
-    fn crash_recovery_restores_old_copy_when_update_was_interrupted_after_move() {
+    fn crash_recovery_retains_old_copy_for_explicit_manual_restore() {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
         let skill = library_skill(&fx, "s-demo", "demo", "v1");
@@ -5965,10 +6078,17 @@ mod project_plan_tests {
 
         let reopened = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
         let notices = recover_incomplete_project_skill_operations(&reopened).unwrap();
-        assert!(notices
-            .iter()
-            .any(|msg| msg.contains(&id) && msg.contains("Restored")));
-        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), prior);
+        assert!(
+            notices
+                .iter()
+                .any(|msg| msg.contains(&id) && msg.contains("Manual restore required")),
+            "{notices:?}"
+        );
+        assert!(!target.exists(), "no unapproved startup rename may occur");
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous/SKILL.md")).unwrap(),
+            prior
+        );
         assert_eq!(
             reopened
                 .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
@@ -5981,11 +6101,15 @@ mod project_plan_tests {
             .pending_project_skill_operations()
             .unwrap()
             .iter()
-            .any(|op| op.id == id && op.phase == "recovery_available"));
+            .any(|op| op.id == id && op.phase == "needs_attention"));
         // Running startup recovery again has no destructive side effects.
         let second = recover_incomplete_project_skill_operations(&reopened).unwrap();
         assert!(second.iter().any(|msg| msg.contains(&id)));
-        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), prior);
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read_to_string(recovery.join("previous/SKILL.md")).unwrap(),
+            prior
+        );
     }
 
     #[test]
@@ -6193,6 +6317,18 @@ mod project_plan_tests {
         rename_directory_no_replace(&target, &parked).unwrap();
         std::os::unix::fs::symlink(&demo.central_path, &target).unwrap();
         assert!(!managed_symlink_matches(&row, &target));
+        let retry = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            retry[0].state,
+            ProjectDeployState::Conflict,
+            "same-link-text replacement must not be called an existing managed deployment"
+        );
         let plan = plan_project_undeploy(&fx.store, &fx.project_id, &ids(&[&demo]), &[]).unwrap();
         assert_eq!(plan.len(), 1);
         assert!(!plan[0].safe);
@@ -6207,6 +6343,84 @@ mod project_plan_tests {
         assert!(std::fs::symlink_metadata(&target).is_ok());
         assert!(std::fs::symlink_metadata(&parked).is_ok());
         assert!(Path::new(&demo.central_path).join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn deployment_planner_refuses_equal_tree_replaced_managed_copy_and_legacy_null_identity() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let demo = library_skill(&fx, "s-demo", "demo", "SAME TREE");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let original_identity = project_copy_directory_identity(&target).unwrap();
+        let parked = fx.repo.join("parked-old-deployment");
+        rename_directory_no_replace(&target, &parked).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::copy(parked.join("SKILL.md"), target.join("SKILL.md")).unwrap();
+        assert_ne!(
+            project_copy_directory_identity(&target).unwrap(),
+            original_identity
+        );
+        assert!(
+            git_skill_versions::matches_skill_tree(
+                &central_repo::skills_dir(),
+                row.base_tree_oid.as_deref().unwrap(),
+                &target,
+            )
+            .unwrap(),
+            "replaced external Copy must have exactly matching Git content"
+        );
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            plan[0].state,
+            ProjectDeployState::Conflict,
+            "same Tree cannot inherit the original Copy's management"
+        );
+        assert!(target.join("SKILL.md").is_file());
+        assert!(parked.join("SKILL.md").is_file());
+
+        // Even the historical v12 NULL identity must not be silently
+        // re-granted ownership by deployment planning.
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute(
+            "UPDATE project_skill_deployments SET copy_identity=NULL WHERE id=?1",
+            [&row.id],
+        )
+        .unwrap();
+        let legacy_plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(legacy_plan[0].state, ProjectDeployState::Conflict);
+        assert!(fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+            .unwrap()
+            .unwrap()
+            .copy_identity
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -6231,8 +6445,8 @@ mod project_plan_tests {
         assert!(apply_project_deploy(&fx.store, &plan).is_err());
         let target = fx.repo.join(".claude/skills/demo");
         assert!(
-            std::fs::symlink_metadata(&target).is_err(),
-            "manager-created link rolls back on failed ownership registration"
+            std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()),
+            "failed registration keeps the link instead of unlinking a potentially replaced entry"
         );
         assert!(
             Path::new(&demo.central_path).join("SKILL.md").is_file(),
@@ -6243,6 +6457,22 @@ mod project_plan_tests {
             .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
             .unwrap()
             .is_none());
+        let retry_plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&demo]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            retry_plan[0].state,
+            ProjectDeployState::Conflict,
+            "failed management registration cannot silently adopt the retained Symlink"
+        );
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            PathBuf::from(&demo.central_path)
+        );
     }
 
     #[test]
@@ -6390,7 +6620,7 @@ mod project_plan_tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_sigkill_interrupted_toggle_recovers_without_adopting_external_skill() {
+    fn real_sigkill_interrupted_toggle_retains_external_skill_without_automatic_move() {
         let fx = fixture(&["claude_code"]);
         let source = fx.repo.join(".claude/skills/demo");
         let destination = fx.repo.join(".claude/skills-disabled/demo");
@@ -6426,13 +6656,19 @@ mod project_plan_tests {
         kill_child_after_rename(&source, &destination, fx._tmp.path());
         let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
         let notices = recover_incomplete_project_skill_operations(&restarted).unwrap();
-        assert!(notices
-            .iter()
-            .any(|notice| notice.contains(&id) && notice.contains("Restored")));
-        assert!(fs::read_to_string(source.join("SKILL.md"))
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains(&id) && n.contains("Manual restore required")),
+            "{notices:?}"
+        );
+        assert!(
+            !source.exists(),
+            "startup must not rename an external Skill"
+        );
+        assert!(fs::read_to_string(destination.join("SKILL.md"))
             .unwrap()
             .contains("external data before crash"));
-        assert!(!destination.exists());
         assert!(
             restarted
                 .get_project_skill_deployment(&fx.project_id, &source.to_string_lossy(),)
@@ -6443,9 +6679,10 @@ mod project_plan_tests {
         let ops = restarted.pending_project_skill_operations().unwrap();
         assert!(ops
             .iter()
-            .any(|op| op.id == id && op.phase == "recovery_available"));
+            .any(|op| op.id == id && op.phase == "needs_attention"));
         recover_incomplete_project_skill_operations(&restarted).unwrap();
-        assert!(source.join("SKILL.md").exists());
+        assert!(!source.exists());
+        assert!(destination.join("SKILL.md").exists());
     }
 
     #[cfg(unix)]
@@ -6513,7 +6750,7 @@ mod project_plan_tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_sigkill_interrupted_delete_restores_managed_copy_and_db_record() {
+    fn real_sigkill_interrupted_delete_preserves_backup_and_db_record_for_manual_restore() {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
         let demo = library_skill(&fx, "s-demo", "demo", "managed original before crash");
@@ -6563,11 +6800,17 @@ mod project_plan_tests {
         kill_child_after_rename(&target, &previous, fx._tmp.path());
         let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
         let notices = recover_incomplete_project_skill_operations(&restarted).unwrap();
-        assert!(notices
-            .iter()
-            .any(|notice| notice.contains(&id) && notice.contains("Restored")));
-        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), before);
-        assert!(!previous.exists());
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains(&id) && n.contains("Manual restore required")),
+            "{notices:?}"
+        );
+        assert!(
+            !target.exists(),
+            "startup must not rename retained managed backup"
+        );
+        assert_eq!(fs::read(previous.join("SKILL.md")).unwrap(), before);
         assert_eq!(
             restarted
                 .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
@@ -6577,11 +6820,12 @@ mod project_plan_tests {
             old_row.id
         );
         recover_incomplete_project_skill_operations(&restarted).unwrap();
-        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), before);
+        assert!(!target.exists());
+        assert_eq!(fs::read(previous.join("SKILL.md")).unwrap(), before);
     }
 
     #[test]
-    fn interrupted_toggle_recovery_restores_original_without_claiming_management() {
+    fn interrupted_toggle_recovery_keeps_external_skill_for_manual_restore() {
         let fx = fixture(&["claude_code"]);
         let source = fx.repo.join(".claude/skills/demo");
         let destination = fx.repo.join(".claude/skills-disabled/demo");
@@ -6617,11 +6861,14 @@ mod project_plan_tests {
         assert!(!source.exists());
         let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
         let messages = recover_incomplete_project_skill_operations(&restarted).unwrap();
-        assert!(messages
-            .iter()
-            .any(|msg| msg.contains(&id) && msg.contains("Restored")));
-        assert!(source.join("SKILL.md").is_file());
-        assert!(!destination.exists());
+        assert!(
+            messages
+                .iter()
+                .any(|n| n.contains(&id) && n.contains("Manual restore required")),
+            "{messages:?}"
+        );
+        assert!(!source.exists());
+        assert!(destination.join("SKILL.md").is_file());
         assert!(
             restarted
                 .get_project_skill_deployment(&fx.project_id, &source.to_string_lossy(),)
@@ -6631,7 +6878,8 @@ mod project_plan_tests {
         );
         // Idempotent on a second scan.
         recover_incomplete_project_skill_operations(&restarted).unwrap();
-        assert!(source.join("SKILL.md").is_file());
+        assert!(!source.exists());
+        assert!(destination.join("SKILL.md").is_file());
     }
 
     #[cfg(unix)]

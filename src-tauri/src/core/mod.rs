@@ -11,6 +11,8 @@ pub mod file_watcher;
 pub mod git2_engine;
 pub mod git_backup;
 pub mod git_skill_versions;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod handle_bound_fs;
 mod git_command;
 pub mod git_credentials;
 pub mod git_fetcher;

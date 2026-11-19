@@ -313,3 +313,51 @@ This is a narrow lifecycle operation, **not** proof of full malicious
 path-swap safety. The macOS parent-directory descriptor bound operations,
 power-loss persistence barriers and original recovery archive transaction
 remain separately reviewable requirements.
+
+## 10. macOS/Linux directory-handle bound no-clobber moves (limited implementation)
+
+The shared Project Copy deploy/update/delete/toggle/recovery **no-clobber
+rename primitive** now walks each parent directory component from the
+filesystem root with \`openat(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)\`,
+retains the resulting directory file descriptors, compares their identity
+against a fresh descriptor walk immediately before publication, and calls
+\`renameat_with(RENAME_NOREPLACE)\` **relative to those bound parents**.
+It never falls back to pathname-based rename on macOS/Linux when an
+unexpected ancestor symlink or stale parent identity is encountered.
+
+This closes the specific failure mode where another process swaps an
+ancestor pathname between preflight and a no-replace rename, causing an
+otherwise correct operation to resolve its destination under a new
+unrelated directory. Tested on macOS with a deterministic injection seam
+after parent FD acquisition: replacing either parent with an ordinary
+directory of equal-content Skills refuses the operation, and a separate
+\`/bin/sh\` process doing the same cannot make the Manager move the
+outsider's Copy. Tests also cover symlinked intermediate ancestors and
+normal exclusive rename behavior.
+
+**Limitations and nonclaims:**
+
+- This is a safety improvement for **no-clobber directory-entry rename**
+  only, not an atomic source-child inode compare-and-rename.
+  A hostile actor may still replace the *source child entry itself*
+  between its identity check and the system call; existing post-isolation
+  checks may detect the mistake but cannot promise a foreign object was
+  never briefly moved. Further design or refusal is required for a full
+  malicious-concurrency acceptance.
+- Other string-path operations such as materialization, recursive content
+  checks, staging-directory creation, Symlink removal, empty-directory
+  cleanup and file durability barriers have **not** all been converted to
+  handle-relative APIs. No power-loss crash barrier was added.
+- A symlinked ancestor is refused; macOS's \`/var\` points to
+  \`/private/var\`, so callers should provide canonical registered project
+  paths. No generic \`canonicalize\` fallback inside the move operation was
+  added, since that would silently change its security contract.
+- This implementation does **not** enable recovery archival, recovery
+  permanent deletion, Git-pin release, or a general cleanup API.
+- The macOS exact-object disposition contract in §5 and the remaining
+  cross-process child-replacement, open-writer, and crash-durability
+  requirements must still receive independent evidence and sign-off.
+
+The method is deliberately only a **partial** closure of the pending
+macOS handle-bound filesystem requirement; Issue #11 M1/M2 are not
+automatically approved by these tests.

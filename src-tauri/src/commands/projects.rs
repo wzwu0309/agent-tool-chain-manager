@@ -555,19 +555,15 @@ fn unique_center_match<'a>(
 }
 
 /// Publish a staged directory only if the destination is still unoccupied.
-/// On macOS/Linux this is an OS-level no-replace rename, not a vulnerable
-/// stat-then-rename pair. Other platforms retain a conservative preflight.
+/// On macOS/Linux this uses no-follow directory descriptors for every
+/// ancestor and an OS-level no-replace rename relative to bound parents.
+/// It still cannot atomically compare a *source child inode*; that requires
+/// the surrounding journal/identity checks. Other platforms are conservative.
 fn rename_directory_no_replace(source: &Path, target: &Path) -> Result<(), AppError> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            source,
-            rustix::fs::CWD,
-            target,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|err| AppError::io(std::io::Error::from_raw_os_error(err.raw_os_error())))
+        crate::core::handle_bound_fs::rename_directory_no_replace(source, target)
+            .map_err(AppError::io)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -4916,8 +4912,11 @@ mod tests {
     #[test]
     fn set_project_skill_enabled_state_enabling_removes_emptied_disabled_dir() {
         let tmp = tempdir().unwrap();
-        let skills_root = tmp.path().join("skills");
-        let disabled_root = tmp.path().join("skills-disabled");
+        // Registered project paths are canonical; macOS /var is a symlink
+        // to /private/var and must not be silently followed by the move.
+        let project_root = fs::canonicalize(tmp.path()).unwrap();
+        let skills_root = project_root.join("skills");
+        let disabled_root = project_root.join("skills-disabled");
         let relative_path = "my-skill";
 
         let real_disabled = disabled_root.join(relative_path);
@@ -4934,8 +4933,11 @@ mod tests {
     #[test]
     fn set_project_skill_enabled_state_enabling_keeps_disabled_dir_when_other_skills_remain() {
         let tmp = tempdir().unwrap();
-        let skills_root = tmp.path().join("skills");
-        let disabled_root = tmp.path().join("skills-disabled");
+        // Registered project paths are canonical; macOS /var is a symlink
+        // to /private/var and must not be silently followed by the move.
+        let project_root = fs::canonicalize(tmp.path()).unwrap();
+        let skills_root = project_root.join("skills");
+        let disabled_root = project_root.join("skills-disabled");
         let relative_path = "skill-a";
 
         let real_disabled_a = disabled_root.join(relative_path);
@@ -4964,8 +4966,11 @@ mod tests {
     #[test]
     fn set_project_skill_enabled_state_enabling_removes_empty_nested_disabled_dirs() {
         let tmp = tempdir().unwrap();
-        let skills_root = tmp.path().join("skills");
-        let disabled_root = tmp.path().join("skills-disabled");
+        // Registered project paths are canonical; macOS /var is a symlink
+        // to /private/var and must not be silently followed by the move.
+        let project_root = fs::canonicalize(tmp.path()).unwrap();
+        let skills_root = project_root.join("skills");
+        let disabled_root = project_root.join("skills-disabled");
         let relative_path = "category/sub/skill-a";
 
         let real_disabled = disabled_root.join(relative_path);
@@ -6002,15 +6007,18 @@ mod project_plan_tests {
     #[test]
     fn post_isolation_identity_check_rejects_replaced_target() {
         let tmp = tempdir().unwrap();
-        let owned = tmp.path().join("owned");
-        let foreign = tmp.path().join("foreign");
-        let backup = tmp.path().join("isolated");
+        // Registered project paths are canonical; macOS /var is a symlink
+        // to /private/var and must not be silently followed by the move.
+        let project_root = fs::canonicalize(tmp.path()).unwrap();
+        let owned = project_root.join("owned");
+        let foreign = project_root.join("foreign");
+        let backup = project_root.join("isolated");
         fs::create_dir(&owned).unwrap();
         fs::create_dir(&foreign).unwrap();
         fs::write(owned.join("owner"), "original").unwrap();
         fs::write(foreign.join("user"), "external").unwrap();
         let approved = project_target_identity(&owned).unwrap();
-        let parked = tmp.path().join("original-parked");
+        let parked = project_root.join("original-parked");
         rename_directory_no_replace(&owned, &parked).unwrap();
         rename_directory_no_replace(&foreign, &owned).unwrap();
         rename_directory_no_replace(&owned, &backup).unwrap();

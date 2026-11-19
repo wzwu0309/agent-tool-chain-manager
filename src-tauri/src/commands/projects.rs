@@ -574,6 +574,34 @@ fn rename_directory_no_replace(source: &Path, target: &Path) -> Result<(), AppEr
     }
 }
 
+/// The expected identity is from a prior authorized deployment, journal or
+/// staged publication; it must not be freshly inferred from this path. The
+/// bound-parent fstatat check is still NOT an atomic source-inode CAS.
+fn rename_directory_no_replace_expected(
+    source: &Path,
+    target: &Path,
+    expected_source_identity: &str,
+) -> Result<(), AppError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        crate::core::handle_bound_fs::rename_directory_no_replace_expected(
+            source,
+            target,
+            expected_source_identity,
+        )
+        .map_err(AppError::io)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        if project_target_identity_string(source).as_deref() != Some(expected_source_identity) {
+            return Err(AppError::invalid_input(
+                "Source directory entry identity changed before no-clobber move",
+            ));
+        }
+        rename_directory_no_replace(source, target)
+    }
+}
+
 /// Best-effort startup repair for a crash after the original Copy was moved
 /// but before the SQLite outcome was committed. Never adopt, delete or replace
 /// an occupied project target. Ambiguous states are reported for inspection.
@@ -674,18 +702,21 @@ pub fn recover_incomplete_project_skill_operations(
                 && original.is_none()
                 && moved.as_deref() == expected_identity
             {
-                if rename_directory_no_replace(destination, &target).is_ok() {
-                    let _ = store.transition_project_skill_operation(
-                        &op.id,
-                        "publishing",
-                        "recovery_available",
-                    );
-                    notices.push(format!(
-                        "Restored interrupted toggle {} to {}",
-                        op.id,
-                        target.display(),
-                    ));
-                    continue;
+                if let Some(expected) = expected_identity {
+                    if rename_directory_no_replace_expected(destination, &target, expected).is_ok()
+                    {
+                        let _ = store.transition_project_skill_operation(
+                            &op.id,
+                            "publishing",
+                            "recovery_available",
+                        );
+                        notices.push(format!(
+                            "Restored interrupted toggle {} to {}",
+                            op.id,
+                            target.display(),
+                        ));
+                        continue;
+                    }
                 }
             }
             notices.push(format!(
@@ -753,19 +784,21 @@ pub fn recover_incomplete_project_skill_operations(
                 && std::fs::symlink_metadata(recovery_root.parent().unwrap())
                     .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
             {
-                if rename_directory_no_replace(&previous, &target).is_ok() {
-                    let _ = store.transition_project_skill_operation(
-                        &op.id,
-                        "publishing",
-                        "recovery_available",
-                    );
-                    notices.push(format!(
-                        "Restored interrupted {} operation {} to {}",
-                        op.kind,
-                        op.id,
-                        target.display(),
-                    ));
-                    continue;
+                if let Some(expected) = op.observed_identity.as_deref() {
+                    if rename_directory_no_replace_expected(&previous, &target, expected).is_ok() {
+                        let _ = store.transition_project_skill_operation(
+                            &op.id,
+                            "publishing",
+                            "recovery_available",
+                        );
+                        notices.push(format!(
+                            "Restored interrupted {} operation {} to {}",
+                            op.kind,
+                            op.id,
+                            target.display(),
+                        ));
+                        continue;
+                    }
                 }
             }
         }
@@ -2531,7 +2564,7 @@ pub fn update_managed_project_copy_checked(
             created_at: now,
             updated_at: now,
             destination_path: None,
-            observed_identity: None,
+            observed_identity: Some(original_copy_identity.to_string()),
         })
         .map_err(AppError::db)?;
     std::fs::create_dir(&operation_root)?;
@@ -2571,7 +2604,7 @@ pub fn update_managed_project_copy_checked(
             "Project Skill changed during update; original Copy preserved",
         ));
     }
-    rename_directory_no_replace(target_path, &backup)?;
+    rename_directory_no_replace_expected(target_path, &backup, original_copy_identity)?;
     if project_copy_directory_identity(&backup).as_deref() != Some(original_copy_identity) {
         // We may have moved an external replacement. Restore it no-replace
         // without declaring the object managed or deleting its contents.
@@ -2600,12 +2633,13 @@ pub fn update_managed_project_copy_checked(
             &backup,
             &operation_root,
             &staged_identity,
+            original_copy_identity,
             "Project Copy changed while moving it to recovery",
         ));
     }
     // The previous directory is still available at operation_root/previous.
     // Never remove this backup solely because a snapshot compared equal once.
-    if let Err(err) = rename_directory_no_replace(&staged, target_path) {
+    if let Err(err) = rename_directory_no_replace_expected(&staged, target_path, &staged_identity) {
         return Err(restore_failed_project_copy_update(
             store,
             &operation_id,
@@ -2615,6 +2649,7 @@ pub fn update_managed_project_copy_checked(
             &backup,
             &operation_root,
             &staged_identity,
+            original_copy_identity,
             &format!("Unable to publish the new Copy: {err}"),
         ));
     }
@@ -2628,6 +2663,7 @@ pub fn update_managed_project_copy_checked(
             &backup,
             &operation_root,
             &staged_identity,
+            original_copy_identity,
             "Published Copy was replaced before database commit",
         ));
     }
@@ -2643,6 +2679,7 @@ pub fn update_managed_project_copy_checked(
             &backup,
             &operation_root,
             &staged_identity,
+            original_copy_identity,
             "Published Copy differs from selected Git version",
         ));
     }
@@ -2665,6 +2702,7 @@ pub fn update_managed_project_copy_checked(
             &backup,
             &operation_root,
             &staged_identity,
+            original_copy_identity,
             &format!("Copy update database commit failed: {err}"),
         ));
     }
@@ -2686,6 +2724,7 @@ fn restore_failed_project_copy_update(
     backup: &Path,
     operation_root: &Path,
     expected_new_identity: &str,
+    expected_old_identity: &str,
     reason: &str,
 ) -> AppError {
     // Never move a new occupant solely because its content matches the
@@ -2693,11 +2732,15 @@ fn restore_failed_project_copy_update(
     if project_copy_directory_identity(target).as_deref() == Some(expected_new_identity)
         && git_skill_versions::matches_skill_tree(root, new_tree, target).unwrap_or(false)
     {
-        let _ = rename_directory_no_replace(target, &operation_root.join("failed-new"));
+        let _ = rename_directory_no_replace_expected(
+            target,
+            &operation_root.join("failed-new"),
+            expected_new_identity,
+        );
     }
     let restored = std::fs::symlink_metadata(target).is_err()
         && std::fs::symlink_metadata(backup).is_ok()
-        && rename_directory_no_replace(backup, target).is_ok();
+        && rename_directory_no_replace_expected(backup, target, expected_old_identity).is_ok();
     let phase = if restored {
         "recovery_available"
     } else {
@@ -2912,10 +2955,11 @@ pub fn toggle_project_skill_internal(
             "Skill changed before enable/disable rename",
         ));
     }
-    rename_directory_no_replace(&source, &destination)?;
+    rename_directory_no_replace_expected(&source, &destination, &observed_string)?;
     if project_target_identity(&destination) != Some(observed) {
         let restored = std::fs::symlink_metadata(&source).is_err()
-            && rename_directory_no_replace(&destination, &source).is_ok();
+            && rename_directory_no_replace_expected(&destination, &source, &observed_string)
+                .is_ok();
         let _ = store.transition_project_skill_operation(
             &id,
             "publishing",
@@ -2932,7 +2976,8 @@ pub fn toggle_project_skill_internal(
     if let Err(err) = store.commit_project_skill_toggle(&id) {
         let restored = std::fs::symlink_metadata(&source).is_err()
             && project_target_identity(&destination) == Some(observed)
-            && rename_directory_no_replace(&destination, &source).is_ok();
+            && rename_directory_no_replace_expected(&destination, &source, &observed_string)
+                .is_ok();
         let _ = store.transition_project_skill_operation(
             &id,
             "publishing",
@@ -3098,18 +3143,20 @@ fn quarantine_project_skill_delete(
             created_at: now,
             updated_at: now,
             destination_path: None,
-            observed_identity: None,
+            observed_identity: Some(format!("{}:{}", original_identity.0, original_identity.1)),
         })
         .map_err(AppError::db)?;
     std::fs::create_dir(&recovery_root)?;
     store
         .transition_project_skill_operation(&id, "preparing", "publishing")
         .map_err(AppError::db)?;
-    rename_directory_no_replace(target, &backup)?;
+    let original_identity_string = format!("{}:{}", original_identity.0, original_identity.1);
+    rename_directory_no_replace_expected(target, &backup, &original_identity_string)?;
     // The authorized inode must still be the one that was isolated.
     if !is_same_isolated_target(&backup, original_identity) {
         let restored = std::fs::symlink_metadata(target).is_err()
-            && rename_directory_no_replace(&backup, target).is_ok();
+            && rename_directory_no_replace_expected(&backup, target, &original_identity_string)
+                .is_ok();
         let _ = store.transition_project_skill_operation(
             &id,
             "publishing",
@@ -3143,7 +3190,9 @@ fn quarantine_project_skill_delete(
             })
     };
     if !explicit_force && !moved_is_clean {
-        let restored = rename_directory_no_replace(&backup, target).is_ok();
+        let restored =
+            rename_directory_no_replace_expected(&backup, target, &original_identity_string)
+                .is_ok();
         let _ = store.transition_project_skill_operation(
             &id,
             "publishing",
@@ -3161,7 +3210,9 @@ fn quarantine_project_skill_delete(
     }
     if let Err(err) = store.commit_project_skill_delete(&id, project_id, &target.to_string_lossy())
     {
-        let restored = rename_directory_no_replace(&backup, target).is_ok();
+        let restored =
+            rename_directory_no_replace_expected(&backup, target, &original_identity_string)
+                .is_ok();
         let _ = store.transition_project_skill_operation(
             &id,
             "publishing",
@@ -3838,7 +3889,7 @@ fn apply_project_deploy_inner(
             let staged_identity = project_copy_directory_identity(&staged).ok_or_else(|| {
                 AppError::invalid_input("Staged Copy has no stable directory identity")
             })?;
-            rename_directory_no_replace(&staged, &target_dir)?;
+            rename_directory_no_replace_expected(&staged, &target_dir, &staged_identity)?;
             if project_copy_directory_identity(&target_dir).as_deref()
                 != Some(staged_identity.as_str())
             {
@@ -3948,7 +3999,10 @@ fn recover_failed_first_project_copy_deploy(
         )
         .unwrap_or(false);
 
-    if still_committed_bytes && rename_directory_no_replace(target_dir, &saved).is_ok() {
+    if still_committed_bytes
+        && rename_directory_no_replace_expected(target_dir, &saved, expected_published_identity)
+            .is_ok()
+    {
         if project_copy_directory_identity(&saved).as_deref() == Some(expected_published_identity) {
             let _ = store.transition_project_skill_operation(
                 operation_id,
@@ -5794,6 +5848,72 @@ mod project_plan_tests {
     }
 
     #[test]
+    fn legacy_interrupted_copy_without_trusted_identity_is_not_auto_restored() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "ORIGINAL");
+        commit_library(&fx);
+        let deploy = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &deploy).unwrap();
+
+        let target = fx.repo.join(".claude/skills/demo");
+        let bytes = fs::read(target.join("SKILL.md")).unwrap();
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let recovery = target.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir(&recovery).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id.clone(),
+                deployment_id: Some(row.id),
+                kind: "update".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: row.base_tree_oid.clone(),
+                new_tree_oid: row.base_tree_oid,
+                created_at: now,
+                updated_at: now,
+                destination_path: None,
+                observed_identity: None, // old journal
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        let previous = recovery.join("previous");
+        rename_directory_no_replace(&target, &previous).unwrap();
+        let restarted = SkillStore::new(&fx._tmp.path().join("skills.db")).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&restarted).unwrap();
+        assert!(
+            !notices
+                .iter()
+                .any(|s| s.contains("Restored interrupted update")),
+            "an old journal with no observed inode cannot justify moving previous: {notices:?}"
+        );
+        assert!(!target.exists());
+        assert_eq!(fs::read(previous.join("SKILL.md")).unwrap(), bytes);
+        assert!(restarted
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == id && op.phase == "publishing"));
+    }
+
+    #[test]
     fn crash_recovery_restores_old_copy_when_update_was_interrupted_after_move() {
         let fx = fixture(&["claude_code"]);
         fx.store.set_setting("sync_mode", "copy").unwrap();
@@ -5834,7 +5954,7 @@ mod project_plan_tests {
                 updated_at: now,
 
                 destination_path: None,
-                observed_identity: None,
+                observed_identity: record.copy_identity.clone(),
             })
             .unwrap();
         fx.store
@@ -6433,7 +6553,7 @@ mod project_plan_tests {
                 created_at: now,
                 updated_at: now,
                 destination_path: None,
-                observed_identity: None,
+                observed_identity: old_row.copy_identity.clone(),
             })
             .unwrap();
         fx.store

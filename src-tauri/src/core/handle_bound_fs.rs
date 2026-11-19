@@ -14,7 +14,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{self, Mode, OFlags, RenameFlags};
+use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags};
 
 fn error(err: rustix::io::Errno) -> io::Error {
     io::Error::from_raw_os_error(err.raw_os_error())
@@ -83,7 +83,23 @@ fn parent_is_same_object(parent: &Path, bound: &OwnedFd) -> io::Result<bool> {
 }
 
 pub fn rename_directory_no_replace(source: &Path, target: &Path) -> io::Result<()> {
-    rename_directory_no_replace_inner(source, target, || {})
+    rename_directory_no_replace_inner(source, target, None, || {})
+}
+
+/// Reject an already-substituted source child, even if it has exactly the
+/// same bytes as the original managed directory. The expected identity must
+/// come from an earlier trusted deployment record or an observed manager-
+/// published staging directory, *not* from a fresh stat of the target here.
+///
+/// The child stat is performed relative to the captured parent FD, directly
+/// before renameat. This narrows the race; macOS/Linux do NOT offer an
+/// atomic 'rename only if source inode equals expected' primitive.
+pub fn rename_directory_no_replace_expected(
+    source: &Path,
+    target: &Path,
+    expected_source_identity: &str,
+) -> io::Result<()> {
+    rename_directory_no_replace_inner(source, target, Some(expected_source_identity), || {})
 }
 
 /// Test seam: caller can rename a parent after its FD is bound, before the
@@ -94,12 +110,26 @@ pub(crate) fn rename_after_parents_open<F: FnOnce()>(
     target: &Path,
     hook: F,
 ) -> io::Result<()> {
-    rename_directory_no_replace_inner(source, target, hook)
+    rename_directory_no_replace_inner(source, target, None, hook)
+}
+
+/// Test-only fault injection between parent binding and the final source
+/// child identity check. This models a different process replacing just the
+/// child, without modifying the parent inode.
+#[cfg(test)]
+pub(crate) fn rename_expected_after_parents_open<F: FnOnce()>(
+    source: &Path,
+    target: &Path,
+    expected_source_identity: &str,
+    hook: F,
+) -> io::Result<()> {
+    rename_directory_no_replace_inner(source, target, Some(expected_source_identity), hook)
 }
 
 fn rename_directory_no_replace_inner<F: FnOnce()>(
     source: &Path,
     target: &Path,
+    expected_source_identity: Option<&str>,
     after_open: F,
 ) -> io::Result<()> {
     let (source_parent, source_name) = parent_and_name(source)?;
@@ -115,6 +145,22 @@ fn rename_directory_no_replace_inner<F: FnOnce()>(
             io::ErrorKind::WouldBlock,
             "Directory parent changed after descriptor binding; no move performed",
         ));
+    }
+
+    if let Some(expected) = expected_source_identity {
+        // fstatat on a *bound* parent, not another full string-path lookup.
+        // NOFOLLOW checks the inode of the directory entry itself (including
+        // manager-created Symlinks), never the link's destination. Reject
+        // identical-content replacements and final-component Symlink swaps.
+        let entry =
+            fs::statat(&from, source_name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(error)?;
+        let current = format!("{}:{}", entry.st_dev, entry.st_ino);
+        if current != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Source directory entry identity changed after authorization; no move performed",
+            ));
+        }
     }
 
     fs::renameat_with(
@@ -265,6 +311,158 @@ mod tests {
             !to.join("copy").exists(),
             "no foreign or old Copy was moved"
         );
+    }
+
+    #[test]
+    fn expected_source_identity_rejects_equal_content_replacement_after_fd_open() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempdir().unwrap();
+        let root = stdfs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let parked = root.join("original-child");
+        stdfs::create_dir(&source).unwrap();
+        stdfs::create_dir(&destination).unwrap();
+        stdfs::create_dir(source.join("copy")).unwrap();
+        stdfs::write(source.join("copy/SKILL.md"), "same Git Tree").unwrap();
+        let meta = stdfs::symlink_metadata(source.join("copy")).unwrap();
+        let expected = format!("{}:{}", meta.dev(), meta.ino());
+
+        let err = rename_expected_after_parents_open(
+            &source.join("copy"),
+            &destination.join("copy"),
+            &expected,
+            || {
+                stdfs::rename(source.join("copy"), &parked).unwrap();
+                stdfs::create_dir(source.join("copy")).unwrap();
+                stdfs::write(source.join("copy/SKILL.md"), "same Git Tree").unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert_eq!(
+            stdfs::read_to_string(source.join("copy/SKILL.md")).unwrap(),
+            "same Git Tree"
+        );
+        assert_eq!(
+            stdfs::read_to_string(parked.join("SKILL.md")).unwrap(),
+            "same Git Tree"
+        );
+        assert!(
+            !destination.join("copy").exists(),
+            "foreign child must not be moved"
+        );
+    }
+
+    #[test]
+    fn external_process_replaces_source_child_after_parent_binding() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempdir().unwrap();
+        let root = stdfs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let parked = root.join("original-copy");
+        stdfs::create_dir(&source).unwrap();
+        stdfs::create_dir(&destination).unwrap();
+        stdfs::create_dir(source.join("copy")).unwrap();
+        stdfs::write(source.join("copy/SKILL.md"), "same committed contents").unwrap();
+        let original = stdfs::symlink_metadata(source.join("copy")).unwrap();
+        let expected = format!("{}:{}", original.dev(), original.ino());
+        let result =
+            rename_expected_after_parents_open(
+                &source.join("copy"),
+                &destination.join("copy"),
+                &expected,
+                || {
+                    let status = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg("mv \"$1\" \"$2\" && mkdir \"$1\" && cp \"$2/SKILL.md\" \"$1/SKILL.md\"")
+                    .arg("sh").arg(source.join("copy")).arg(&parked)
+                    .status().unwrap();
+                    assert!(
+                        status.success(),
+                        "second process must replace just the child"
+                    );
+                },
+            );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            stdfs::read_to_string(parked.join("SKILL.md")).unwrap(),
+            "same committed contents"
+        );
+        assert_eq!(
+            stdfs::read_to_string(source.join("copy/SKILL.md")).unwrap(),
+            "same committed contents"
+        );
+        assert!(
+            !destination.join("copy").exists(),
+            "external Copy was not moved"
+        );
+    }
+
+    #[test]
+    fn expected_source_identity_rejects_final_symlink_swap() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempdir().unwrap();
+        let root = stdfs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let parked = root.join("original-child");
+        stdfs::create_dir(&source).unwrap();
+        stdfs::create_dir(&destination).unwrap();
+        stdfs::create_dir(source.join("copy")).unwrap();
+        let meta = stdfs::symlink_metadata(source.join("copy")).unwrap();
+        let expected = format!("{}:{}", meta.dev(), meta.ino());
+
+        let err = rename_expected_after_parents_open(
+            &source.join("copy"),
+            &destination.join("copy"),
+            &expected,
+            || {
+                stdfs::rename(source.join("copy"), &parked).unwrap();
+                std::os::unix::fs::symlink(&parked, source.join("copy")).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert!(stdfs::symlink_metadata(source.join("copy"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(parked.is_dir());
+        assert!(!destination.join("copy").exists());
+    }
+
+    #[test]
+    fn expected_source_identity_allows_exact_directory_and_rejects_stale_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempdir().unwrap();
+        let root = stdfs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        stdfs::create_dir(&source).unwrap();
+        stdfs::create_dir(&destination).unwrap();
+        stdfs::create_dir(source.join("copy")).unwrap();
+        let meta = stdfs::symlink_metadata(source.join("copy")).unwrap();
+        let expected = format!("{}:{}", meta.dev(), meta.ino());
+        rename_directory_no_replace_expected(
+            &source.join("copy"),
+            &destination.join("copy"),
+            &expected,
+        )
+        .unwrap();
+        assert!(destination.join("copy").is_dir());
+
+        stdfs::create_dir(source.join("copy")).unwrap();
+        let err = rename_directory_no_replace_expected(
+            &source.join("copy"),
+            &destination.join("copy-2"),
+            &expected,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert!(source.join("copy").exists());
+        assert!(!destination.join("copy-2").exists());
     }
 
     #[test]

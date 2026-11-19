@@ -361,3 +361,41 @@ normal exclusive rename behavior.
 The method is deliberately only a **partial** closure of the pending
 macOS handle-bound filesystem requirement; Issue #11 M1/M2 are not
 automatically approved by these tests.
+
+
+## 11. Bound-source entry identity and legacy journal recovery (limited implementation)
+
+The shared no-replace directory move now also supports an **expected source
+entry identity** from the existing trusted manager record or immutable
+publication observation. It calls \`fstatat(AT_SYMLINK_NOFOLLOW)\` on the
+source entry relative to the already bound parent descriptor immediately
+before \`renameat_with(RENAME_NOREPLACE)\`. The observed \`dev:ino\` must
+equal the **prior** authorized identity; checking only the current content
+or obtaining a brand-new identity at move time is never authorization.
+
+The checked move is used for initial managed Copy publication, managed
+Copy update isolation/publication, failed-deploy isolation, managed
+Copy/symlink toggle, and protected delete quarantine and restoration.
+The update/delete operation journals now retain the trusted pre-isolation
+source identity. Startup recovery and failed-update rollback require this
+identity before moving retained data to another path. **Older incomplete
+journals with no observed identity remain available for manual review;
+they do not silently upgrade to auto-restore using a matching Git Tree.**
+
+Tests cover same-content child substitution between opening parent handles
+and checking the source entry, final-component Symlink substitution,
+stale identity refusal, exact-identity successful moves, and **a real
+second process** replacing the source child with an equal-content copy
+after the parent descriptors were opened. The separately maintained
+parent-swap regression suite remains intact.
+
+**Safety limit:** Standard macOS/Linux \`renameat\` has no
+\`rename-if-source-inode-equals-X\` option. A hostile external process can
+still swap a source name in the non-atomic gap between the last
+\`fstatat\` and \`renameat\`. A later post-move identity check can detect
+such a mistake but cannot guarantee an unrelated directory was never
+temporarily moved. Inode reuse, active writers and other string-path
+operations also remain outside this limited proof. This batch is
+**hardening and negative-test evidence, not a full M1/M2 sign-off**,
+not permission to archive/delete recovery objects and not permission to
+release Git pins.

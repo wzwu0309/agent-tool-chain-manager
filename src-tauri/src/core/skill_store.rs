@@ -1315,6 +1315,80 @@ impl SkillStore {
         Ok(())
     }
 
+    /// Consumes one explicit, verified, metadata-only manual reconciliation.
+    /// This NEVER creates, moves, removes or adopts files. It releases an
+    /// interrupted target reservation only if the journal and the original
+    /// managed Copy deployment still match the previously reviewed snapshot.
+    /// The filesystem/Git proofs are checked by Core immediately before this
+    /// transaction under RepoLock; this SQL does not claim a filesystem CAS.
+    pub fn reconcile_restored_managed_copy_journal(
+        &self,
+        operation_id: &str,
+        project_id: &str,
+        deployment_id: &str,
+        skill_id: &str,
+        target_path: &str,
+        recovery_root: &str,
+        observed_identity: &str,
+        old_commit: &str,
+        old_tree: &str,
+        journal_kind: &str,
+        journal_new_tree: Option<&str>,
+        journal_created_at: i64,
+        journal_updated_at: i64,
+        deployment_updated_at: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE project_skill_operations
+             SET phase='recovery_available', updated_at=?12
+             WHERE id=?1 AND project_id=?2 AND deployment_id=?3 AND skill_id=?4
+               AND target_path=?5 AND recovery_root=?6
+               AND kind=?13 AND kind IN ('update', 'delete')
+               AND phase='needs_attention'
+               AND observed_identity=?7 AND base_tree_oid=?9
+               AND new_tree_oid IS ?14 AND created_at=?15
+               AND destination_path IS NULL
+               AND updated_at=?10
+               AND EXISTS (
+                 SELECT 1 FROM project_skill_deployments d
+                 JOIN projects p ON p.id=d.project_id
+                 WHERE d.id=?3 AND d.project_id=?2 AND d.skill_id=?4
+                   AND d.target_path=?5 AND d.mode='copy'
+                   AND d.management_state='managed'
+                   AND d.management_origin='deployed_by_manager'
+                   AND d.copy_identity=?7 AND d.base_commit_oid=?8
+                   AND d.base_tree_oid=?9 AND d.updated_at=?11
+                   AND p.lifecycle_state='active'
+               )",
+            params![
+                operation_id,
+                project_id,
+                deployment_id,
+                skill_id,
+                target_path,
+                recovery_root,
+                observed_identity,
+                old_commit,
+                old_tree,
+                journal_updated_at,
+                deployment_updated_at,
+                chrono::Utc::now().timestamp_millis(),
+                journal_kind,
+                journal_new_tree,
+                journal_created_at
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!(
+                "Restored Copy reconciliation CAS failed: journal, original ownership, Git baseline or project state changed"
+            );
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Atomic ownership grant and operation completion. Publishing a directory
     /// is NOT ownership; this transaction is the only first-deploy grant.
     pub fn commit_project_skill_deploy(

@@ -52,6 +52,7 @@ import { useRevealProjectFolder } from "../hooks/useRevealProjectFolder";
 import { AddSkillsSheet } from "../components/AddSkillsSheet";
 import { ProjectCopyVersionDialog } from "../components/ProjectCopyVersionDialog";
 import { recoveryNeedsAttention, recoveryNeedsFollowUp, recoveryMayBeInProgress } from "../lib/projectRecovery";
+import type { RestoredCopyReconciliationPreview } from "../lib/tauri";
 const projectLastUsedAgentsKey = (projectId: string) =>
   `project_last_used_export_agents:${projectId}`;
 
@@ -144,6 +145,9 @@ export function ProjectDetail() {
   const [recoveryExpanded, setRecoveryExpanded] = useState(false);
   const [recoveryLoading, setRecoveryLoading] = useState(false);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [reconcilePreview, setReconcilePreview] = useState<RestoredCopyReconciliationPreview | null>(null);
+  const [reconcileBusy, setReconcileBusy] = useState<string | null>(null);
+  const [reconcileError, setReconcileError] = useState<{ operationId: string; text: string } | null>(null);
   const recoveryRequestRef = useRef(0);
   const [projectAgentTargets, setProjectAgentTargets] = useState<ProjectAgentTarget[]>([]);
   const [loading, setLoading] = useState(true);
@@ -243,6 +247,8 @@ export function ProjectDetail() {
     setRecoveries([]);
     setRecoveryExpanded(false);
     setRecoveryError(null);
+    setReconcilePreview(null);
+    setReconcileError(null);
     void loadRecoveries();
   }, [loadRecoveries]);
 
@@ -298,6 +304,42 @@ export function ProjectDetail() {
 
   const recoveryAttention = recoveries.filter(recoveryNeedsAttention);
   const recoveryFollowUp = recoveries.filter(recoveryNeedsFollowUp);
+  const inspectRestoredCopy = async (operationId: string) => {
+    if (!id) return;
+    setReconcilePreview(null);
+    setReconcileError(null);
+    setReconcileBusy(operationId);
+    try {
+      const preview = await api.previewRestoredCopyReconciliation(id, operationId);
+      setReconcilePreview(preview);
+    } catch (error) {
+      setReconcileError({
+        operationId,
+        text: getErrorMessage(error, t("project.recovery.reconcileNotEligible")),
+      });
+    } finally {
+      setReconcileBusy(null);
+    }
+  };
+
+  const confirmRestoredCopy = async (preview: RestoredCopyReconciliationPreview) => {
+    setReconcileBusy(preview.operationId);
+    setReconcilePreview(null);
+    setReconcileError(null);
+    try {
+      await api.applyRestoredCopyReconciliation(preview);
+      await Promise.all([loadRecoveries(), loadSkills(), refreshProjects()]);
+      toast.success(t("project.recovery.reconcileSuccess"));
+    } catch (error) {
+      setReconcileError({
+        operationId: preview.operationId,
+        text: getErrorMessage(error, t("project.recovery.reconcileFailed")),
+      });
+    } finally {
+      setReconcileBusy(null);
+    }
+  };
+
   const copyRecoveryPath = async (path: string) => {
     try {
       await navigator.clipboard.writeText(path);
@@ -1337,6 +1379,46 @@ export function ProjectDetail() {
                     )}
                   </div>
                   <p className="mt-1 break-all text-muted">{t("project.recovery.operation")}: {recovery.operation_id}</p>
+                  {recovery.phase === "needs_attention"
+                    && (recovery.kind === "update" || recovery.kind === "delete") && (
+                    <div className="mt-2 space-y-2 border-t border-border-subtle pt-2">
+                      <p className="text-muted">{t("project.recovery.reconcileHint")}</p>
+                      <button type="button"
+                        className="rounded-lg border border-border px-2 py-1 text-secondary hover:bg-surface-hover disabled:opacity-50"
+                        disabled={reconcileBusy !== null}
+                        onClick={() => void inspectRestoredCopy(recovery.operation_id)}>
+                        {t("project.recovery.reconcilePreview")}
+                      </button>
+                      {reconcileError?.operationId === recovery.operation_id && (
+                        <p role="alert" className="text-amber-700 dark:text-amber-300">
+                          {t("project.recovery.reconcileNotEligible")}: {reconcileError.text}
+                        </p>
+                      )}
+                      {reconcilePreview?.operationId === recovery.operation_id && (
+                        <div className="space-y-2 rounded-md border border-border p-2">
+                          <p className="font-medium">{t("project.recovery.reconcileVerified")}</p>
+                          <p>{t("project.recovery.reconcileConsent")}</p>
+                          <p className="break-all text-muted">DeploymentId: {reconcilePreview.deploymentId}</p>
+                          <p className="break-all text-muted">Git Commit: {reconcilePreview.baseCommitOid}</p>
+                          <p className="break-all text-muted">Git Tree: {reconcilePreview.baseTreeOid}</p>
+                          <p className="break-all text-muted">{t("project.recovery.target")}: {reconcilePreview.targetPath}</p>
+                          <div className="flex flex-wrap gap-2">
+                            <button type="button"
+                              className="rounded-lg border border-border px-3 py-1 font-medium text-secondary hover:bg-surface-hover disabled:opacity-50"
+                              disabled={reconcileBusy !== null}
+                              onClick={() => void confirmRestoredCopy(reconcilePreview)}>
+                              {t("project.recovery.reconcileConfirm")}
+                            </button>
+                            <button type="button"
+                              className="rounded-lg px-2 py-1 text-muted hover:bg-surface-hover"
+                              onClick={() => setReconcilePreview(null)}>
+                              {t("common.cancel")}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

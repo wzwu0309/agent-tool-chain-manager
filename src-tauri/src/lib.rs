@@ -1126,6 +1126,8 @@ pub fn run() {
             // Projects
             commands::projects::get_projects,
             commands::projects::get_project_skill_recoveries,
+            commands::projects::preview_restored_copy_reconciliation,
+            commands::projects::apply_restored_copy_reconciliation,
             commands::projects::get_active_project_skill_recoveries,
             commands::projects::get_unregistered_project_skill_recoveries,
             commands::projects::add_project,

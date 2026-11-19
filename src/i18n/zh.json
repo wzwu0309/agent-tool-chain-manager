@@ -980,6 +980,14 @@
       "success": "受管 Copy 已更新。"
     },
         "recovery": {
+      "reconcileHint": "仅当原先由管理器部署的同一份 Copy 已经回到 Agent 原路径时，可核验身份并解除中断阻塞。本操作不会搬回文件；原件缺失或已被替换时仍会拒绝。",
+      "reconcilePreview": "检查原 Copy 是否已归位",
+      "reconcileNotEligible": "当前操作无法安全地收口",
+      "reconcileFailed": "收口失败，原恢复日志仍然保留",
+      "reconcileVerified": "已核对原目录身份、不可变 Git 基线及操作日志",
+      "reconcileConsent": "我确认原受管 Copy 已经在原路径。本操作只更新 SQLite 操作状态，不移动或删除文件、恢复备份及 Git pins。",
+      "reconcileConfirm": "确认只收口管理状态",
+      "reconcileSuccess": "已核验原 Copy 并解除中断操作阻塞；恢复数据保持不变。",
       "retainedPaths": "检测到的保留子目录",
       "retainedPathsNotVerified": "仅表示查询时发现这些目录，并不代表内容已核验或获准恢复。",
       "attentionTitle": "项目 Skill 需要人工检查（{{count}}）",

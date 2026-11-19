@@ -500,3 +500,47 @@ Frontend tests explicitly assert that \`cleanup_pending\` is not a service
 outage, \`recovery_available\` is informational follow-up, and
 \`preparing/publishing/needs_attention\` require attention. No restoration,
 archive or permanent deletion capability is enabled by these views.
+
+
+## 14. Exact-original Copy already restored · metadata-only reconciliation (limited implementation)
+
+A separate, explicit ProjectDetail action is now available only for a
+\`needs_attention\` operation of kind \`update\` or \`delete\` where the
+**same exact manager-owned Copy directory object** was already returned
+to the original Agent target path by an out-of-band recovery. The user
+must first request a read-only preview, then independently confirm the
+preview. No filesystem restoration/move is performed by this feature.
+
+The preview verifies: active ProjectId; normalized real project and
+target-parent containment; expected \`.atm-recovery/<OperationId>\`
+root and parent identities with no Symlink redirection; \`previous\`
+is **absent**; original target exists with exact prior \`dev:ino\`;
+journal's original \`DeploymentId\`, \`SkillId\`, kind, phase,
+\`observed_identity\`, original Tree and \`updated_at\`; deployment
+mode \`copy\`, manager-created provenance and stored original
+\`copy_identity\`; immutable local Git deployment pin,
+CommitId, TreeId and historical Skill path; and complete target contents
+matching the immutable Git Tree. Same-content directory replacement,
+untrusted legacy NULL identity, modified contents, missing original
+path, and absent/changed Git pin are **not eligible**.
+
+Apply holds RepoLock, recomputes the entire filesystem/Git/SQLite
+preview and compares it with the explicit user-confirmed snapshot.
+A single SQLite transaction then CAS-checks the original deployment,
+its \`updated_at\`/Git baseline/identity, active project lifecycle and
+operation snapshot, and only updates the journal from
+\`needs_attention\` to \`recovery_available\`. This removes the active
+target-path reservation while retaining the original DeploymentId,
+Copy inode, Git baseline/pins, operation history and all recovery data.
+A failed CAS or stale/replayed preview never clears the blocker.
+
+The feature does **not** make macOS filesystem and SQLite metadata
+atomic against a hostile writer after the final filesystem check; no
+such claim is made. It is an intentionally narrow, **no file writes**
+reconciliation for an unchanged, already-restored manager-owned object.
+It does not support Symlink/toggle recovery, copying from \`previous\`,
+an unknown original inode, old Copy updates that already committed,
+or restoring absent files. These still require the independently
+reviewed, source-preserving copy-to-staging and no-overwrite
+publication workflow. Users must not be instructed to edit SQLite
+directly. Recovery archive/deletion and Git-pin release stay prohibited.

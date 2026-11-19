@@ -1488,6 +1488,269 @@ pub async fn apply_project_detach(
         .await?
 }
 
+/// Metadata-only recovery after the original *manager-owned* Copy has
+/// already been returned to its original project path. This operation
+/// deliberately cannot move or copy any files and does not reauthorize an
+/// externally replaced directory, legacy NULL identity, or a different Tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredCopyReconciliationPreview {
+    pub project_id: String,
+    pub operation_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub journal_created_at: i64,
+    pub journal_updated_at: i64,
+    pub journal_new_tree_oid: Option<String>,
+    pub project_path: String,
+    pub project_root_identity: String,
+    pub target_path: String,
+    pub target_parent_identity: String,
+    pub target_copy_identity: String,
+    pub recovery_root: String,
+    pub recovery_parent_identity: String,
+    pub recovery_root_identity: String,
+    pub skill_id: String,
+    pub deployment_id: String,
+    pub deployment_updated_at: i64,
+    pub base_commit_oid: String,
+    pub base_tree_oid: String,
+    pub path_at_commit: String,
+}
+
+pub fn preview_restored_copy_reconciliation_internal(
+    store: &SkillStore,
+    project_id: &str,
+    operation_id: &str,
+) -> Result<RestoredCopyReconciliationPreview, AppError> {
+    let project = store
+        .get_project_by_id(project_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| {
+            AppError::invalid_input("Only active projects may reconcile Copy recovery")
+        })?;
+    let op = store
+        .pending_project_skill_operations()
+        .map_err(AppError::db)?
+        .into_iter()
+        .find(|op| op.project_id == project_id && op.id == operation_id)
+        .ok_or_else(|| AppError::not_found("Recovery operation is no longer pending"))?;
+    if op.phase != "needs_attention"
+        || !matches!(op.kind.as_str(), "update" | "delete")
+        || op.destination_path.is_some()
+    {
+        return Err(AppError::invalid_input(
+            "Only interrupted managed Copy update/delete operations marked needs_attention support metadata-only reconciliation",
+        ));
+    }
+    let deployment_id = op
+        .deployment_id
+        .as_deref()
+        .ok_or_else(|| AppError::invalid_input("Recovery journal has no trusted DeploymentId"))?;
+    let identity = op.observed_identity.as_deref().ok_or_else(|| {
+        AppError::invalid_input("Recovery journal has no trusted original directory identity")
+    })?;
+    let row = store
+        .get_project_skill_deployment(project_id, &op.target_path)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::invalid_input("Original managed Copy deployment is missing"))?;
+    if row.id != deployment_id
+        || row.skill_id != op.skill_id
+        || row.mode != "copy"
+        || row.management_state != "managed"
+        || row.management_origin != "deployed_by_manager"
+        || row.copy_identity.as_deref() != Some(identity)
+        || row.base_tree_oid != op.base_tree_oid
+    {
+        return Err(AppError::invalid_input(
+            "Original Copy ownership, DeploymentId, identity or Tree differs from the journal",
+        ));
+    }
+    let commit = row
+        .base_commit_oid
+        .as_deref()
+        .ok_or_else(|| AppError::invalid_input("Original Copy has no immutable Git CommitId"))?;
+    let tree = row
+        .base_tree_oid
+        .as_deref()
+        .ok_or_else(|| AppError::invalid_input("Original Copy has no immutable Git TreeId"))?;
+    let historical_path = row.path_at_commit.as_deref().ok_or_else(|| {
+        AppError::invalid_input("Original Copy has no committed historical Skill path")
+    })?;
+    let project_path = Path::new(&project.path);
+    let project_canonical = std::fs::canonicalize(project_path).map_err(AppError::io)?;
+    if project_canonical != project_path {
+        return Err(AppError::invalid_input(
+            "Project path includes a substituted or noncanonical ancestor",
+        ));
+    }
+    let project_root_identity = project_copy_directory_identity(project_path)
+        .ok_or_else(|| AppError::invalid_input("Project root identity is unavailable"))?;
+    let target = Path::new(&op.target_path);
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| AppError::invalid_input("Recovery target has no parent"))?;
+    let target_parent_canonical = std::fs::canonicalize(target_parent).map_err(AppError::io)?;
+    if target_parent_canonical != target_parent || !target_parent.starts_with(&project_canonical) {
+        return Err(AppError::invalid_input(
+            "Recovery target has a Symlink ancestor or lies outside the active project",
+        ));
+    }
+    let target_parent_identity = project_copy_directory_identity(target_parent)
+        .ok_or_else(|| AppError::invalid_input("Recovery target parent is not a directory"))?;
+    let expected_recovery_root = target_parent.join(".atm-recovery").join(operation_id);
+    if Path::new(&op.recovery_root) != expected_recovery_root {
+        return Err(AppError::invalid_input(
+            "Recovery root does not match journal OperationId and target path",
+        ));
+    }
+    let recovery_parent = expected_recovery_root.parent().unwrap();
+    let recovery_parent_identity = project_copy_directory_identity(recovery_parent)
+        .ok_or_else(|| AppError::invalid_input("Recovery parent is missing or a Symlink"))?;
+    let recovery_root_identity = project_copy_directory_identity(&expected_recovery_root)
+        .ok_or_else(|| AppError::invalid_input("Recovery root is missing or a Symlink"))?;
+    if std::fs::canonicalize(recovery_parent).map_err(AppError::io)? != recovery_parent
+        || std::fs::canonicalize(&expected_recovery_root).map_err(AppError::io)?
+            != expected_recovery_root
+    {
+        return Err(AppError::invalid_input(
+            "Recovery ancestors have been replaced or redirected by Symlinks",
+        ));
+    }
+    // Safe metadata-only reconciliation is deliberately unavailable when the
+    // original backup still occupies 'previous'. In that case nothing proves
+    // the original manager-owned object has been returned to the target.
+    match std::fs::symlink_metadata(expected_recovery_root.join("previous")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(AppError::invalid_input(
+            "The original previous backup is still present; metadata-only reconciliation would hide an unresolved restoration",
+        )),
+        Err(err) => return Err(AppError::io(err)),
+    }
+    let actual = project_copy_directory_identity(target).ok_or_else(|| {
+        AppError::invalid_input(
+            "The original Copy is not present at its expected Agent path; this action cannot move files",
+        )
+    })?;
+    if actual != identity {
+        return Err(AppError::invalid_input(
+            "The Copy at the Agent path is not the exact previously manager-owned directory (same content is insufficient)",
+        ));
+    }
+    git_skill_versions::verify_recorded_skill_base(
+        &central_repo::skills_dir(),
+        &row.id,
+        &row.skill_id,
+        commit,
+        tree,
+        historical_path,
+    )
+    .map_err(AppError::git)?;
+    if !git_skill_versions::matches_skill_tree(&central_repo::skills_dir(), tree, target)
+        .map_err(AppError::git)?
+    {
+        return Err(AppError::invalid_input(
+            "Restored Copy content is different from the recorded Git Tree; refusing to clear the operation",
+        ));
+    }
+    Ok(RestoredCopyReconciliationPreview {
+        project_id: project.id,
+        operation_id: op.id,
+        kind: op.kind,
+        phase: op.phase,
+        journal_created_at: op.created_at,
+        journal_updated_at: op.updated_at,
+        journal_new_tree_oid: op.new_tree_oid,
+        project_path: project.path,
+        project_root_identity,
+        target_path: op.target_path,
+        target_parent_identity,
+        target_copy_identity: actual,
+        recovery_root: op.recovery_root,
+        recovery_parent_identity,
+        recovery_root_identity,
+        skill_id: op.skill_id,
+        deployment_id: row.id,
+        deployment_updated_at: row.updated_at,
+        base_commit_oid: commit.to_string(),
+        base_tree_oid: tree.to_string(),
+        path_at_commit: historical_path.to_string(),
+    })
+}
+
+/// The explicit user action consumes its preview through a single-use SQLite
+/// compare-and-swap. A stale response is never authority to move or adopt
+/// anything. A successful call leaves the managed Copy and Git pins unchanged.
+pub fn apply_restored_copy_reconciliation_internal(
+    store: &SkillStore,
+    preview: &RestoredCopyReconciliationPreview,
+) -> Result<(), AppError> {
+    let _lock = RepoLock::acquire_foreground("reconcile previously restored managed Copy")
+        .map_err(AppError::io)?;
+    let actual = preview_restored_copy_reconciliation_internal(
+        store,
+        &preview.project_id,
+        &preview.operation_id,
+    )?;
+    if &actual != preview {
+        return Err(AppError::invalid_input(
+            "Recovery reconciliation preview is stale; inspect the operation and Copy again",
+        ));
+    }
+    store
+        .reconcile_restored_managed_copy_journal(
+            &actual.operation_id,
+            &actual.project_id,
+            &actual.deployment_id,
+            &actual.skill_id,
+            &actual.target_path,
+            &actual.recovery_root,
+            &actual.target_copy_identity,
+            &actual.base_commit_oid,
+            &actual.base_tree_oid,
+            &actual.kind,
+            actual.journal_new_tree_oid.as_deref(),
+            actual.journal_created_at,
+            actual.journal_updated_at,
+            actual.deployment_updated_at,
+        )
+        .map_err(AppError::db)?;
+    store.log_audit(
+        AuditDraft::new("reconcile_restored_project_copy")
+            .detail(format!(
+                "project {}, operation {}, deployment {}, original Copy unchanged, journal -> recovery_available",
+                actual.project_id, actual.operation_id, actual.deployment_id,
+            ))
+            .ok(),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn preview_restored_copy_reconciliation(
+    store: State<'_, Arc<SkillStore>>,
+    project_id: String,
+    operation_id: String,
+) -> Result<RestoredCopyReconciliationPreview, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_restored_copy_reconciliation_internal(&store, &project_id, &operation_id)
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn apply_restored_copy_reconciliation(
+    store: State<'_, Arc<SkillStore>>,
+    preview: RestoredCopyReconciliationPreview,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_restored_copy_reconciliation_internal(&store, &preview)
+    })
+    .await?
+}
+
 /// Show a workspace's folder in the OS file manager, selected where the
 /// platform can (Linux `xdg-open` opens the containing directory).
 ///
@@ -6145,6 +6408,258 @@ mod project_plan_tests {
             .unwrap()
             .iter()
             .any(|op| op.id == id && op.phase == "needs_attention"));
+    }
+
+    fn setup_metadata_recovery_test(
+        fx: &Fixture,
+        kind: &str,
+    ) -> (
+        SkillRecord,
+        String,
+        PathBuf,
+        PathBuf,
+        ProjectSkillDeploymentRecord,
+    ) {
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(fx, "s-demo", "demo", "OLD CONTENT");
+        commit_library(fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let recovery = target.parent().unwrap().join(".atm-recovery").join(&id);
+        fs::create_dir_all(&recovery).unwrap();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id.clone(),
+                deployment_id: Some(row.id.clone()),
+                kind: kind.into(),
+                phase: "preparing".into(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: row.base_tree_oid.clone(),
+                new_tree_oid: row.base_tree_oid.clone(),
+                created_at: 1,
+                updated_at: 1,
+                destination_path: None,
+                observed_identity: row.copy_identity.clone(),
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "preparing", "publishing")
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&id, "publishing", "needs_attention")
+            .unwrap();
+        (skill, id, target, recovery, row)
+    }
+
+    #[test]
+    fn manually_restored_exact_copy_can_release_block_by_sql_cas_without_file_moves() {
+        let fx = fixture(&["claude_code"]);
+        let (skill, id, target, root, original) = setup_metadata_recovery_test(&fx, "update");
+        let bytes = fs::read(target.join("SKILL.md")).unwrap();
+        let previous = root.join("previous");
+        rename_directory_no_replace(&target, &previous).unwrap();
+        assert!(
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).is_err()
+        );
+        // Simulate a separate manual restore, not a manager action.
+        rename_directory_no_replace(&previous, &target).unwrap();
+        let preview =
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).unwrap();
+        assert_eq!(
+            preview.target_copy_identity,
+            original.copy_identity.clone().unwrap()
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|o| o.id == id && o.phase == "needs_attention"));
+        let sql = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        sql.execute_batch(
+            "CREATE TRIGGER deny_manual_recovery
+            BEFORE UPDATE OF phase ON project_skill_operations WHEN NEW.phase='recovery_available'
+            BEGIN SELECT RAISE(ABORT,'injected manual reconciliation failed'); END;",
+        )
+        .unwrap();
+        let err = apply_restored_copy_reconciliation_internal(&fx.store, &preview).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected manual reconciliation failed"));
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|o| o.id == id && o.phase == "needs_attention"));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), bytes);
+        sql.execute_batch("DROP TRIGGER deny_manual_recovery")
+            .unwrap();
+        apply_restored_copy_reconciliation_internal(&fx.store, &preview).unwrap();
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|o| o.id == id && o.phase == "recovery_available"));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), bytes);
+        assert_eq!(
+            project_copy_directory_identity(&target),
+            original.copy_identity
+        );
+        assert_eq!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .base_commit_oid,
+            original.base_commit_oid
+        );
+        assert!(!previous.exists());
+        assert!(apply_restored_copy_reconciliation_internal(&fx.store, &preview).is_err());
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        assert_eq!(plan[0].state, ProjectDeployState::AlreadyDeployed);
+        write_skill(Path::new(&skill.central_path), "demo", "NEW CONTENT");
+        commit_library(&fx);
+        let update = plan_managed_project_copy_update(
+            &fx.store,
+            &fx.project_id,
+            "demo",
+            "claude_code",
+            None,
+        )
+        .unwrap();
+        assert!(
+            update.will_change_content,
+            "normal managed Copy version update is unblocked"
+        );
+        update_managed_project_copy_checked(&fx.store, &fx.project_id, &target, None, None)
+            .unwrap();
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("NEW CONTENT"));
+        assert_eq!(
+            fx.store
+                .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy(),)
+                .unwrap()
+                .unwrap()
+                .id,
+            original.id
+        );
+    }
+
+    #[test]
+    fn copy_metadata_reconciliation_rejects_previous_backup_substitution_dirty_tree_and_stale_previews(
+    ) {
+        let fx = fixture(&["claude_code"]);
+        let (_skill, id, target, root, old) = setup_metadata_recovery_test(&fx, "delete");
+        let original = fs::read(target.join("SKILL.md")).unwrap();
+        let valid =
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).unwrap();
+        fs::create_dir(root.join("previous")).unwrap();
+        assert!(
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).is_err()
+        );
+        assert!(apply_restored_copy_reconciliation_internal(&fx.store, &valid).is_err());
+        fs::remove_dir(root.join("previous")).unwrap();
+        let parked = fx.repo.join("parked-original-copy");
+        rename_directory_no_replace(&target, &parked).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("SKILL.md"), &original).unwrap();
+        assert!(git_skill_versions::matches_skill_tree(
+            &central_repo::skills_dir(),
+            old.base_tree_oid.as_deref().unwrap(),
+            &target,
+        )
+        .unwrap());
+        assert!(
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).is_err()
+        );
+        assert!(apply_restored_copy_reconciliation_internal(&fx.store, &valid).is_err());
+        fs::remove_dir_all(&target).unwrap();
+        rename_directory_no_replace(&parked, &target).unwrap();
+        fs::write(target.join("SKILL.md"), "USER MODIFIED").unwrap();
+        assert!(
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).is_err()
+        );
+        fs::write(target.join("SKILL.md"), &original).unwrap();
+        let valid =
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).unwrap();
+        let sql = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        sql.execute(
+            "UPDATE project_skill_operations SET updated_at=updated_at+1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        assert!(apply_restored_copy_reconciliation_internal(&fx.store, &valid).is_err());
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|o| o.id == id && o.phase == "needs_attention"));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), original);
+        assert_eq!(project_copy_directory_identity(&target), old.copy_identity);
+    }
+
+    #[test]
+    fn metadata_reconciliation_requires_original_git_pin_and_unchanged_deployment() {
+        let fx = fixture(&["claude_code"]);
+        let (_skill, id, target, _root, old) = setup_metadata_recovery_test(&fx, "delete");
+        let preview =
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id).unwrap();
+        let connection = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE project_skill_deployments SET updated_at=updated_at+1 WHERE id=?1",
+                [&old.id],
+            )
+            .unwrap();
+        assert!(
+            apply_restored_copy_reconciliation_internal(&fx.store, &preview).is_err(),
+            "a changed deployment version invalidates prior explicit consent"
+        );
+        let pin_name = git_skill_versions::deployment_pin_ref(
+            &old.id,
+            old.base_commit_oid.as_deref().unwrap(),
+        )
+        .unwrap();
+        let repo = git2::Repository::open(central_repo::skills_dir()).unwrap();
+        repo.find_reference(&pin_name).unwrap().delete().unwrap();
+        assert!(
+            preview_restored_copy_reconciliation_internal(&fx.store, &fx.project_id, &id,).is_err(),
+            "missing historical Git pin cannot be substituted with current HEAD"
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == id && op.phase == "needs_attention"));
+        assert!(target.join("SKILL.md").exists());
+        assert_eq!(project_copy_directory_identity(&target), old.copy_identity);
     }
 
     #[test]

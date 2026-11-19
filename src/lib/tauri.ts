@@ -842,6 +842,40 @@ export interface ProjectSkillRecovery {
   updated_at: number;
 }
 
+/** Explicit metadata-only reconciliation for an exact original Copy already
+ * back at its project path. This does NOT move/copy/delete any files. */
+export interface RestoredCopyReconciliationPreview {
+  projectId: string;
+  operationId: string;
+  kind: "update" | "delete";
+  phase: "needs_attention";
+  journalCreatedAt: number;
+  journalUpdatedAt: number;
+  journalNewTreeOid: string | null;
+  projectPath: string;
+  projectRootIdentity: string;
+  targetPath: string;
+  targetParentIdentity: string;
+  targetCopyIdentity: string;
+  recoveryRoot: string;
+  recoveryParentIdentity: string;
+  recoveryRootIdentity: string;
+  skillId: string;
+  deploymentId: string;
+  deploymentUpdatedAt: number;
+  baseCommitOid: string;
+  baseTreeOid: string;
+  pathAtCommit: string;
+}
+
+export const previewRestoredCopyReconciliation = (projectId: string, operationId: string) =>
+  invoke<RestoredCopyReconciliationPreview>(
+    "preview_restored_copy_reconciliation", { projectId, operationId },
+  );
+
+export const applyRestoredCopyReconciliation = (preview: RestoredCopyReconciliationPreview) =>
+  invoke<void>("apply_restored_copy_reconciliation", { preview });
+
 /** Read-only operation journal; no recovery or cleanup side effects. */
 export const getProjectSkillRecoveries = (projectId: string) =>
   invoke<ProjectSkillRecovery[]>("get_project_skill_recoveries", { projectId });

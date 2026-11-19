@@ -960,6 +960,14 @@
       "success": "Copy administrado actualizado."
     },
         "recovery": {
+      "reconcileHint": "Solo si la misma Copy original y administrada ya está de vuelta en la ruta del agente: comprueba su identidad y libera la operación bloqueada. No restaura archivos; las copias ausentes o sustituidas siguen bloqueadas.",
+      "reconcilePreview": "Verificar la Copy original ya restaurada",
+      "reconcileNotEligible": "Esta operación no se puede reconciliar de forma segura",
+      "reconcileFailed": "La reconciliación falló; se conservó el registro",
+      "reconcileVerified": "Se verificaron el directorio original, la base Git inmutable y el registro",
+      "reconcileConsent": "Confirmo que la Copy original ya está en su ruta. Solo cambiará el estado SQLite; no se moverán ni borrarán archivos, copias de seguridad ni referencias Git.",
+      "reconcileConfirm": "Confirmar solo el estado",
+      "reconcileSuccess": "Copy original verificada y operación desbloqueada; recuperación conservada.",
       "retainedPaths": "Directorios conservados observados",
       "retainedPathsNotVerified": "Solo se detectaron estas rutas al consultar. No están verificadas ni autorizadas para restauración.",
       "attentionTitle": "Skills que requieren atención ({{count}})",

@@ -980,6 +980,14 @@
       "success": "Managed Copy updated."
     },
         "recovery": {
+      "reconcileHint": "If the exact original manager-owned Copy is already back at its Agent path, verify it and release the interrupted operation. This does not restore files. Missing or replaced copies remain blocked.",
+      "reconcilePreview": "Check already-restored Copy",
+      "reconcileNotEligible": "This operation cannot be reconciled safely",
+      "reconcileFailed": "Reconciliation failed; the original recovery record remains",
+      "reconcileVerified": "Original directory, immutable Git baseline and journal verified",
+      "reconcileConsent": "I confirm that the original Copy is already restored. Only the SQLite operation status will change; no files, backups or Git pins will be moved or deleted.",
+      "reconcileConfirm": "Confirm metadata-only reconciliation",
+      "reconcileSuccess": "Original Copy verified. The interrupted operation has been released; retained recovery data remains untouched.",
       "retainedPaths": "Observed retained directories",
       "retainedPathsNotVerified": "Listed paths were observed during this read, not verified or authorized for restoration.",
       "attentionTitle": "Project Skills need attention ({{count}})",

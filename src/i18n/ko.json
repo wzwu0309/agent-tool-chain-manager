@@ -960,6 +960,14 @@
       "success": "관리되는 Copy가 업데이트되었습니다."
     },
         "recovery": {
+      "reconcileHint": "기존에 관리자가 배포한 동일한 Copy가 Agent 원래 경로에 이미 돌아온 경우에만 신원을 확인하고 중단된 작업을 해제합니다. 파일은 복구하거나 이동하지 않습니다. 누락·교체된 Copy는 계속 차단됩니다.",
+      "reconcilePreview": "이미 복원된 원본 Copy 확인",
+      "reconcileNotEligible": "이 작업은 안전하게 상태를 정리할 수 없습니다",
+      "reconcileFailed": "정리 실패, 기존 복구 기록이 보존되었습니다",
+      "reconcileVerified": "원본 디렉터리, 불변 Git 기준 및 작업 기록 검증 완료",
+      "reconcileConsent": "원래 관리 대상 Copy가 경로에 이미 돌아왔음을 확인합니다. SQLite 작업 상태만 변경하며 파일, 복구 백업 또는 Git 핀을 이동하거나 삭제하지 않습니다.",
+      "reconcileConfirm": "관리 상태만 정리 확인",
+      "reconcileSuccess": "원본 Copy 검증 및 중단 작업 차단 해제 완료. 복구 데이터는 변경되지 않았습니다.",
       "retainedPaths": "확인된 보관 하위 디렉터리",
       "retainedPathsNotVerified": "조회 시 관찰된 경로일 뿐이며 복원에 대한 검증이나 권한 부여를 의미하지 않습니다.",
       "attentionTitle": "프로젝트 Skill 확인 필요 ({{count}})",

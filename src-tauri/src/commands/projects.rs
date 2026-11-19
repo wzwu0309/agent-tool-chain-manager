@@ -602,6 +602,30 @@ fn rename_directory_no_replace_expected(
     }
 }
 
+/// Journal phase changes are not optional. A failed SQLite CAS means the
+/// status was NOT persisted; never report "needs_attention saved" to the UI
+/// or logs when the database is still at publishing/preparing. Keep the
+/// original operation pending so the next inspection can retry.
+fn record_startup_recovery_transition(
+    store: &SkillStore,
+    op: &ProjectSkillOperationRecord,
+    next_phase: &str,
+    success_message: String,
+    notices: &mut Vec<String>,
+) {
+    match store.transition_project_skill_operation(&op.id, &op.phase, next_phase) {
+        Ok(()) => notices.push(success_message),
+        Err(err) => {
+            let message = format!(
+                "Recovery state NOT persisted for operation {} ({}, project {}): transition {} -> {} failed: {}; original journal remains pending; no file move attempted; retry inspection",
+                op.id, op.kind, op.project_id, op.phase, next_phase, err
+            );
+            log::error!("{message}");
+            notices.push(message);
+        }
+    }
+}
+
 /// Conservative startup inspection of interrupted project Skill operations.
 /// An interrupted process does not grant a new destructive authorization:
 /// startup may advance journal phases but never move a Copy, Symlink or
@@ -689,16 +713,17 @@ pub fn recover_incomplete_project_skill_operations(
             let original = project_target_identity_string(&target);
             let moved = project_target_identity_string(destination);
             if original.as_deref() == expected_identity && moved.is_none() {
-                let _ = store.transition_project_skill_operation(
-                    &op.id,
-                    &op.phase,
+                record_startup_recovery_transition(
+                    store,
+                    &op,
                     "recovery_available",
+                    format!(
+                        "Interrupted toggle {} left original entry at {}",
+                        op.id,
+                        target.display(),
+                    ),
+                    &mut notices,
                 );
-                notices.push(format!(
-                    "Interrupted toggle {} left original entry at {}",
-                    op.id,
-                    target.display(),
-                ));
                 continue;
             }
             if op.phase == "publishing"
@@ -710,15 +735,14 @@ pub fn recover_incomplete_project_skill_operations(
                 // compare the source inode with the journal's expected inode.
                 // Even a successful pre-rename stat cannot justify moving an
                 // unrelated object that was swapped in the remaining gap.
-                let _ = store.transition_project_skill_operation(
-                    &op.id,
-                    "publishing",
-                    "needs_attention",
+                record_startup_recovery_transition(
+                    store, &op, "needs_attention",
+                    format!(
+                        "Manual restore required for interrupted toggle {}: original {}, retained destination {} (no filesystem move attempted)",
+                        op.id, target.display(), destination.display(),
+                    ),
+                    &mut notices,
                 );
-                notices.push(format!(
-                    "Manual restore required for interrupted toggle {}: original {}, retained destination {} (no filesystem move attempted)",
-                    op.id, target.display(), destination.display(),
-                ));
                 continue;
             }
             notices.push(format!(
@@ -746,17 +770,18 @@ pub fn recover_incomplete_project_skill_operations(
                 std::fs::symlink_metadata(&target).is_ok()
             };
             if unchanged_position {
-                let _ = store.transition_project_skill_operation(
-                    &op.id,
-                    "preparing",
+                record_startup_recovery_transition(
+                    store,
+                    &op,
                     "recovery_available",
+                    format!(
+                        "Interrupted {} preparation {} retained at {}",
+                        op.kind,
+                        op.id,
+                        recovery_root.display(),
+                    ),
+                    &mut notices,
                 );
-                notices.push(format!(
-                    "Interrupted {} preparation {} retained at {}",
-                    op.kind,
-                    op.id,
-                    recovery_root.display(),
-                ));
                 continue;
             }
         }
@@ -764,16 +789,17 @@ pub fn recover_incomplete_project_skill_operations(
             && op.kind == "deploy"
             && std::fs::symlink_metadata(&target).is_err()
         {
-            let _ = store.transition_project_skill_operation(
-                &op.id,
-                "publishing",
+            record_startup_recovery_transition(
+                store,
+                &op,
                 "recovery_available",
+                format!(
+                    "Interrupted deploy {} staged content retained at {}",
+                    op.id,
+                    recovery_root.display(),
+                ),
+                &mut notices,
             );
-            notices.push(format!(
-                "Interrupted deploy {} staged content retained at {}",
-                op.id,
-                recovery_root.display(),
-            ));
             continue;
         }
         if op.phase == "publishing" && matches!(op.kind.as_str(), "update" | "delete") {
@@ -793,16 +819,15 @@ pub fn recover_incomplete_project_skill_operations(
                 // Read-only startup recovery: never rename user-owned bytes
                 // after a prior process has died. The stored inode narrows
                 // races but cannot authorize an atomic conditional rename.
-                let _ = store.transition_project_skill_operation(
-                    &op.id,
-                    "publishing",
-                    "needs_attention",
+                record_startup_recovery_transition(
+                    store, &op, "needs_attention",
+                    format!(
+                        "Manual restore required for interrupted {} {}: target {}, preserved backup {} (journal identity {}; no filesystem move attempted)",
+                        op.kind, op.id, target.display(), previous.display(),
+                        if backup_matches_journal { "matches" } else { "missing or changed" },
+                    ),
+                    &mut notices,
                 );
-                notices.push(format!(
-                    "Manual restore required for interrupted {} {}: target {}, preserved backup {} (journal identity {}; no filesystem move attempted)",
-                    op.kind, op.id, target.display(), previous.display(),
-                    if backup_matches_journal { "matches" } else { "missing or changed" },
-                ));
                 continue;
             }
         }
@@ -913,8 +938,32 @@ pub struct ProjectSkillRecoveryDto {
     pub destination_path: Option<String>,
     pub target_exists: bool,
     pub recovery_root_exists: bool,
+    /// Read-only observed candidates, NOT verified ownership or safe
+    /// restoration sources; paths can be replaced by an external writer.
+    pub retained_paths: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Show the *actual* known retained subobjects, not just the operation
+/// root. This is a non-authoritative, read-only snapshot; the UI must never
+/// offer a file move/delete from this list or infer ownership from it.
+fn observed_retained_recovery_paths(recovery_root: &str) -> Vec<String> {
+    let root = Path::new(recovery_root);
+    if !std::fs::symlink_metadata(root)
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+    {
+        return Vec::new();
+    }
+    ["previous", "failed-new", "recovered", "new"]
+        .iter()
+        .map(|name| root.join(name))
+        .filter(|candidate| {
+            std::fs::symlink_metadata(candidate)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .collect()
 }
 
 pub fn get_project_skill_recoveries_internal(
@@ -943,6 +992,7 @@ pub fn get_project_skill_recoveries_internal(
             target_exists: std::fs::symlink_metadata(&op.target_path).is_ok(),
             recovery_root_exists: std::fs::symlink_metadata(&op.recovery_root)
                 .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()),
+            retained_paths: observed_retained_recovery_paths(&op.recovery_root),
             target_path: op.target_path,
             recovery_root: op.recovery_root,
             destination_path: op.destination_path,
@@ -956,6 +1006,60 @@ pub fn get_project_skill_recoveries_internal(
             .then(a.operation_id.cmp(&b.operation_id))
     });
     Ok(rows)
+}
+
+/// Read-only cross-project recovery inbox for *active* workspaces. Keep
+/// detached/unregistered records in their existing separate recovery index;
+/// this query never changes journal phases or file bytes.
+pub fn get_active_project_skill_recoveries_internal(
+    store: &SkillStore,
+) -> Result<Vec<ProjectSkillRecoveryDto>, AppError> {
+    let active: std::collections::HashSet<String> = store
+        .get_all_projects()
+        .map_err(AppError::db)?
+        .into_iter()
+        .map(|project| project.id)
+        .collect();
+    let mut rows = store
+        .pending_project_skill_operations()
+        .map_err(AppError::db)?
+        .into_iter()
+        .filter(|op| active.contains(&op.project_id))
+        .map(|op| ProjectSkillRecoveryDto {
+            operation_id: op.id,
+            project_id: op.project_id,
+            skill_id: op.skill_id,
+            deployment_id: op.deployment_id,
+            kind: op.kind,
+            phase: op.phase,
+            target_exists: std::fs::symlink_metadata(&op.target_path).is_ok(),
+            recovery_root_exists: std::fs::symlink_metadata(&op.recovery_root)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()),
+            retained_paths: observed_retained_recovery_paths(&op.recovery_root),
+            target_path: op.target_path,
+            recovery_root: op.recovery_root,
+            destination_path: op.destination_path,
+            created_at: op.created_at,
+            updated_at: op.updated_at,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.operation_id.cmp(&b.operation_id))
+    });
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn get_active_project_skill_recoveries(
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<Vec<ProjectSkillRecoveryDto>, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        get_active_project_skill_recoveries_internal(&store)
+    })
+    .await?
 }
 
 /// Historical recovery journal rows whose ProjectId is no longer registered.
@@ -980,6 +1084,7 @@ pub fn get_unregistered_project_recoveries_internal(
             target_exists: std::fs::symlink_metadata(&op.target_path).is_ok(),
             recovery_root_exists: std::fs::symlink_metadata(&op.recovery_root)
                 .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()),
+            retained_paths: observed_retained_recovery_paths(&op.recovery_root),
             target_path: op.target_path,
             recovery_root: op.recovery_root,
             destination_path: op.destination_path,
@@ -5658,7 +5763,19 @@ mod project_plan_tests {
         assert_eq!(orphaned[0].operation_id, old_id);
         assert_eq!(orphaned[0].project_id, old_project.id);
         assert!(orphaned[0].recovery_root_exists);
+        assert_eq!(
+            orphaned[0].retained_paths,
+            vec![old_recovery.join("previous").to_string_lossy().to_string()]
+        );
         assert_eq!(orphaned[0].phase, "cleanup_pending");
+        let active_inbox = get_active_project_skill_recoveries_internal(&fx.store).unwrap();
+        assert_eq!(active_inbox.len(), 1);
+        assert_eq!(active_inbox[0].operation_id, active_id);
+        assert_eq!(active_inbox[0].project_id, fx.project_id);
+        assert!(
+            active_inbox.iter().all(|op| op.operation_id != old_id),
+            "legacy unregistered recovery must not masquerade as an active project alert"
+        );
         assert!(
             get_project_skill_recoveries_internal(&fx.store, &fx.project_id,)
                 .unwrap()
@@ -5686,6 +5803,10 @@ mod project_plan_tests {
             let link_list = get_unregistered_project_recoveries_internal(&fx.store).unwrap();
             assert_eq!(link_list.len(), 1);
             assert!(!link_list[0].recovery_root_exists);
+            assert!(
+                link_list[0].retained_paths.is_empty(),
+                "read-only list must not follow symlink to another recovery directory"
+            );
         }
     }
 
@@ -6024,6 +6145,175 @@ mod project_plan_tests {
             .unwrap()
             .iter()
             .any(|op| op.id == id && op.phase == "needs_attention"));
+    }
+
+    #[test]
+    fn startup_recovery_sqlite_transition_failure_is_reported_and_retryable() {
+        let fx = fixture(&["claude_code"]);
+        fx.store.set_setting("sync_mode", "copy").unwrap();
+        let skill = library_skill(&fx, "s-demo", "demo", "BEFORE");
+        commit_library(&fx);
+        let plan = plan_project_deploy(
+            &fx.store,
+            &fx.project_id,
+            &ids(&[&skill]),
+            &["claude_code".into()],
+        )
+        .unwrap();
+        apply_project_deploy(&fx.store, &plan).unwrap();
+        let target = fx.repo.join(".claude/skills/demo");
+        let original_bytes = fs::read(target.join("SKILL.md")).unwrap();
+        let row = fx
+            .store
+            .get_project_skill_deployment(&fx.project_id, &target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let recovery = target
+            .parent()
+            .unwrap()
+            .join(".atm-recovery")
+            .join(&operation_id);
+        fs::create_dir_all(&recovery).unwrap();
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: operation_id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: skill.id.clone(),
+                deployment_id: Some(row.id.clone()),
+                kind: "update".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: row.base_tree_oid.clone(),
+                new_tree_oid: row.base_tree_oid.clone(),
+                created_at: 1,
+                updated_at: 1,
+                destination_path: None,
+                observed_identity: row.copy_identity.clone(),
+            })
+            .unwrap();
+        fx.store
+            .transition_project_skill_operation(&operation_id, "preparing", "publishing")
+            .unwrap();
+        let previous = recovery.join("previous");
+        rename_directory_no_replace(&target, &previous).unwrap();
+
+        let connection = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        connection.execute_batch(
+            "CREATE TRIGGER block_startup_attention BEFORE UPDATE OF phase ON project_skill_operations
+             WHEN NEW.phase='needs_attention'
+             BEGIN SELECT RAISE(ABORT,'injected startup SQLite failure'); END;",
+        ).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&fx.store).unwrap();
+        assert!(
+            notices.iter().any(|n| n.contains(&operation_id)
+                && n.contains("NOT persisted")
+                && n.contains("injected startup SQLite failure")),
+            "{notices:?}"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|n| n.contains("Manual restore required") && n.contains(&operation_id)),
+            "must not falsely report success"
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == operation_id && op.phase == "publishing"));
+        assert!(!target.exists());
+        assert_eq!(fs::read(previous.join("SKILL.md")).unwrap(), original_bytes);
+
+        connection
+            .execute_batch("DROP TRIGGER block_startup_attention")
+            .unwrap();
+        let retry_notices = recover_incomplete_project_skill_operations(&fx.store).unwrap();
+        assert!(
+            retry_notices
+                .iter()
+                .any(|n| n.contains(&operation_id) && n.contains("Manual restore required")),
+            "{retry_notices:?}"
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == operation_id && op.phase == "needs_attention"));
+        assert!(!target.exists());
+        assert_eq!(fs::read(previous.join("SKILL.md")).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn startup_preparing_phase_transition_failure_reports_instead_of_claiming_recovery() {
+        let fx = fixture(&["claude_code"]);
+        let target = fx.repo.join(".claude/skills/never-published");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let recovery = target
+            .parent()
+            .unwrap()
+            .join(".atm-recovery")
+            .join(&operation_id);
+        fx.store
+            .insert_project_skill_operation(&ProjectSkillOperationRecord {
+                id: operation_id.clone(),
+                project_id: fx.project_id.clone(),
+                skill_id: "never-published".to_string(),
+                deployment_id: None,
+                kind: "deploy".to_string(),
+                phase: "preparing".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                recovery_root: recovery.to_string_lossy().to_string(),
+                base_tree_oid: None,
+                new_tree_oid: None,
+                created_at: 1,
+                updated_at: 1,
+                destination_path: None,
+                observed_identity: None,
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(fx._tmp.path().join("skills.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER block_prep_transition BEFORE UPDATE OF phase ON project_skill_operations
+             WHEN NEW.phase='recovery_available'
+             BEGIN SELECT RAISE(ABORT,'injected recovery availability failure'); END;",
+        ).unwrap();
+        let notices = recover_incomplete_project_skill_operations(&fx.store).unwrap();
+        assert!(
+            notices.iter().any(|n| n.contains(&operation_id)
+                && n.contains("NOT persisted")
+                && n.contains("injected recovery availability failure")),
+            "{notices:?}"
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == operation_id && op.phase == "preparing"));
+        assert!(!target.exists());
+        assert!(!recovery.exists());
+        db.execute_batch("DROP TRIGGER block_prep_transition")
+            .unwrap();
+        let retried = recover_incomplete_project_skill_operations(&fx.store).unwrap();
+        assert!(
+            retried
+                .iter()
+                .any(|n| n.contains(&operation_id) && n.contains("Interrupted deploy preparation")),
+            "{retried:?}"
+        );
+        assert!(fx
+            .store
+            .pending_project_skill_operations()
+            .unwrap()
+            .iter()
+            .any(|op| op.id == operation_id && op.phase == "recovery_available"));
+        assert!(!target.exists());
+        assert!(!recovery.exists());
     }
 
     #[test]
@@ -8059,6 +8349,13 @@ mod project_plan_tests {
             .unwrap()
             .iter()
             .all(|p| p.id != fx.project_id));
+        assert!(
+            get_active_project_skill_recoveries_internal(&fx.store)
+                .unwrap()
+                .iter()
+                .all(|r| r.project_id != fx.project_id),
+            "detached project must remain solely in its independent read-only archive index"
+        );
         let detached = fx
             .store
             .get_detached_project_by_id(&fx.project_id)

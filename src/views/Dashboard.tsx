@@ -1,16 +1,42 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { listen } from "@tauri-apps/api/event";
 import { Layers, CheckCircle2, Bot, Plus, Download, AlertTriangle, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useApp } from "../context/AppContext";
 import { AgentControlSetupCard } from "../components/AgentControlSetupCard";
 import * as api from "../lib/tauri";
 import type { ProjectSkillRecovery } from "../lib/tauri";
+import { recoveryNeedsAttention, recoveryNeedsFollowUp, recoveryMayBeInProgress } from "../lib/projectRecovery";
 
 export function Dashboard() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { tools, projects, managedSkills, openSkillDetailById } = useApp();
+
+  const [activeRecoveries, setActiveRecoveries] = useState<ProjectSkillRecovery[]>([]);
+  const [activeRecoveryError, setActiveRecoveryError] = useState(false);
+  const [startupRecoveryScanFailed, setStartupRecoveryScanFailed] = useState(false);
+  const activeRecoveryRequestRef = useRef(0);
+  const loadActiveRecoveries = useCallback(async () => {
+    const request = ++activeRecoveryRequestRef.current;
+    try {
+      const records = await api.getActiveProjectSkillRecoveries();
+      if (request === activeRecoveryRequestRef.current) {
+        setActiveRecoveries(records);
+        setActiveRecoveryError(false);
+      }
+    } catch (error) {
+      console.error("Failed to load active project recovery inbox:", error);
+      if (request === activeRecoveryRequestRef.current) setActiveRecoveryError(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    const requestGuard = activeRecoveryRequestRef;
+    void loadActiveRecoveries();
+    return () => { requestGuard.current++; };
+  }, [loadActiveRecoveries, projects.length]);
 
   const [orphanedRecoveries, setOrphanedRecoveries] = useState<ProjectSkillRecovery[]>([]);
   const [orphanError, setOrphanError] = useState(false);
@@ -36,9 +62,35 @@ export function Dashboard() {
   useEffect(() => {
     // A project detached from the Sidebar disappears from the active list,
     // so refresh this independent read-only recovery index immediately.
+    const requestGuard = orphanRequestRef;
     void loadOrphans();
-    return () => { orphanRequestRef.current++; };
+    return () => { requestGuard.current++; };
   }, [loadOrphans, projects.length]);
+
+  useEffect(() => {
+    let disposed = false;
+    const listener = listen<{ ok: boolean }>("project-skill-recovery-inspection-finished", (event) => {
+      if (disposed) return;
+      setStartupRecoveryScanFailed(!event.payload.ok);
+      void loadActiveRecoveries();
+      void loadOrphans();
+    }).then((stop) => {
+      // Also read once *after* subscription is attached: otherwise the
+      // background scan can finish between the first query and listen().
+      if (!disposed) {
+        void loadActiveRecoveries();
+        void loadOrphans();
+      }
+      return stop;
+    });
+    return () => {
+      disposed = true;
+      void listener.then((stop) => stop()).catch(() => {});
+    };
+  }, [loadActiveRecoveries, loadOrphans]);
+
+  const actionRecoveries = activeRecoveries.filter(recoveryNeedsFollowUp);
+  const urgentRecoveries = actionRecoveries.filter(recoveryNeedsAttention);
 
   const enabledAgents = useMemo(
     () => tools.filter((tool) => tool.installed && tool.enabled),
@@ -80,6 +132,62 @@ export function Dashboard() {
       </div>
 
       <AgentControlSetupCard />
+
+      {(actionRecoveries.length > 0 || activeRecoveryError || startupRecoveryScanFailed) && (
+        <section role="alert" className="app-panel border border-amber-500/40 p-4">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="flex items-center gap-2 text-[13px] font-semibold text-amber-700 dark:text-amber-300">
+              <AlertTriangle className="h-4 w-4" />
+              {t("dashboard.recoveryInbox.title", { count: actionRecoveries.length })}
+            </h2>
+            <button type="button" onClick={() => { void loadActiveRecoveries(); void loadOrphans(); }}
+              className="rounded-md p-1.5 text-muted hover:bg-surface-hover"
+              aria-label={t("common.refresh")} title={t("common.refresh")}>
+              <RefreshCw className="h-4 w-4" />
+            </button>
+          </div>
+          <p className="mt-1 text-[12px] text-secondary">
+            {urgentRecoveries.length > 0
+              ? t("dashboard.recoveryInbox.mayBeUnavailable")
+              : t("dashboard.recoveryInbox.readOnly")}
+          </p>
+          {(activeRecoveryError || startupRecoveryScanFailed) && (
+            <p className="mt-2 text-[12px] text-amber-700 dark:text-amber-300">
+              {t("dashboard.recoveryInbox.statusUncertain")}
+            </p>
+          )}
+          <div className="mt-3 space-y-2">
+            {actionRecoveries.map((record) => (
+              <div key={record.operation_id} className="rounded-md border border-border p-2 text-[12px]">
+                <p className="font-medium text-secondary">
+                  {projects.find((project) => project.id === record.project_id)?.name ?? record.project_id}
+                  {" · "}{record.kind}{" · "}{t("project.recovery.phase." + record.phase, { defaultValue: record.phase })}
+                </p>
+                <p className="mt-1 text-muted">
+                  {recoveryMayBeInProgress(record)
+                    ? t("project.recovery.mayBeInterrupted")
+                    : t("project.recovery.manualReview")}
+                </p>
+                <p className="mt-1 break-all text-muted">
+                  {t("project.recovery.target")}: {record.target_path}
+                  {" · "}{record.target_exists
+                    ? t("project.recovery.targetPresent") : t("project.recovery.targetMissing")}
+                </p>
+                {record.retained_paths.length > 0 && (
+                  <p className="mt-1 break-all text-muted">
+                    {t("project.recovery.retainedPaths")}: {record.retained_paths.join(", ")}
+                  </p>
+                )}
+                <button type="button"
+                  className="mt-1 rounded-lg border border-border px-2 py-1 text-secondary hover:bg-surface-hover"
+                  onClick={() => navigate("/project/" + encodeURIComponent(record.project_id))}>
+                  {t("dashboard.recoveryInbox.inspect")}
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-3 gap-3.5">

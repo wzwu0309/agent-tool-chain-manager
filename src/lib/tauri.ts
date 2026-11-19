@@ -836,6 +836,8 @@ export interface ProjectSkillRecovery {
   destination_path: string | null;
   target_exists: boolean;
   recovery_root_exists: boolean;
+  /** Observed child directories only, not authenticated restoration sources. */
+  retained_paths: string[];
   created_at: number;
   updated_at: number;
 }
@@ -843,6 +845,10 @@ export interface ProjectSkillRecovery {
 /** Read-only operation journal; no recovery or cleanup side effects. */
 export const getProjectSkillRecoveries = (projectId: string) =>
   invoke<ProjectSkillRecovery[]>("get_project_skill_recoveries", { projectId });
+
+/** Read-only recovery inbox across currently active projects (no file changes). */
+export const getActiveProjectSkillRecoveries = () =>
+  invoke<ProjectSkillRecovery[]>("get_active_project_skill_recoveries");
 
 /** Exact retained recovery object identity for an explicit project detach. */
 export interface ProjectDetachRecoveryRef {

@@ -870,19 +870,31 @@ pub fn run() {
                 log::error!("{detail}");
             }
 
-            // Restore only interrupted project Copy operations whose target
-            // is absent; ambiguous occupied targets require manual recovery.
+            // Inspect interrupted project Skill operations without moving
+            // user files. Refresh UI inbox when asynchronous inspection ends.
             let store_for_project_recovery = store_for_setup.clone();
+            let app_for_project_recovery = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                match commands::projects::recover_incomplete_project_skill_operations(
+                let inspection = commands::projects::recover_incomplete_project_skill_operations(
                     &store_for_project_recovery,
-                ) {
+                );
+                match &inspection {
                     Ok(notices) => {
                         for notice in notices {
                             log::warn!("project Skill recovery: {notice}");
                         }
                     }
                     Err(err) => log::error!("project Skill recovery failed: {err}"),
+                }
+                if let Err(err) = app_for_project_recovery.emit(
+                    "project-skill-recovery-inspection-finished",
+                    serde_json::json!({
+                        "ok": inspection.as_ref().is_ok_and(|notices| {
+                            !notices.iter().any(|notice| notice.contains("NOT persisted"))
+                        }),
+                    }),
+                ) {
+                    log::error!("failed to signal recovery inspection completion: {err}");
                 }
             });
 
@@ -1114,6 +1126,7 @@ pub fn run() {
             // Projects
             commands::projects::get_projects,
             commands::projects::get_project_skill_recoveries,
+            commands::projects::get_active_project_skill_recoveries,
             commands::projects::get_unregistered_project_skill_recoveries,
             commands::projects::add_project,
             commands::projects::add_linked_workspace,

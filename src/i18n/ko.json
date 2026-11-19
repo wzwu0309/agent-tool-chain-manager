@@ -69,6 +69,13 @@
     }
   },
   "dashboard": {
+    "recoveryInbox": {
+      "title": "검토할 프로젝트 Skill 작업 ({{count}})",
+      "mayBeUnavailable": "중단 후 Agent가 기대하는 위치에 Skill이 없을 수 있습니다. 재시도 전에 보관된 파일을 확인하세요.",
+      "readOnly": "일부 중단된 작업은 확인이 필요합니다. 파일은 자동으로 복원되지 않았습니다.",
+      "statusUncertain": "복구 검사나 데이터베이스 읽기에 실패했을 수 있습니다. 상태가 최신이 아닐 수 있으므로 새로 고침하세요.",
+      "inspect": "프로젝트 복구 기록 보기"
+    },
     "orphanedRecovery": {
       "title": "등록 해제된 프로젝트의 복구 기록",
       "readOnly": "이전 버전에서는 프로젝트 등록 해제 후에도 복구 데이터가 남을 수 있습니다. 이 목록은 읽기 전용이며 파일을 인수하거나 복구하거나 삭제하지 않습니다.",
@@ -953,6 +960,29 @@
       "success": "관리되는 Copy가 업데이트되었습니다."
     },
         "recovery": {
+      "retainedPaths": "확인된 보관 하위 디렉터리",
+      "retainedPathsNotVerified": "조회 시 관찰된 경로일 뿐이며 복원에 대한 검증이나 권한 부여를 의미하지 않습니다.",
+      "attentionTitle": "프로젝트 Skill 확인 필요 ({{count}})",
+      "followUpTitle": "확인할 복구 기록 ({{count}})",
+      "attentionBody": "일부 Skill이 Agent의 예상 경로에 없거나 미완료 작업 때문에 다음 변경이 차단될 수 있습니다.",
+      "noAutoRestore": "기존 파일은 보관됩니다. 자동 이동이나 원클릭 복원은 제공되지 않습니다. 아래 경로를 확인하고 SQLite를 직접 수정하지 마세요.",
+      "inspectLocations": "보관 위치 확인",
+      "queryFailed": "복구 상태를 확인할 수 없음",
+      "copied": "경로를 복사했습니다",
+      "mayBeInterrupted": "작업이 완료되지 않았거나 중단되었을 수 있습니다. 다른 프로세스에서 실행 중인지 먼저 확인하세요.",
+      "manualReview": "이 작업은 수동 검토가 필요하며 파일 이동이나 삭제를 승인하지 않습니다.",
+      "targetPresent": "대상 항목 있음",
+      "targetMissing": "대상 항목 없음; Agent 사용에 영향 가능",
+      "destination": "다른 Skill 위치",
+      "copyLocation": "복구 경로 복사",
+      "copyDestination": "다른 위치 복사",
+      "phase": {
+        "needs_attention": "수동 확인 필요",
+        "preparing": "준비 단계 미완료",
+        "publishing": "게시 단계 미완료",
+        "recovery_available": "확인할 복구 데이터 있음",
+        "cleanup_pending": "백업 보관 중"
+      },
       "title": "복구 기록",
       "readOnly": "읽기 전용입니다. 복구 복사본은 자동으로 정리되지 않습니다. 수동 작업 전에 내용을 확인하세요.",
       "saved": "복구 경로 있음",

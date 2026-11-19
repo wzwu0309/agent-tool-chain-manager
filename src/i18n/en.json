@@ -69,6 +69,13 @@
     }
   },
   "dashboard": {
+    "recoveryInbox": {
+      "title": "Project Skill operations to review ({{count}})",
+      "mayBeUnavailable": "A Skill may be missing from its expected Agent path after an interruption. Check the retained data before retrying.",
+      "readOnly": "Some interrupted operations need inspection. No files have been automatically restored.",
+      "statusUncertain": "Recovery scan or database read may have failed. The persisted operation status may be outdated; refresh to check again.",
+      "inspect": "Inspect project recovery"
+    },
     "orphanedRecovery": {
       "title": "Recovery records from unregistered projects",
       "readOnly": "Old versions could unregister projects while their recovery files remained. This is a read-only index; no file is adopted, restored or deleted.",
@@ -973,6 +980,29 @@
       "success": "Managed Copy updated."
     },
         "recovery": {
+      "retainedPaths": "Observed retained directories",
+      "retainedPathsNotVerified": "Listed paths were observed during this read, not verified or authorized for restoration.",
+      "attentionTitle": "Project Skills need attention ({{count}})",
+      "followUpTitle": "Recovery records need review ({{count}})",
+      "attentionBody": "Some Skills may not be available where your Agent expects them. A pending operation can block further changes.",
+      "noAutoRestore": "The manager has preserved the existing files. No automatic file move or one-click restore is available. Review these paths before taking manual action; do not edit the SQLite database.",
+      "inspectLocations": "Inspect retained locations",
+      "queryFailed": "Unable to verify recovery state",
+      "copied": "Path copied",
+      "mayBeInterrupted": "The operation is incomplete or may have been interrupted. Confirm no process is still running before taking action.",
+      "manualReview": "A previous operation needs review. This status does not authorize moving or deleting files.",
+      "targetPresent": "entry exists",
+      "targetMissing": "entry missing; Agent access may be affected",
+      "destination": "Other Skill location",
+      "copyLocation": "Copy recovery path",
+      "copyDestination": "Copy other location",
+      "phase": {
+        "needs_attention": "Manual attention required",
+        "preparing": "Incomplete preparation",
+        "publishing": "Incomplete publication",
+        "recovery_available": "Recovery available for inspection",
+        "cleanup_pending": "Backup retained"
+      },
       "title": "Recovery records",
       "readOnly": "Read-only history. Recovery copies are never cleaned automatically; inspect contents before any manual action.",
       "saved": "recovery location exists",

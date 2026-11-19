@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   FolderOpen,
@@ -7,6 +8,7 @@ import {
   LayoutGrid,
   List,
   RefreshCw,
+  AlertTriangle,
   GitCommitHorizontal,
   FileText,
   Download,
@@ -49,6 +51,7 @@ import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { useRevealProjectFolder } from "../hooks/useRevealProjectFolder";
 import { AddSkillsSheet } from "../components/AddSkillsSheet";
 import { ProjectCopyVersionDialog } from "../components/ProjectCopyVersionDialog";
+import { recoveryNeedsAttention, recoveryNeedsFollowUp, recoveryMayBeInProgress } from "../lib/projectRecovery";
 const projectLastUsedAgentsKey = (projectId: string) =>
   `project_last_used_export_agents:${projectId}`;
 
@@ -140,6 +143,7 @@ export function ProjectDetail() {
   const [recoveries, setRecoveries] = useState<ProjectSkillRecovery[]>([]);
   const [recoveryExpanded, setRecoveryExpanded] = useState(false);
   const [recoveryLoading, setRecoveryLoading] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const recoveryRequestRef = useRef(0);
   const [projectAgentTargets, setProjectAgentTargets] = useState<ProjectAgentTarget[]>([]);
   const [loading, setLoading] = useState(true);
@@ -220,11 +224,15 @@ export function ProjectDetail() {
     setRecoveryLoading(true);
     try {
       const records = await api.getProjectSkillRecoveries(id);
-      if (recoveryRequestRef.current === requestId) setRecoveries(records);
+      if (recoveryRequestRef.current === requestId) {
+        setRecoveries(records);
+        setRecoveryError(null);
+        if (records.some(recoveryNeedsAttention)) setRecoveryExpanded(true);
+      }
     } catch (e) {
       if (recoveryRequestRef.current === requestId) {
         console.error("Failed to load project Skill recovery operations:", e);
-        toast.error(getErrorMessage(e, t("common.error")));
+        setRecoveryError(getErrorMessage(e, t("common.error")));
       }
     } finally {
       if (recoveryRequestRef.current === requestId) setRecoveryLoading(false);
@@ -234,7 +242,24 @@ export function ProjectDetail() {
   useEffect(() => {
     setRecoveries([]);
     setRecoveryExpanded(false);
+    setRecoveryError(null);
     void loadRecoveries();
+  }, [loadRecoveries]);
+
+  useEffect(() => {
+    let disposed = false;
+    const listener = listen("project-skill-recovery-inspection-finished", () => {
+      if (!disposed) void loadRecoveries();
+    }).then((stop) => {
+      // Close the query/subscribe gap if startup inspection completed
+      // while the Tauri event listener was being registered.
+      if (!disposed) void loadRecoveries();
+      return stop;
+    });
+    return () => {
+      disposed = true;
+      void listener.then((stop) => stop()).catch(() => {});
+    };
   }, [loadRecoveries]);
 
   useEffect(() => {
@@ -270,6 +295,17 @@ export function ProjectDetail() {
       navigate("/");
     }
   }, [project, loading, navigate]);
+
+  const recoveryAttention = recoveries.filter(recoveryNeedsAttention);
+  const recoveryFollowUp = recoveries.filter(recoveryNeedsFollowUp);
+  const copyRecoveryPath = async (path: string) => {
+    try {
+      await navigator.clipboard.writeText(path);
+      toast.success(t("project.recovery.copied"));
+    } catch (error) {
+      toast.error(getErrorMessage(error, t("common.error")));
+    }
+  };
 
   const groupedSkills = useMemo<ProjectSkillGroup[]>(() => {
     const groups = new Map<string, ProjectSkillGroup>();
@@ -1196,6 +1232,30 @@ export function ProjectDetail() {
         )}
       </div>
 
+      {recoveryError && (
+        <div role="alert" className="mx-1 mb-3 rounded-md border border-amber-500/30 p-3 text-[12px] text-amber-700 dark:text-amber-300">
+          <strong>{t("project.recovery.queryFailed")}</strong>: {recoveryError}
+          <button type="button" className="ml-2 underline" onClick={() => void loadRecoveries()}>
+            {t("common.refresh")}
+          </button>
+        </div>
+      )}
+      {recoveryFollowUp.length > 0 && (
+        <section role="alert" className="mx-1 mb-3 rounded-md border border-amber-500/40 bg-amber-500/[0.06] p-3">
+          <p className="flex items-center gap-2 text-[13px] font-semibold text-amber-700 dark:text-amber-300">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            {recoveryAttention.length > 0
+              ? t("project.recovery.attentionTitle", { count: recoveryAttention.length })
+              : t("project.recovery.followUpTitle", { count: recoveryFollowUp.length })}
+          </p>
+          <p className="mt-1 text-[12px] text-secondary">{t("project.recovery.attentionBody")}</p>
+          <p className="mt-1 text-[12px] text-muted">{t("project.recovery.noAutoRestore")}</p>
+          <button type="button" className="mt-2 rounded-md border border-border px-2.5 py-1 text-[12px] font-medium text-secondary hover:bg-surface-hover"
+            onClick={() => setRecoveryExpanded(true)}>
+            {t("project.recovery.inspectLocations")}
+          </button>
+        </section>
+      )}
       {recoveries.length > 0 && (
         <section className="mx-1 mb-3 rounded-md border border-border bg-surface p-3" aria-label={t("project.recovery.title")}>
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1228,8 +1288,54 @@ export function ProjectDetail() {
                       ? " · " + t("project.recovery.saved")
                       : " · " + t("project.recovery.notFound")}
                   </p>
-                  <p className="mt-1 break-all text-muted">{t("project.recovery.target")}: {recovery.target_path}</p>
+                  {recoveryNeedsFollowUp(recovery) && (
+                    <p className="mt-1 text-[12px] text-amber-700 dark:text-amber-300">
+                      {recoveryMayBeInProgress(recovery)
+                        ? t("project.recovery.mayBeInterrupted")
+                        : t("project.recovery.manualReview")}
+                    </p>
+                  )}
+                  <p className="mt-1 break-all text-muted">
+                    {t("project.recovery.target")}: {recovery.target_path}
+                    <span className="ml-1">({recovery.target_exists
+                      ? t("project.recovery.targetPresent") : t("project.recovery.targetMissing")})</span>
+                  </p>
                   <p className="mt-1 break-all text-muted">{t("project.recovery.location")}: {recovery.recovery_root}</p>
+                  <p className="mt-1 text-muted">
+                    {recovery.recovery_root_exists
+                      ? t("project.recovery.saved") : t("project.recovery.notFound")}
+                  </p>
+                  {recovery.destination_path && (
+                    <p className="mt-1 break-all text-muted">{t("project.recovery.destination")}: {recovery.destination_path}</p>
+                  )}
+                  {recovery.retained_paths.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      <p className="font-medium text-secondary">{t("project.recovery.retainedPaths")}</p>
+                      <p className="text-muted">{t("project.recovery.retainedPathsNotVerified")}</p>
+                      {recovery.retained_paths.map((path) => (
+                        <div key={path} className="flex flex-wrap items-center gap-2">
+                          <span className="break-all text-muted">{path}</span>
+                          <button type="button"
+                            className="rounded-lg border border-border px-2 py-1 text-muted hover:bg-surface-hover"
+                            onClick={() => void copyRecoveryPath(path)}>
+                            {t("project.recovery.copyLocation")}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <button type="button" className="rounded-lg border border-border px-2 py-1 text-muted hover:bg-surface-hover"
+                      onClick={() => void copyRecoveryPath(recovery.recovery_root)}>
+                      {t("project.recovery.copyLocation")}
+                    </button>
+                    {recovery.destination_path && (
+                      <button type="button" className="rounded-lg border border-border px-2 py-1 text-muted hover:bg-surface-hover"
+                        onClick={() => void copyRecoveryPath(recovery.destination_path!)}>
+                        {t("project.recovery.copyDestination")}
+                      </button>
+                    )}
+                  </div>
                   <p className="mt-1 break-all text-muted">{t("project.recovery.operation")}: {recovery.operation_id}</p>
                 </div>
               ))}

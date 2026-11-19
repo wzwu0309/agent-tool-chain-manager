@@ -69,6 +69,13 @@
     }
   },
   "dashboard": {
+    "recoveryInbox": {
+      "title": "待檢查的專案 Skill 操作（{{count}}）",
+      "mayBeUnavailable": "操作中斷後，Skill 可能不在 Agent 預期的目錄中。請先確認保留資料，再考慮重試。",
+      "readOnly": "部分中斷操作需要檢查；系統沒有自動移動檔案。",
+      "statusUncertain": "復原掃描或資料庫讀取可能失敗，持久狀態未必最新；請重新整理確認。",
+      "inspect": "檢視專案復原記錄"
+    },
     "orphanedRecovery": {
       "title": "已註銷專案的復原記錄",
       "readOnly": "舊版管理器可能在註銷專案後保留復原資料。此處僅供檢視，不會認領、還原或刪除檔案。",
@@ -962,6 +969,29 @@
       "success": "受管 Copy 已更新。"
     },
         "recovery": {
+      "retainedPaths": "偵測到的保留子目錄",
+      "retainedPathsNotVerified": "僅表示查詢時發現這些目錄，不代表內容已驗證或獲准復原。",
+      "attentionTitle": "專案 Skill 需要人工檢查（{{count}}）",
+      "followUpTitle": "復原記錄待檢查（{{count}}）",
+      "attentionBody": "部分 Skill 可能不在 Agent 預期路徑，未完成的操作也可能阻止後續變更。",
+      "noAutoRestore": "管理器保留現有檔案，不會自動移回，也尚未提供一鍵復原。請先查看以下路徑，勿直接修改 SQLite 資料庫。",
+      "inspectLocations": "檢視保留位置",
+      "queryFailed": "無法確認復原狀態",
+      "copied": "路徑已複製",
+      "mayBeInterrupted": "操作尚未完成或可能已中斷。處理前請確認沒有程序仍在執行。",
+      "manualReview": "此操作需要人工確認；該狀態不授權移動或刪除檔案。",
+      "targetPresent": "目標項目存在",
+      "targetMissing": "目標項目缺失，Agent 可能無法讀取",
+      "destination": "Skill 另一位置",
+      "copyLocation": "複製復原目錄",
+      "copyDestination": "複製另一位置",
+      "phase": {
+        "needs_attention": "需要人工處理",
+        "preparing": "準備階段未完成",
+        "publishing": "發布階段未完成",
+        "recovery_available": "保留復原資料待檢查",
+        "cleanup_pending": "備份已保留"
+      },
       "title": "復原記錄",
       "readOnly": "僅供檢視。復原副本不會自動清理；手動操作前請先檢查內容。",
       "saved": "復原目錄存在",

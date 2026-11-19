@@ -69,6 +69,13 @@
     }
   },
   "dashboard": {
+    "recoveryInbox": {
+      "title": "待检查的项目 Skill 操作（{{count}}）",
+      "mayBeUnavailable": "操作中断后，Skill 可能不在 Agent 预期的目录中。请先核对保留数据，再考虑重试。",
+      "readOnly": "部分中断操作需要核查。系统没有自动搬动文件。",
+      "statusUncertain": "恢复扫描或数据库读取可能失败，持久化状态未必最新；请刷新后核对。",
+      "inspect": "查看项目恢复记录"
+    },
     "orphanedRecovery": {
       "title": "已注销项目的恢复记录",
       "readOnly": "旧版管理器可能注销项目后仍保留恢复数据。此处仅供查看，不会认领、恢复或删除任何文件。",
@@ -973,6 +980,29 @@
       "success": "受管 Copy 已更新。"
     },
         "recovery": {
+      "retainedPaths": "检测到的保留子目录",
+      "retainedPathsNotVerified": "仅表示查询时发现这些目录，并不代表内容已核验或获准恢复。",
+      "attentionTitle": "项目 Skill 需要人工检查（{{count}}）",
+      "followUpTitle": "恢复记录待复核（{{count}}）",
+      "attentionBody": "部分 Skill 可能已不在 Agent 预期路径，未完成的操作也可能阻止进一步修改。",
+      "noAutoRestore": "管理器保留了现有文件，不会自动搬回，也尚未提供一键恢复。请先查看以下路径，勿直接修改 SQLite 数据库。",
+      "inspectLocations": "查看保留的位置",
+      "queryFailed": "无法确认恢复状态",
+      "copied": "路径已复制",
+      "mayBeInterrupted": "操作尚未完成或上次执行可能已中断。处理前请确认没有进程仍在运行。",
+      "manualReview": "该操作需要人工核对；本状态不授予移动或删除文件的权限。",
+      "targetPresent": "目标条目存在",
+      "targetMissing": "目标条目缺失，Agent 可能无法读取",
+      "destination": "Skill 另一位置",
+      "copyLocation": "复制恢复目录",
+      "copyDestination": "复制另一位置",
+      "phase": {
+        "needs_attention": "需要人工处理",
+        "preparing": "准备阶段未完成",
+        "publishing": "发布阶段未完成",
+        "recovery_available": "保留恢复数据待检查",
+        "cleanup_pending": "备份已保留"
+      },
       "title": "恢复记录",
       "readOnly": "仅供查看。恢复副本不会被自动清理；手动操作前请先检查内容。",
       "saved": "恢复目录存在",

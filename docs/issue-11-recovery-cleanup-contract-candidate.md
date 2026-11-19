@@ -446,3 +446,57 @@ preview conflicts for unowned or replaced same-content Copy/Symlink entries. The
 macOS descriptor-based move remains separately covered by §10–11.
 No source recovery object, Git pin or project deployment record may be
 released or removed because of these startup status transitions.
+
+
+## 13. User-visible recovery inbox and durable phase failure (implementation)
+
+The read-only recovery index for **active projects** is now surfaced on the
+Dashboard and project detail. Only unfinished \`needs_attention\`,
+\`preparing\`, \`publishing\`, and follow-up \`recovery_available\` phases
+trigger review messaging; \`cleanup_pending\` means a backup is retained,
+**not** that an Agent Skill is necessarily broken. An active project
+showing an unfinished operation can be clicked through to a project view
+containing the target path, recovery root, **read-only observed
+\`previous/failed-new/recovered/new\` subdirectory candidates**, and
+optional toggle destination, with explicit entry-exists diagnostics and
+copyable locations. These are path-discovery hints and never represent
+validated ownership or permission to restore; Symlink recovery roots are
+not traversed. Neither view
+initiates file moves, recovery, archive or cleanup.
+
+A Tauri event signals when the asynchronous startup inspection ends; the
+views re-fetch the durable SQLite operation journal instead of trusting
+ephemeral log text. They also query on initial mount, for instances where
+the event occurred before the frontend listener was ready. After
+subscribing, the views also re-query once to avoid a scan completion
+race between their first read and listener registration. A query
+failure or scan failure is an **unknown state**, not a claim that there are
+no outstanding operations. \`preparing\` and \`publishing\` may still reflect
+an active invocation; UI wording asks the user to check that the previous
+operation is no longer running before attempting manual intervention.
+
+Startup phase transitions formerly ignored with \`let _ = ...\` now report
+any SQLite/CAS failure with OperationId, project, old/new phase and error.
+The message **must not** claim a successfully persisted
+\`needs_attention\` or \`recovery_available\` phase when SQLite has rejected
+the write. The original journal remains pending and a future scan can
+retry. Trigger-based regression tests prove both \`publishing ->
+needs_attention\` and \`preparing -> recovery_available\` failures leave
+SQLite and filesystem bytes unchanged, and succeed on a later inspection
+after the injected failure is removed.
+
+**Still not implemented:** a user-authorized restore action that safely
+places bytes at the intended Agent target and transactionally releases
+\`needs_attention\` while maintaining DeploymentId, Copy identity, old/new
+Git baselines and retained originals. The v12/v13 operation uniqueness
+guard must **not** be relaxed as a workaround. A user who manually moved
+files back may still see a blocked operation until an independently
+reviewed authorization/state-reconciliation workflow exists. This is a
+deliberate, visible product limitation, not an invitation to edit SQLite.
+The macOS atomic source-entry CAS gap, source-live-writer changes and
+crash durability remain independent acceptance gates.
+
+Frontend tests explicitly assert that \`cleanup_pending\` is not a service
+outage, \`recovery_available\` is informational follow-up, and
+\`preparing/publishing/needs_attention\` require attention. No restoration,
+archive or permanent deletion capability is enabled by these views.

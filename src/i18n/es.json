@@ -69,6 +69,13 @@
     }
   },
   "dashboard": {
+    "recoveryInbox": {
+      "title": "Operaciones de Skill que revisar ({{count}})",
+      "mayBeUnavailable": "Un Skill podría faltar en la ubicación esperada por el agente tras una interrupción. Revisa los archivos conservados.",
+      "readOnly": "Algunas operaciones interrumpidas necesitan revisión. No se han restaurado archivos automáticamente.",
+      "statusUncertain": "Puede haber fallado el análisis o la lectura de la base de datos. El estado puede estar desactualizado; vuelve a actualizar.",
+      "inspect": "Revisar recuperación del proyecto"
+    },
     "orphanedRecovery": {
       "title": "Registros de recuperación de proyectos no registrados",
       "readOnly": "Las versiones anteriores podían desregistrar proyectos y conservar sus datos de recuperación. Este índice es de solo lectura; no adopta, restaura ni elimina archivos.",
@@ -953,6 +960,29 @@
       "success": "Copy administrado actualizado."
     },
         "recovery": {
+      "retainedPaths": "Directorios conservados observados",
+      "retainedPathsNotVerified": "Solo se detectaron estas rutas al consultar. No están verificadas ni autorizadas para restauración.",
+      "attentionTitle": "Skills que requieren atención ({{count}})",
+      "followUpTitle": "Registros de recuperación por revisar ({{count}})",
+      "attentionBody": "Algunos Skills podrían no estar en la ubicación esperada por el agente, y una operación pendiente puede bloquear cambios.",
+      "noAutoRestore": "Se han conservado los archivos existentes. No hay traslado automático ni restauración con un clic. Revisa las rutas y no modifiques SQLite directamente.",
+      "inspectLocations": "Consultar ubicaciones conservadas",
+      "queryFailed": "No se pudo comprobar la recuperación",
+      "copied": "Ruta copiada",
+      "mayBeInterrupted": "La operación no ha terminado o pudo interrumpirse. Comprueba que no sigue en ejecución.",
+      "manualReview": "Esta operación necesita revisión y no autoriza mover ni eliminar archivos.",
+      "targetPresent": "ruta ocupada",
+      "targetMissing": "ruta ausente; el agente podría verse afectado",
+      "destination": "Ubicación alternativa",
+      "copyLocation": "Copiar ruta de recuperación",
+      "copyDestination": "Copiar otra ubicación",
+      "phase": {
+        "needs_attention": "Requiere atención manual",
+        "preparing": "Preparación incompleta",
+        "publishing": "Publicación incompleta",
+        "recovery_available": "Recuperación conservada para revisar",
+        "cleanup_pending": "Copia conservada"
+      },
       "title": "Registros de recuperación",
       "readOnly": "Solo lectura. Las copias de recuperación no se eliminan automáticamente; revisa su contenido antes de actuar.",
       "saved": "ubicación disponible",
